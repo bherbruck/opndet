@@ -87,6 +87,10 @@ class OpndetDataset(Dataset):
 
     GT encoding runs inside the worker so the main training loop just stacks
     pre-encoded tensors — no CPU work between batches blocks the GPU.
+
+    cache_images=True keeps decoded uint8 RGB arrays in worker RAM after first
+    read; subsequent epochs skip the JPEG decode entirely. Aug still runs each
+    epoch on a fresh copy of the cached array.
     """
 
     def __init__(
@@ -96,6 +100,7 @@ class OpndetDataset(Dataset):
         img_w: int,
         augment_fn=None,
         encode_fn=None,
+        cache_images: bool = False,
         mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: tuple[float, float, float] = (0.229, 0.224, 0.225),
     ):
@@ -106,16 +111,28 @@ class OpndetDataset(Dataset):
         self.encode = encode_fn
         self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
+        self.cache_images = cache_images
+        self._cache: dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _load_rgb(self, idx: int, path) -> np.ndarray:
+        if self.cache_images and idx in self._cache:
+            return self._cache[idx]
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError(f"failed to read {path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.cache_images:
+            self._cache[idx] = img
+        return img
+
     def __getitem__(self, idx: int):
         s = self.samples[idx]
-        img = cv2.imread(str(s.image_path), cv2.IMREAD_COLOR)
-        if img is None:
-            raise RuntimeError(f"failed to read {s.image_path}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = self._load_rgb(idx, s.image_path)
+        if self.cache_images:
+            img = img.copy()  # aug mutates, keep cache pristine
         boxes = s.boxes.copy()
 
         if self.aug is not None:

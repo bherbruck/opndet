@@ -150,35 +150,44 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}")
 
     encode_fn = partial(encode_targets, cfg=cfg_shim)
-    train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn, encode_fn=encode_fn)
-    val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn)
-    test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn)
+    cache = bool(c.get("cache_images", False))
+    train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn, encode_fn=encode_fn, cache_images=cache)
+    val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache)
+    test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache)
     nw = int(c.get("num_workers", 2))
     pf = int(c.get("prefetch_factor", 4)) if nw > 0 else None
-    common = dict(num_workers=nw, collate_fn=collate, pin_memory=device.type == "cuda",
-                  persistent_workers=nw > 0, prefetch_factor=pf)
-    common = {k: v for k, v in common.items() if v is not None}
-    train_loader = DataLoader(train_ds, batch_size=int(c["batch_size"]), shuffle=True, **common)
-    val_loader = DataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, **common)
-    test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, **common)
+    train_kw = dict(num_workers=nw, collate_fn=collate, pin_memory=device.type == "cuda",
+                    persistent_workers=nw > 0, prefetch_factor=pf)
+    eval_kw = {**train_kw, "pin_memory": False}  # val/test don't need pinned memory
+    train_kw = {k: v for k, v in train_kw.items() if v is not None}
+    eval_kw = {k: v for k, v in eval_kw.items() if v is not None}
+    train_loader = DataLoader(train_ds, batch_size=int(c["batch_size"]), shuffle=True, **train_kw)
+    val_loader = DataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
+    test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
 
     loss_fn = OpndetBboxLoss(**(c.get("loss") or {}))
     opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
+    amp_dtype_str = str(c.get("amp_dtype", "fp16")).lower()
+    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                 "float16": torch.float16}.get(amp_dtype_str, torch.float16)
     use_amp = device.type == "cuda" and c.get("amp", True)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    needs_scaler = use_amp and amp_dtype == torch.float16  # bf16 doesn't need GradScaler
+    scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler)
 
     epochs = int(c["epochs"])
     total_steps = epochs * max(1, len(train_loader))
     base_lr = float(c["lr"])
     warmup = int(c.get("warmup_steps", 200))
 
-    n_vis = int(c.get("vis_samples", 8))
+    n_vis = int(c.get("vis_samples", 4))
+    vis_every = int(c.get("vis_every", 5))   # render TB images every N epochs (0 = never)
     vis_imgs = []
     vis_boxes = []
-    for i in range(min(n_vis, len(val_ds))):
-        img_t, boxes, _ = val_ds[i]
-        vis_imgs.append(img_t)
-        vis_boxes.append(boxes)
+    if n_vis > 0 and vis_every > 0:
+        for i in range(min(n_vis, len(val_ds))):
+            img_t, boxes, _ = val_ds[i]
+            vis_imgs.append(img_t)
+            vis_boxes.append(boxes)
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
 
     best_f1 = -1.0
@@ -194,14 +203,19 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             imgs = imgs.to(device, non_blocking=True)
             tgt = {k: v.to(device, non_blocking=True) for k, v in tgt.items()}
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 raw5 = model.forward_with_alias(imgs, "raw")
                 losses = loss_fn(raw5, tgt)
-            scaler.scale(losses["loss"]).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            scaler.step(opt)
-            scaler.update()
+            if needs_scaler:
+                scaler.scale(losses["loss"]).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                losses["loss"].backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                opt.step()
             for k in running:
                 running[k] += float(losses.get(k, torch.tensor(0.0)).detach()) if k in losses else 0.0
             step += 1
@@ -223,7 +237,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             writer.add_scalar(f"val/{k}", v, ep)
         writer.add_scalar("time/epoch_s", dt, ep)
 
-        if vis_batch is not None:
+        if vis_batch is not None and (ep % vis_every == 0 or ep == epochs):
             grid = render_predictions(
                 model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
                 threshold=float(c.get("eval_threshold", 0.3)), device=device,
