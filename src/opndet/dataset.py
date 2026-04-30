@@ -189,7 +189,9 @@ class OpndetDataset(Dataset):
         if self.aug is not None:
             img, boxes = self.aug(img, boxes)
 
-        if do_letterbox:
+        # always letterbox — aug (rotate90 with k=1 or 3) can transpose dims, so the
+        # final canvas size must be reasserted regardless of where img came from.
+        if do_letterbox or img.shape[:2] != (self.img_h, self.img_w):
             img, boxes = letterbox(img, boxes, self.img_h, self.img_w)
 
         if boxes.shape[0] > 0:
