@@ -71,20 +71,24 @@ class Head(nn.Module):
 
 
 class PeakSuppress(nn.Module):
-    """In-graph local-max via GreaterOrEqual(hm + eps, MaxPool(hm)).
+    """In-graph local-max suppression. Arithmetic form, Myriad-safe.
 
-    Tolerance eps absorbs FP drift between PyTorch and ORT/OpenVINO so the mask is
-    bit-stable across runtimes. eps small enough that real non-maxima still fail.
+    OpenVINO 2022.1's Myriad VPU plugin has a known bug lowering GreaterOrEqual
+    to a Logical_OR stage that asserts FP16 inputs but sees S32 — fails on
+    float32 inputs. Arithmetic mask `clip((hm + eps - MaxPool(hm)) * (1/eps), 0, 1)`
+    is mathematically equivalent and uses only Sub/Mul/Clip (all opset 13 + Myriad).
     """
 
     def __init__(self, k: int = 3, eps: float = 1e-3):
         super().__init__()
         self.k = k
         self.eps = eps
+        self._big = 1.0 / max(eps, 1e-9)
 
     def forward(self, hm: torch.Tensor) -> torch.Tensor:
         pooled = F.max_pool2d(hm, kernel_size=self.k, stride=1, padding=self.k // 2)
-        mask = (hm + self.eps >= pooled).to(hm.dtype)
+        diff = (hm + self.eps) - pooled
+        mask = torch.clamp(diff * self._big, 0.0, 1.0)
         return hm * mask
 
 

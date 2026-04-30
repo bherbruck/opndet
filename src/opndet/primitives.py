@@ -55,38 +55,55 @@ class Tanh(nn.Module):
         return torch.tanh(x)
 
 
+def _peak_mask(hm: torch.Tensor, k: int, eps: float, mode: str) -> torch.Tensor:
+    """Local-max mask via either:
+      mode='arith' (default): mask = clip((hm + eps - MaxPool(hm)) * BIG, 0, 1)
+        — pure arithmetic, no comparison op. Required for OpenVINO 2022.1 Myriad
+        which has a known plugin bug lowering GreaterOrEqual to a buggy Logical_OR
+        stage that asserts FP16 inputs and fails for float32 operands.
+      mode='compare': mask = (hm + eps >= MaxPool(hm)). Smaller graph but breaks
+        on Myriad VPU. OK for CPU/GPU OpenVINO and ORT.
+    """
+    pooled = F.max_pool2d(hm, kernel_size=k, stride=1, padding=k // 2)
+    if mode == "compare":
+        return (hm + eps >= pooled).to(hm.dtype)
+    # arith: scale chosen so any positive diff > eps clips to 1, any negative diff clips to 0.
+    # BIG = 1/eps gives diff=eps -> scaled=1 (exact peak), diff<-eps -> scaled<-1 (clipped to 0).
+    big = 1.0 / max(eps, 1e-9)
+    diff = (hm + eps) - pooled
+    return torch.clamp(diff * big, 0.0, 1.0)
+
+
 @register("PeakSuppress")
 class PeakSuppress(nn.Module):
-    """In-graph local-max via GreaterOrEqual(hm + eps, MaxPool(hm)).
+    """In-graph local-max suppression. Default mode='arith' is Myriad-safe.
 
-    Tolerance eps absorbs FP drift PyTorch <-> ORT/OpenVINO so mask is bit-stable.
+    eps absorbs FP drift PyTorch <-> ORT/OpenVINO so mask is bit-stable.
     """
 
-    def __init__(self, k: int = 3, eps: float = 1e-3):
+    def __init__(self, k: int = 3, eps: float = 1e-3, mode: str = "arith"):
         super().__init__()
         self.k = k
         self.eps = eps
+        self.mode = mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pooled = F.max_pool2d(x, kernel_size=self.k, stride=1, padding=self.k // 2)
-        mask = (x + self.eps >= pooled).to(x.dtype)
-        return x * mask
+        return x * _peak_mask(x, self.k, self.eps, self.mode)
 
 
 @register("SigmoidPeakSuppress")
 class SigmoidPeakSuppress(nn.Module):
-    """Sigmoid then peak-suppress. Single fused op for the peaks head."""
+    """Sigmoid then peak-suppress (fused op for the obj head). Default mode='arith'."""
 
-    def __init__(self, k: int = 3, eps: float = 1e-3):
+    def __init__(self, k: int = 3, eps: float = 1e-3, mode: str = "arith"):
         super().__init__()
         self.k = k
         self.eps = eps
+        self.mode = mode
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hm = torch.sigmoid(x)
-        pooled = F.max_pool2d(hm, kernel_size=self.k, stride=1, padding=self.k // 2)
-        mask = (hm + self.eps >= pooled).to(hm.dtype)
-        return hm * mask
+        return hm * _peak_mask(hm, self.k, self.eps, self.mode)
 
 
 @register("SigmoidScale")
