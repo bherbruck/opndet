@@ -109,7 +109,7 @@ def cosine_lr(step: int, total: int, base: float, warmup: int = 200, min_factor:
     return base * (min_factor + 0.5 * (1 - min_factor) * (1 + math.cos(math.pi * p)))
 
 
-def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = None) -> None:
+def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = None, resume: str | None = None) -> None:
     with open(cfg_path) as f:
         c = yaml.safe_load(f)
 
@@ -118,13 +118,24 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     if run_name is not None:
         c["name"] = run_name
 
-    if "runs_dir" in c or "name" in c:
-        rd = Path(c.get("runs_dir", "runs"))
-        nm = c.get("name", "exp1")
-        base = rd / nm
+    resume_state = None
+    if resume:
+        resume_path = Path(resume)
+        if resume_path.is_dir():
+            resume_path = resume_path / "last.pt"
+        if not resume_path.exists():
+            raise FileNotFoundError(f"resume ckpt not found: {resume_path}")
+        print(f"resume: loading {resume_path}")
+        resume_state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        out_dir = resume_path.parent
     else:
-        base = Path(c.get("out_dir", "runs/exp1"))
-    out_dir = _resolve_out_dir(base, auto_increment=bool(c.get("auto_increment", True)))
+        if "runs_dir" in c or "name" in c:
+            rd = Path(c.get("runs_dir", "runs"))
+            nm = c.get("name", "exp1")
+            base = rd / nm
+        else:
+            base = Path(c.get("out_dir", "runs/exp1"))
+        out_dir = _resolve_out_dir(base, auto_increment=bool(c.get("auto_increment", True)))
     out_dir.mkdir(parents=True, exist_ok=True)
     tb_dir = out_dir / "tb"
     print(f"out_dir: {out_dir}")
@@ -150,6 +161,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     model_path = _resolve_preset(c["model_config"])
     model = build_model_from_yaml(model_path).to(device)
+    if resume_state is not None:
+        model.load_state_dict(resume_state["model"])
     in_ch, img_h, img_w = model.input_shape
     cfg_shim = _CfgShim(img_h, img_w, stride=int(c["model"].get("stride", 4)))
     n_params = sum(p.numel() for p in model.parameters())
@@ -173,6 +186,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     loss_fn = OpndetBboxLoss(**(c.get("loss") or {}))
     opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
+    if resume_state is not None and "optimizer" in resume_state:
+        opt.load_state_dict(resume_state["optimizer"])
     amp_dtype_str = str(c.get("amp_dtype", "fp16")).lower()
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
                  "float16": torch.float16}.get(amp_dtype_str, torch.float16)
@@ -200,7 +215,17 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     best_epoch = 0
     patience = int(c.get("patience", 0))   # 0 = disabled
     step = 0
-    for epoch in range(epochs):
+    start_epoch = 0
+    if resume_state is not None:
+        start_epoch = int(resume_state.get("epoch", 0))
+        best_f1 = float(resume_state.get("best_f1", -1.0))
+        best_epoch = int(resume_state.get("best_epoch", start_epoch))
+        step = int(resume_state.get("step", start_epoch * max(1, len(train_loader))))
+        if needs_scaler and "scaler" in resume_state:
+            scaler.load_state_dict(resume_state["scaler"])
+        print(f"resuming from epoch {start_epoch + 1}, best_f1={best_f1:.3f} @ epoch {best_epoch}, step={step}")
+
+    for epoch in range(start_epoch, epochs):
         model.train()
         t0 = time.time()
         running = {"loss": 0.0, "l_hm": 0.0, "l_cxy": 0.0, "l_wh": 0.0}
@@ -252,7 +277,17 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
 
-        ckpt = {"epoch": ep, "model": model.state_dict(), "metrics": m, "config": c}
+        ckpt = {
+            "epoch": ep,
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scaler": scaler.state_dict() if needs_scaler else None,
+            "step": step,
+            "best_f1": best_f1,
+            "best_epoch": best_epoch,
+            "metrics": m,
+            "config": c,
+        }
         torch.save(ckpt, out_dir / "last.pt")
         if m["f1"] > best_f1:
             best_f1 = m["f1"]
@@ -279,8 +314,9 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--run-name", default=None, help="Override config 'name'")
     ap.add_argument("--runs-dir", default=None, help="Override config 'runs_dir'")
+    ap.add_argument("--resume", default=None, help="Path to ckpt .pt OR run dir (uses last.pt). Continues training in same dir.")
     args = ap.parse_args()
-    train(args.config, run_name=args.run_name, runs_dir=args.runs_dir)
+    train(args.config, run_name=args.run_name, runs_dir=args.runs_dir, resume=args.resume)
 
 
 if __name__ == "__main__":
