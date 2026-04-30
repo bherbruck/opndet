@@ -1,0 +1,62 @@
+# uv / venv
+.venv/
+venv/
+env/
+.python-version
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+wheels/
+.eggs/
+
+# Tests / type checkers / linters
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code / agent scratch
+.claude/
+
+# opndet runtime artifacts
+runs/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.openvino/
+*.xml
+*.bin
+
+# datasets (large, point-at-them via configs)
+data/
+datasets/
+*.zip
+*.tar
+*.tar.gz

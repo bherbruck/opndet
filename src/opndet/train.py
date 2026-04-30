@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import argparse
+import math
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import torch
+import yaml
+from torch.utils.data import DataLoader
+
+from opndet.augment import AugConfig, make_augment
+from opndet.dataset import OpndetDataset, collate, load_datasets, split_samples
+from opndet.decode import decode_batch
+from opndet.encode import collate_targets, encode_targets
+from opndet.loss import OpndetBboxLoss
+from opndet.presets import resolve as _resolve_preset
+from opndet.yaml_build import build_model_from_yaml
+
+
+def _make_targets_batch(boxes_list, cfg) -> dict[str, torch.Tensor]:
+    items = [encode_targets(b, cfg) for b in boxes_list]
+    return collate_targets(items)
+
+
+class _CfgShim:
+    """encode_targets needs an object with img_h/img_w/stride/out_h/out_w."""
+
+    def __init__(self, img_h: int, img_w: int, stride: int):
+        self.img_h = img_h
+        self.img_w = img_w
+        self.stride = stride
+        self.out_h = img_h // stride
+        self.out_w = img_w // stride
+
+
+def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    x1 = np.maximum(a[:, None, 0], b[None, :, 0])
+    y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+    x2 = np.minimum(a[:, None, 2], b[None, :, 2])
+    y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+    iw = np.clip(x2 - x1, 0, None)
+    ih = np.clip(y2 - y1, 0, None)
+    inter = iw * ih
+    a_area = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    b_area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    union = a_area[:, None] + b_area[None, :] - inter + 1e-9
+    return inter / union
+
+
+@torch.no_grad()
+def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thresh: float = 0.3, iou_thresh: float = 0.5) -> dict[str, float]:
+    model.eval()
+    tp = fp = fn = 0
+    n_pred = n_gt = 0
+    for imgs, boxes_list in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        out = model(imgs)
+        out_t = out["output"] if isinstance(out, dict) else out
+        out_np = out_t.cpu().numpy()
+        dets_per = decode_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=score_thresh)
+        for dets, gt in zip(dets_per, boxes_list):
+            n_pred += len(dets)
+            n_gt += gt.shape[0]
+            if not dets or gt.shape[0] == 0:
+                fn += gt.shape[0]
+                fp += len(dets)
+                continue
+            pred_boxes = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32)
+            ious = _iou_xyxy(pred_boxes, gt)
+            matched_gt = set()
+            for pi in np.argsort([-d.score for d in dets]):
+                gj = ious[pi].argmax()
+                if ious[pi, gj] >= iou_thresh and gj not in matched_gt:
+                    matched_gt.add(int(gj))
+                    tp += 1
+                else:
+                    fp += 1
+            fn += gt.shape[0] - len(matched_gt)
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, tp + fn)
+    f1 = 2 * precision * recall / max(1e-9, precision + recall)
+    return {"precision": precision, "recall": recall, "f1": f1, "n_pred": float(n_pred), "n_gt": float(n_gt)}
+
+
+def cosine_lr(step: int, total: int, base: float, warmup: int = 200, min_factor: float = 0.05) -> float:
+    if step < warmup:
+        return base * (step + 1) / max(1, warmup)
+    p = (step - warmup) / max(1, total - warmup)
+    return base * (min_factor + 0.5 * (1 - min_factor) * (1 + math.cos(math.pi * p)))
+
+
+def train(cfg_path: str) -> None:
+    with open(cfg_path) as f:
+        c = yaml.safe_load(f)
+
+    out_dir = Path(c["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
+    seed = int(c.get("seed", 0))
+    torch.manual_seed(seed); np.random.seed(seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() and c.get("device", "auto") != "cpu" else "cpu")
+    print(f"device: {device}")
+
+    print("loading data ...")
+    samples = load_datasets(c["data"]["sources"])
+    print(f"total samples: {len(samples)}")
+    ratios = tuple(c["data"].get("split_ratios", [0.8, 0.1, 0.1]))
+    train_s, val_s, test_s = split_samples(samples, ratios=ratios, seed=seed)
+    print(f"split: train={len(train_s)} val={len(val_s)} test={len(test_s)}")
+
+    aug_cfg = AugConfig(**(c.get("augment") or {}))
+    aug_fn = make_augment(aug_cfg)
+
+    model_path = _resolve_preset(c["model_config"])
+    model = build_model_from_yaml(model_path).to(device)
+    in_ch, img_h, img_w = model.input_shape
+    cfg_shim = _CfgShim(img_h, img_w, stride=int(c["model"].get("stride", 4)))
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}")
+
+    train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn)
+    val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None)
+    test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None)
+    train_loader = DataLoader(train_ds, batch_size=int(c["batch_size"]), shuffle=True, num_workers=int(c.get("num_workers", 2)), collate_fn=collate, pin_memory=device.type == "cuda")
+    val_loader = DataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, num_workers=int(c.get("num_workers", 2)), collate_fn=collate)
+    test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, num_workers=int(c.get("num_workers", 2)), collate_fn=collate)
+
+    loss_fn = OpndetBboxLoss(**(c.get("loss") or {}))
+    opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
+    use_amp = device.type == "cuda" and c.get("amp", True)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    epochs = int(c["epochs"])
+    total_steps = epochs * max(1, len(train_loader))
+    base_lr = float(c["lr"])
+    warmup = int(c.get("warmup_steps", 200))
+
+    best_f1 = -1.0
+    step = 0
+    for epoch in range(epochs):
+        model.train()
+        t0 = time.time()
+        running = {"loss": 0.0, "l_hm": 0.0, "l_cxy": 0.0, "l_wh": 0.0}
+        for imgs, boxes_list in train_loader:
+            for g in opt.param_groups:
+                g["lr"] = cosine_lr(step, total_steps, base_lr, warmup=warmup)
+            imgs = imgs.to(device, non_blocking=True)
+            tgt = _make_targets_batch(boxes_list, cfg_shim)
+            tgt = {k: v.to(device, non_blocking=True) for k, v in tgt.items()}
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                raw5 = model.forward_with_alias(imgs, "raw")
+                losses = loss_fn(raw5, tgt)
+            scaler.scale(losses["loss"]).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            scaler.step(opt)
+            scaler.update()
+            for k in running:
+                running[k] += float(losses.get(k, torch.tensor(0.0)).detach()) if k in losses else 0.0
+            step += 1
+
+        n_iter = max(1, len(train_loader))
+        avg = {k: v / n_iter for k, v in running.items()}
+        dt = time.time() - t0
+        m = evaluate(model, val_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+        cur_lr = opt.param_groups[0]["lr"]
+        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  hm={avg['l_hm']:.4f} cxy={avg['l_cxy']:.4f} wh={avg['l_wh']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  n_pred={m['n_pred']:.0f}/n_gt={m['n_gt']:.0f}  ({dt:.1f}s)")
+
+        ckpt = {"epoch": epoch + 1, "model": model.state_dict(), "metrics": m, "config": c}
+        torch.save(ckpt, out_dir / "last.pt")
+        if m["f1"] > best_f1:
+            best_f1 = m["f1"]
+            torch.save(ckpt, out_dir / "best.pt")
+            print(f"  -> saved best (F1={best_f1:.3f})")
+
+    print("running final test eval ...")
+    state = torch.load(out_dir / "best.pt", map_location=device, weights_only=True)
+    model.load_state_dict(state["model"])
+    m = evaluate(model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+    print(f"TEST: P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  n_pred={m['n_pred']:.0f}/n_gt={m['n_gt']:.0f}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+    train(args.config)
+
+
+if __name__ == "__main__":
+    main()
