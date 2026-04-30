@@ -46,21 +46,33 @@ def _is_url(s: str) -> bool:
     return s.startswith("http://") or s.startswith("https://")
 
 
+def _yt_dlp_cmd() -> list[str] | None:
+    """Find a way to invoke yt-dlp: shell binary first, else python module."""
+    if shutil.which("yt-dlp"):
+        return ["yt-dlp"]
+    try:
+        import yt_dlp   # noqa: F401
+        import sys as _sys
+        return [_sys.executable, "-m", "yt_dlp"]
+    except ImportError:
+        return None
+
+
 def _download_video(url: str, out_dir: Path) -> Path:
-    """Download a video URL via yt-dlp. Falls back to ffmpeg if yt-dlp is absent."""
-    if not shutil.which("yt-dlp"):
-        raise RuntimeError(
-            "yt-dlp not installed. Install with: uv pip install yt-dlp  (or: pip install yt-dlp)"
-        )
+    """Download a video URL via yt-dlp."""
+    cmd = _yt_dlp_cmd()
+    if cmd is None:
+        raise RuntimeError("yt-dlp not installed. Install with: pip install yt-dlp")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "video.mp4"
+    # Cache: derive name from URL hash so repeated runs reuse the download
+    import hashlib
+    name = hashlib.sha1(url.encode()).hexdigest()[:12] + ".mp4"
+    out_path = out_dir / name
     if out_path.exists():
-        out_path.unlink()
+        print(f"using cached {out_path}")
+        return out_path
     print(f"downloading {url} -> {out_path}")
-    subprocess.run(
-        ["yt-dlp", "-f", "best[height<=720]", "-o", str(out_path), url],
-        check=True,
-    )
+    subprocess.run(cmd + ["-f", "best[height<=720]", "-o", str(out_path), url], check=True)
     return out_path
 
 
@@ -109,9 +121,46 @@ def predict_video(
 
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(save_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-    if not writer.isOpened():
-        raise RuntimeError(f"cv2.VideoWriter failed to open {save_path}")
+
+    # H.264 (avc1) plays in VSCode/browsers/Windows; cv2's mp4v (MPEG-4 Part 2)
+    # is hit-and-miss. Try strategies in order:
+    #   1. imageio-ffmpeg if installed (optional dep — ships its own static ffmpeg)
+    #   2. system ffmpeg via shell pipe
+    #   3. cv2 mp4v fallback (warn that container may not play everywhere)
+    use_imageio = False
+    try:
+        import imageio_ffmpeg as _iff   # noqa: F401
+        use_imageio = True
+    except ImportError:
+        pass
+    has_sys_ffmpeg = shutil.which("ffmpeg") is not None
+
+    writer = None
+    used_codec = None
+    if use_imageio:
+        import imageio.v2 as iio
+        writer = iio.get_writer(str(save_path), fps=fps, codec="libx264",
+                                 quality=8, macro_block_size=1)
+        used_codec = "imageio-ffmpeg/H.264"
+    elif has_sys_ffmpeg:
+        # Pipe BGR frames into ffmpeg via a subprocess for direct H.264 encoding.
+        ff = subprocess.Popen([
+            "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}", "-pix_fmt", "bgr24",
+            "-r", str(fps), "-i", "-",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            str(save_path),
+        ], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        writer = ff
+        used_codec = "system ffmpeg/H.264"
+    else:
+        cv_writer = cv2.VideoWriter(str(save_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        if not cv_writer.isOpened():
+            raise RuntimeError(f"cv2.VideoWriter failed to open {save_path}")
+        writer = cv_writer
+        used_codec = "cv2/mp4v"
+        print(f"warning: H.264 unavailable. Wrote mp4v container (may not play in VSCode/browsers).")
+        print(f"         install with: uv pip install imageio-ffmpeg  (or apt install ffmpeg)")
 
     n = 0
     det_counts = []
@@ -139,7 +188,13 @@ def predict_video(
             ox, oy = (w - nw) // 2, (h - nh) // 2
             canvas[oy:oy + nh, ox:ox + nw] = cv2.resize(frame_bgr, (nw, nh))
             vis = _draw_boxes(canvas, dets)
-            writer.write(vis)
+            if used_codec.startswith("imageio"):
+                # imageio expects RGB
+                writer.append_data(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+            elif used_codec.startswith("system ffmpeg"):
+                writer.stdin.write(vis.tobytes())
+            else:
+                writer.write(vis)
 
             det_counts.append(len(dets))
             n += 1
@@ -153,7 +208,13 @@ def predict_video(
                 break
     finally:
         cap.release()
-        writer.release()
+        if used_codec.startswith("imageio"):
+            writer.close()
+        elif used_codec.startswith("system ffmpeg"):
+            writer.stdin.close()
+            writer.wait()
+        else:
+            writer.release()
 
     elapsed = time.perf_counter() - t_start
     counts = np.array(det_counts) if det_counts else np.zeros(0)

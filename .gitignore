@@ -45,12 +45,16 @@ Thumbs.db
 /*.png
 /*.jpg
 /*.jpeg
+/*.mp4
 /*.onnx
 /*.pt
 /train.yaml
 
 # Claude Code / agent scratch
 .claude/
+
+# video predict cache (yt-dlp downloads)
+.opndet_video_cache/
 
 # opndet runtime artifacts
 runs/
