@@ -243,7 +243,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             writer.add_scalar(f"val/{k}", v, ep)
         writer.add_scalar("time/epoch_s", dt, ep)
 
-        if vis_batch is not None and (ep % vis_every == 0 or ep == epochs):
+        if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs):
             grid = render_predictions(
                 model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
                 threshold=float(c.get("eval_threshold", 0.3)), device=device,
