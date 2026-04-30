@@ -49,7 +49,7 @@ augment:
   rotate90_prob: 0.5
   scale_jitter: [0.7, 1.3]
   translate_frac: 0.1
-  mosaic_prob: 0.5            # combine 4 images into 1 — strong regularization
+  mosaic_prob: 0.5            # combine 4 images into 1, strong regularization
   cutout_prob: 0.3            # randomly erase rectangles
   cutout_count: 3
   cutout_size_frac: [0.05, 0.20]
