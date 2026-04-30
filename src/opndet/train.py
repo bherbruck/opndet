@@ -170,7 +170,10 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     encode_fn = partial(encode_targets, cfg=cfg_shim)
     cache = bool(c.get("cache_images", False))
-    train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn, encode_fn=encode_fn, cache_images=cache)
+    mosaic_prob = float(aug_cfg.mosaic_prob if hasattr(aug_cfg, "mosaic_prob") else 0.0)
+    min_vis = float(aug_cfg.min_visible_frac if hasattr(aug_cfg, "min_visible_frac") else 0.5)
+    train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn, encode_fn=encode_fn,
+                             cache_images=cache, mosaic_prob=mosaic_prob, min_visible_frac=min_vis)
     val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache)
     test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache)
     nw = int(c.get("num_workers", 2))

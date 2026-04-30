@@ -101,6 +101,8 @@ class OpndetDataset(Dataset):
         augment_fn=None,
         encode_fn=None,
         cache_images: bool = False,
+        mosaic_prob: float = 0.0,
+        min_visible_frac: float = 0.5,
         mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: tuple[float, float, float] = (0.229, 0.224, 0.225),
     ):
@@ -113,6 +115,8 @@ class OpndetDataset(Dataset):
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
         self.cache_images = cache_images
         self._cache: dict[int, np.ndarray] = {}
+        self.mosaic_prob = mosaic_prob
+        self.min_visible_frac = min_visible_frac
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -128,17 +132,65 @@ class OpndetDataset(Dataset):
             self._cache[idx] = img
         return img
 
-    def __getitem__(self, idx: int):
-        s = self.samples[idx]
-        img = self._load_rgb(idx, s.image_path)
-        if self.cache_images:
-            img = img.copy()  # aug mutates, keep cache pristine
-        boxes = s.boxes.copy()
+    def _mosaic(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+        """4-image mosaic. Output dims = (img_h, img_w). Each quadrant filled by one
+        sample, scaled to fit. Boxes transformed and filtered by min_visible_frac.
+        """
+        H, W = self.img_h, self.img_w
+        rng = random.Random()
+        idxs = [idx] + [rng.randrange(len(self.samples)) for _ in range(3)]
+        cy = rng.randint(H // 4, 3 * H // 4)
+        cx = rng.randint(W // 4, 3 * W // 4)
+        # quadrant target rects: TL, TR, BL, BR
+        rects = [(0, 0, cx, cy), (cx, 0, W, cy), (0, cy, cx, H), (cx, cy, W, H)]
+        canvas = np.full((H, W, 3), 114, dtype=np.uint8)
+        all_boxes = []
+        for ix, (x1, y1, x2, y2) in zip(idxs, rects):
+            qw, qh = x2 - x1, y2 - y1
+            if qw <= 0 or qh <= 0:
+                continue
+            s = self.samples[ix]
+            src = self._load_rgb(ix, s.image_path)
+            sh, sw = src.shape[:2]
+            # scale to fit quadrant preserving aspect
+            scale = min(qw / sw, qh / sh)
+            new_w, new_h = int(round(sw * scale)), int(round(sh * scale))
+            if new_w <= 0 or new_h <= 0:
+                continue
+            resized = cv2.resize(src, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            ox = x1 + (qw - new_w) // 2
+            oy = y1 + (qh - new_h) // 2
+            canvas[oy:oy + new_h, ox:ox + new_w] = resized
+            if s.boxes.shape[0] > 0:
+                bx = s.boxes.copy()
+                orig_w = (bx[:, 2] - bx[:, 0]).clip(min=0)
+                orig_h = (bx[:, 3] - bx[:, 1]).clip(min=0)
+                orig_area = orig_w * orig_h
+                bx[:, [0, 2]] = bx[:, [0, 2]] * scale + ox
+                bx[:, [1, 3]] = bx[:, [1, 3]] * scale + oy
+                # clip to quadrant (so boxes don't bleed across the cut center)
+                bx[:, 0] = bx[:, 0].clip(x1, x2)
+                bx[:, 1] = bx[:, 1].clip(y1, y2)
+                bx[:, 2] = bx[:, 2].clip(x1, x2)
+                bx[:, 3] = bx[:, 3].clip(y1, y2)
+                new_w_px = (bx[:, 2] - bx[:, 0]).clip(min=0)
+                new_h_px = (bx[:, 3] - bx[:, 1]).clip(min=0)
+                new_area = new_w_px * new_h_px
+                # min_visible_frac is in image-coord area, so compare against scaled-orig
+                scaled_orig_area = orig_area * (scale ** 2)
+                keep = (scaled_orig_area <= 0) | (new_area / np.maximum(scaled_orig_area, 1e-9) >= self.min_visible_frac)
+                bx = bx[keep]
+                if bx.shape[0]:
+                    all_boxes.append(bx)
+        out_boxes = np.concatenate(all_boxes, axis=0) if all_boxes else np.zeros((0, 4), dtype=np.float32)
+        return canvas, out_boxes
 
+    def _finish(self, img: np.ndarray, boxes: np.ndarray, do_letterbox: bool = True):
         if self.aug is not None:
             img, boxes = self.aug(img, boxes)
 
-        img, boxes = letterbox(img, boxes, self.img_h, self.img_w)
+        if do_letterbox:
+            img, boxes = letterbox(img, boxes, self.img_h, self.img_w)
 
         if boxes.shape[0] > 0:
             boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, self.img_w - 1)
@@ -152,6 +204,17 @@ class OpndetDataset(Dataset):
 
         targets = self.encode(boxes) if self.encode is not None else None
         return img_t, boxes, targets
+
+    def __getitem__(self, idx: int):
+        if self.mosaic_prob > 0 and random.random() < self.mosaic_prob:
+            img, boxes = self._mosaic(idx)
+            return self._finish(img, boxes, do_letterbox=False)
+        s = self.samples[idx]
+        img = self._load_rgb(idx, s.image_path)
+        if self.cache_images:
+            img = img.copy()
+        boxes = s.boxes.copy()
+        return self._finish(img, boxes, do_letterbox=True)
 
 
 def collate(batch):

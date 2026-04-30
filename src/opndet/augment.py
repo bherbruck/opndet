@@ -23,6 +23,14 @@ class AugConfig:
     rotate90_prob: float = 0.5
     scale_jitter: tuple[float, float] = (0.7, 1.3)
     translate_frac: float = 0.1
+    # mosaic (handled in dataset, not in aug fn — but config flag lives here)
+    mosaic_prob: float = 0.0
+    # cutout / random erase
+    cutout_prob: float = 0.0        # chance of applying cutout to an image
+    cutout_count: int = 3           # how many holes per application
+    cutout_size_frac: tuple[float, float] = (0.05, 0.20)  # hole side as frac of img dim
+    # bbox visibility — drop boxes with <min_visible_frac of original area visible
+    min_visible_frac: float = 0.5
     # composite
     enabled: bool = True
 
@@ -70,6 +78,69 @@ def _photometric(img: np.ndarray, cfg: AugConfig, rng: np.random.Generator) -> n
     return img
 
 
+def _box_orig_areas(boxes: np.ndarray) -> np.ndarray:
+    if boxes.shape[0] == 0:
+        return np.zeros(0, dtype=np.float32)
+    w = (boxes[:, 2] - boxes[:, 0]).clip(min=0)
+    h = (boxes[:, 3] - boxes[:, 1]).clip(min=0)
+    return w * h
+
+
+def _filter_visible(boxes: np.ndarray, orig_areas: np.ndarray, min_frac: float) -> np.ndarray:
+    if boxes.shape[0] == 0:
+        return boxes
+    new_w = (boxes[:, 2] - boxes[:, 0]).clip(min=0)
+    new_h = (boxes[:, 3] - boxes[:, 1]).clip(min=0)
+    new_area = new_w * new_h
+    keep = (orig_areas <= 0) | (new_area / np.maximum(orig_areas, 1e-9) >= min_frac)
+    return boxes[keep]
+
+
+def _cutout(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """Paste random rectangles of mean-gray over the image, then drop boxes whose
+    visible area falls below cfg.min_visible_frac.
+    """
+    h, w = img.shape[:2]
+    if boxes.shape[0] > 0:
+        orig_areas = _box_orig_areas(boxes)
+        # track per-box "visible" pixel count by maintaining a binary visibility mask per box
+        vis_mask = np.ones((boxes.shape[0], h, w), dtype=bool)
+    else:
+        orig_areas = np.zeros(0, dtype=np.float32)
+        vis_mask = None
+
+    pad_value = 114
+    for _ in range(cfg.cutout_count):
+        sf = rng.uniform(*cfg.cutout_size_frac)
+        ch = max(1, int(round(sf * h)))
+        cw = max(1, int(round(sf * w)))
+        y0 = int(rng.integers(0, max(1, h - ch)))
+        x0 = int(rng.integers(0, max(1, w - cw)))
+        img[y0:y0 + ch, x0:x0 + cw] = pad_value
+        if vis_mask is not None:
+            for i in range(boxes.shape[0]):
+                bx1, by1, bx2, by2 = [int(round(v)) for v in boxes[i]]
+                ix0 = max(bx1, x0); iy0 = max(by1, y0)
+                ix1 = min(bx2, x0 + cw); iy1 = min(by2, y0 + ch)
+                if ix1 > ix0 and iy1 > iy0:
+                    vis_mask[i, iy0:iy1, ix0:ix1] = False
+
+    if vis_mask is None or boxes.shape[0] == 0:
+        return img, boxes
+    keep_idx = []
+    for i in range(boxes.shape[0]):
+        bx1, by1, bx2, by2 = [int(round(v)) for v in boxes[i]]
+        bx1 = max(0, min(w, bx1)); by1 = max(0, min(h, by1))
+        bx2 = max(0, min(w, bx2)); by2 = max(0, min(h, by2))
+        if bx2 <= bx1 or by2 <= by1:
+            continue
+        visible = vis_mask[i, by1:by2, bx1:bx2].sum()
+        orig = orig_areas[i]
+        if orig <= 0 or visible / orig >= cfg.min_visible_frac:
+            keep_idx.append(i)
+    return img, boxes[keep_idx] if keep_idx else np.zeros((0, 4), dtype=np.float32)
+
+
 def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
     h, w = img.shape[:2]
 
@@ -115,6 +186,8 @@ def make_augment(cfg: AugConfig):
         rng = np.random.default_rng()
         img = _photometric(img, cfg, rng)
         img, boxes = _geometric(img, boxes, cfg, rng)
+        if cfg.cutout_prob > 0 and rng.random() < cfg.cutout_prob:
+            img, boxes = _cutout(img, boxes, cfg, rng)
         return img, boxes
 
     return aug
