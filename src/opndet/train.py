@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+
 import argparse
 import math
 import time
