@@ -65,6 +65,20 @@ def _cmd_predict(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_quantize(args: argparse.Namespace) -> int:
+    from opndet.quantize import parity_check, quantize_onnx
+    info = quantize_onnx(args.onnx, args.out, args.calib, n_calib=args.n_calib, quant_format=args.format)
+    print(f"int8: {info['int8_path']}")
+    print(f"  fp32 size:  {info['fp32_bytes']/1024:.1f} KB")
+    print(f"  int8 size:  {info['int8_bytes']/1024:.1f} KB")
+    print(f"  ratio:      {info['compression']:.2f}x")
+    print(f"  calibrated on {info['n_calibration_images']} images")
+    if args.verify:
+        diff = parity_check(args.onnx, args.out, args.calib, n_check=16)
+        print(f"parity (n={diff['n']}): obj_mae={diff['obj_mean_abs_diff']:.2e}  all_mae={diff['all_mean_abs_diff']:.2e}")
+    return 0
+
+
 def _cmd_init_config(args: argparse.Namespace) -> int:
     from opndet.presets import bundled_train_template
     src = Path(bundled_train_template())
@@ -139,6 +153,15 @@ def main(argv: list[str] | None = None) -> int:
     pinit = sub.add_parser("init-config", help="Write the bundled training config template to stdout (or --out path)")
     pinit.add_argument("--out", default="-", help="Path or - for stdout")
     pinit.set_defaults(func=_cmd_init_config)
+
+    pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
+    pq.add_argument("--onnx", required=True, help="Input fp32 ONNX")
+    pq.add_argument("--out", required=True, help="Output int8 ONNX")
+    pq.add_argument("--calib", required=True, help="Image directory for calibration")
+    pq.add_argument("--n-calib", type=int, default=100, help="Number of calibration images")
+    pq.add_argument("--format", default="qdq", choices=["qdq", "qoperator"], help="Quantization format")
+    pq.add_argument("--verify", action="store_true", help="After quant, run parity check vs fp32")
+    pq.set_defaults(func=_cmd_quantize)
 
     args = p.parse_args(argv)
     return args.func(args)
