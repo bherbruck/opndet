@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
+import time
 from pathlib import Path
 
 import cv2
@@ -37,6 +40,135 @@ def preprocess(img_bgr: np.ndarray, h: int, w: int) -> tuple[torch.Tensor, dict]
 def unletterbox_box(x1: float, y1: float, x2: float, y2: float, info: dict) -> tuple[float, float, float, float]:
     s, px, py = info["scale"], info["pad_x"], info["pad_y"]
     return ((x1 - px) / s, (y1 - py) / s, (x2 - px) / s, (y2 - py) / s)
+
+
+def _is_url(s: str) -> bool:
+    return s.startswith("http://") or s.startswith("https://")
+
+
+def _download_video(url: str, out_dir: Path) -> Path:
+    """Download a video URL via yt-dlp. Falls back to ffmpeg if yt-dlp is absent."""
+    if not shutil.which("yt-dlp"):
+        raise RuntimeError(
+            "yt-dlp not installed. Install with: uv pip install yt-dlp  (or: pip install yt-dlp)"
+        )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "video.mp4"
+    if out_path.exists():
+        out_path.unlink()
+    print(f"downloading {url} -> {out_path}")
+    subprocess.run(
+        ["yt-dlp", "-f", "best[height<=720]", "-o", str(out_path), url],
+        check=True,
+    )
+    return out_path
+
+
+def _draw_boxes(img_bgr: np.ndarray, dets, thickness: int = 1) -> np.ndarray:
+    out = img_bgr.copy()
+    for d in dets:
+        cv2.rectangle(out, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), (0, 255, 0), thickness)
+        label = f"{d.score:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        cv2.rectangle(out, (int(d.x1), int(d.y1) - th - 4), (int(d.x1) + tw + 4, int(d.y1)), (0, 255, 0), -1)
+        cv2.putText(out, label, (int(d.x1) + 2, int(d.y1) - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+    return out
+
+
+def predict_video(
+    video_path_or_url: str,
+    model_config: str,
+    ckpt: str | None = None,
+    threshold: float = 0.3,
+    device: str = "cpu",
+    save_path: str | Path = "predict_out.mp4",
+    stride: int = 4,
+    max_frames: int | None = None,
+    print_every: int = 30,
+) -> dict:
+    """Run inference on a video (local path or URL). Writes an annotated mp4.
+    Returns a stats dict (frame count, mean dets, det std, total time).
+    """
+    if _is_url(video_path_or_url):
+        cache_dir = Path.cwd() / ".opndet_video_cache"
+        video_path = _download_video(video_path_or_url, cache_dir)
+    else:
+        video_path = Path(video_path_or_url)
+        if not video_path.exists():
+            raise FileNotFoundError(video_path)
+
+    m = load_model(model_config, ckpt, device=device)
+    _, h, w = m.input_shape
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"cv2 could not open {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(save_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if not writer.isOpened():
+        raise RuntimeError(f"cv2.VideoWriter failed to open {save_path}")
+
+    n = 0
+    det_counts = []
+    t_start = time.perf_counter()
+    target = max_frames if max_frames else total_frames or "?"
+    print(f"processing {video_path.name}  ({total_frames or '?'} frames @ {fps:.1f} fps) -> {save_path}")
+
+    try:
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+            t, info = preprocess(frame_bgr, h, w)
+            with torch.no_grad():
+                out = m(t.to(device))
+            out_t = out["output"] if isinstance(out, dict) else out
+            out_np = out_t.cpu().numpy()
+            dets = decode(out_np[0], h, w, stride, threshold=threshold)
+
+            # render on the letterboxed frame so the output canvas matches model input dims
+            canvas = np.full((h, w, 3), 114, dtype=np.uint8)
+            sh, sw = frame_bgr.shape[:2]
+            s = min(w / sw, h / sh)
+            nw, nh = int(round(sw * s)), int(round(sh * s))
+            ox, oy = (w - nw) // 2, (h - nh) // 2
+            canvas[oy:oy + nh, ox:ox + nw] = cv2.resize(frame_bgr, (nw, nh))
+            vis = _draw_boxes(canvas, dets)
+            writer.write(vis)
+
+            det_counts.append(len(dets))
+            n += 1
+            if n % print_every == 0:
+                elapsed = time.perf_counter() - t_start
+                cur_fps = n / max(elapsed, 1e-6)
+                recent = det_counts[-print_every:]
+                print(f"  frame {n}/{target}  proc {cur_fps:.1f} fps  "
+                      f"dets last30: mean={np.mean(recent):.1f} std={np.std(recent):.2f}")
+            if max_frames and n >= max_frames:
+                break
+    finally:
+        cap.release()
+        writer.release()
+
+    elapsed = time.perf_counter() - t_start
+    counts = np.array(det_counts) if det_counts else np.zeros(0)
+    stats = {
+        "frames": n,
+        "elapsed_s": elapsed,
+        "process_fps": n / max(elapsed, 1e-6),
+        "video_fps": fps,
+        "det_mean": float(counts.mean()) if counts.size else 0.0,
+        "det_std": float(counts.std()) if counts.size else 0.0,
+        "det_min": int(counts.min()) if counts.size else 0,
+        "det_max": int(counts.max()) if counts.size else 0,
+        "out": str(save_path),
+    }
+    return stats
 
 
 def predict_image(

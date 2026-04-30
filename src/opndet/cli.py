@@ -52,8 +52,26 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 
 def _cmd_predict(args: argparse.Namespace) -> int:
-    from opndet.predict import predict_image
+    from opndet.predict import predict_image, predict_video
     from opndet.presets import resolve
+
+    if args.video:
+        stats = predict_video(
+            video_path_or_url=args.video,
+            model_config=resolve(args.model),
+            ckpt=args.ckpt,
+            threshold=args.threshold,
+            device=args.device,
+            save_path=args.save or "predict_out.mp4",
+            stride=args.stride,
+            max_frames=args.max_frames,
+        )
+        print(json.dumps(stats, indent=2))
+        return 0
+
+    if not args.image:
+        print("FAIL: must pass --image PATH or --video URL_OR_PATH", file=sys.stderr)
+        return 2
 
     results = predict_image(
         image_path=args.image,
@@ -145,14 +163,18 @@ def main(argv: list[str] | None = None) -> int:
                          "passes raw uint8 0-255 RGB frames without preprocessing.")
     pe.set_defaults(func=_cmd_export)
 
-    pp = sub.add_parser("predict", help="Run inference on a single image")
-    pp.add_argument("--image", required=True)
-    pp.add_argument("--model", required=True, help="Preset name (bbox-n|s|m) or path to YAML")
+    pp = sub.add_parser("predict", help="Run inference on an image or video")
+    pp.add_argument("--image", default=None, help="Path to a single image")
+    pp.add_argument("--video", default=None,
+                    help="Path or URL to a video. URLs use yt-dlp (must be installed).")
+    pp.add_argument("--model", required=True, help="Preset (bbox-n|s|m|p|f) or path to YAML")
     pp.add_argument("--ckpt", default=None)
     pp.add_argument("--threshold", type=float, default=0.3)
     pp.add_argument("--stride", type=int, default=4)
     pp.add_argument("--device", default="cpu")
-    pp.add_argument("--save", default=None, help="Save visualization to this path")
+    pp.add_argument("--save", default=None,
+                    help="Save annotated output. For --image: PNG/JPG. For --video: MP4 (default predict_out.mp4)")
+    pp.add_argument("--max-frames", type=int, default=None, help="Cap video frame count (debug)")
     pp.set_defaults(func=_cmd_predict)
 
     pi = sub.add_parser("info", help="Show model info; pass preset name or YAML path")
