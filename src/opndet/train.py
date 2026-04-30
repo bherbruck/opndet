@@ -54,20 +54,76 @@ def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return inter / union
 
 
+def _ap_at_iou(per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]], iou_thresh: float) -> float:
+    """COCO-style 101-point AP at one IoU threshold. per_image: list of (scores, pred_boxes, gt_boxes)."""
+    n_gt_total = sum(gt.shape[0] for _, _, gt in per_image)
+    if n_gt_total == 0:
+        return 0.0
+    all_scores: list[float] = []
+    all_is_tp: list[int] = []
+    for scores, boxes, gt_boxes in per_image:
+        if boxes.shape[0] == 0:
+            continue
+        order = np.argsort(-scores)
+        boxes = boxes[order]
+        scores = scores[order]
+        if gt_boxes.shape[0] == 0:
+            all_scores.extend(scores.tolist())
+            all_is_tp.extend([0] * len(scores))
+            continue
+        ious = _iou_xyxy(boxes, gt_boxes)
+        matched = np.zeros(gt_boxes.shape[0], dtype=bool)
+        for i in range(boxes.shape[0]):
+            best_j = -1
+            best_iou = iou_thresh
+            for j in range(gt_boxes.shape[0]):
+                if matched[j]:
+                    continue
+                if ious[i, j] > best_iou:
+                    best_iou = ious[i, j]
+                    best_j = j
+            if best_j >= 0:
+                matched[best_j] = True
+                all_is_tp.append(1)
+            else:
+                all_is_tp.append(0)
+            all_scores.append(float(scores[i]))
+    if not all_scores:
+        return 0.0
+    s = np.array(all_scores); t = np.array(all_is_tp, dtype=np.float32)
+    order = np.argsort(-s)
+    t = t[order]
+    cum_tp = np.cumsum(t)
+    cum_fp = np.cumsum(1.0 - t)
+    p = cum_tp / np.maximum(1.0, cum_tp + cum_fp)
+    r = cum_tp / max(1, n_gt_total)
+    ap = 0.0
+    for level in np.linspace(0, 1, 101):
+        mask = r >= level
+        ap += (p[mask].max() if mask.any() else 0.0) / 101.0
+    return float(ap)
+
+
 @torch.no_grad()
 def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thresh: float = 0.3, iou_thresh: float = 0.5) -> dict[str, float]:
     model.eval()
     tp = fp = fn = 0
     n_pred = n_gt = 0
+    per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []  # (scores, boxes, gt) for mAP
     for imgs, boxes_list, _ in tqdm(loader, desc="val", leave=False):
         imgs = imgs.to(device, non_blocking=True)
         out = model(imgs)
         out_t = out["output"] if isinstance(out, dict) else out
         out_np = out_t.cpu().numpy()
+        # decode at very low threshold to capture full PR curve for AP
+        dets_per_full = decode_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=1e-3)
         dets_per = decode_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=score_thresh)
-        for dets, gt in zip(dets_per, boxes_list):
+        for dets, dets_full, gt in zip(dets_per, dets_per_full, boxes_list):
             n_pred += len(dets)
             n_gt += gt.shape[0]
+            scores_arr = np.array([d.score for d in dets_full], dtype=np.float32) if dets_full else np.zeros(0, dtype=np.float32)
+            boxes_arr = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets_full], dtype=np.float32) if dets_full else np.zeros((0, 4), dtype=np.float32)
+            per_image.append((scores_arr, boxes_arr, gt.astype(np.float32)))
             if not dets or gt.shape[0] == 0:
                 fn += gt.shape[0]
                 fp += len(dets)
@@ -86,7 +142,12 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thre
     precision = tp / max(1, tp + fp)
     recall = tp / max(1, tp + fn)
     f1 = 2 * precision * recall / max(1e-9, precision + recall)
-    return {"precision": precision, "recall": recall, "f1": f1, "n_pred": float(n_pred), "n_gt": float(n_gt)}
+
+    map50 = _ap_at_iou(per_image, 0.5)
+    iou_grid = np.arange(0.5, 1.0, 0.05)
+    map_50_95 = float(np.mean([_ap_at_iou(per_image, float(t)) for t in iou_grid]))
+
+    return {"precision": precision, "recall": recall, "f1": f1, "map50": map50, "map_50_95": map_50_95, "n_pred": float(n_pred), "n_gt": float(n_gt)}
 
 
 def _resolve_out_dir(base: Path, auto_increment: bool = True) -> Path:
@@ -214,19 +275,22 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             vis_boxes.append(boxes)
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
 
-    best_f1 = -1.0
+    metric_for_best = str(c.get("metric_for_best", "f1"))   # f1 | map50 | map_50_95
+    if metric_for_best not in ("f1", "map50", "map_50_95"):
+        raise ValueError(f"metric_for_best must be one of f1|map50|map_50_95, got {metric_for_best}")
+    best_metric = -1.0
     best_epoch = 0
     patience = int(c.get("patience", 0))   # 0 = disabled
     step = 0
     start_epoch = 0
     if resume_state is not None:
         start_epoch = int(resume_state.get("epoch", 0))
-        best_f1 = float(resume_state.get("best_f1", -1.0))
+        best_metric = float(resume_state.get("best_metric", resume_state.get("best_f1", -1.0)))
         best_epoch = int(resume_state.get("best_epoch", start_epoch))
         step = int(resume_state.get("step", start_epoch * max(1, len(train_loader))))
         if needs_scaler and "scaler" in resume_state:
             scaler.load_state_dict(resume_state["scaler"])
-        print(f"resuming from epoch {start_epoch + 1}, best_f1={best_f1:.3f} @ epoch {best_epoch}, step={step}")
+        print(f"resuming from epoch {start_epoch + 1}, best_{metric_for_best}={best_metric:.3f} @ epoch {best_epoch}, step={step}")
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -263,7 +327,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         dt = time.time() - t0
         m = evaluate(model, val_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
         cur_lr = opt.param_groups[0]["lr"]
-        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  hm={avg['l_hm']:.4f} cxy={avg['l_cxy']:.4f} wh={avg['l_wh']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  n_pred={m['n_pred']:.0f}/n_gt={m['n_gt']:.0f}  ({dt:.1f}s)")
+        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  ({dt:.1f}s)")
 
         ep = epoch + 1
         writer.add_scalar("lr", cur_lr, ep)
@@ -280,26 +344,28 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
 
+        cur = float(m[metric_for_best])
         ckpt = {
             "epoch": ep,
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
             "scaler": scaler.state_dict() if needs_scaler else None,
             "step": step,
-            "best_f1": best_f1,
+            "best_metric": best_metric,
             "best_epoch": best_epoch,
+            "metric_for_best": metric_for_best,
             "metrics": m,
             "config": c,
         }
         torch.save(ckpt, out_dir / "last.pt")
-        if m["f1"] > best_f1:
-            best_f1 = m["f1"]
+        if cur > best_metric:
+            best_metric = cur
             best_epoch = ep
             torch.save(ckpt, out_dir / "best.pt")
-            print(f"  -> saved best (F1={best_f1:.3f})")
+            print(f"  -> saved best ({metric_for_best}={best_metric:.3f})")
 
         if patience > 0 and (ep - best_epoch) >= patience:
-            print(f"early stop: no F1 improvement for {patience} epochs (best F1={best_f1:.3f} @ epoch {best_epoch})")
+            print(f"early stop: no {metric_for_best} improvement for {patience} epochs (best={best_metric:.3f} @ epoch {best_epoch})")
             break
 
     print("running final test eval ...")
