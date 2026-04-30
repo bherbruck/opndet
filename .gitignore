@@ -41,6 +41,11 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# stray images (e.g. shared screenshots)
+/image.png
+/image.jpg
+/image.jpeg
+
 # Claude Code / agent scratch
 .claude/
 
