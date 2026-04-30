@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from opndet.augment import AugConfig, make_augment
 from opndet.dataset import OpndetDataset, collate, load_datasets, split_samples
@@ -52,7 +53,7 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thre
     model.eval()
     tp = fp = fn = 0
     n_pred = n_gt = 0
-    for imgs, boxes_list, _ in loader:
+    for imgs, boxes_list, _ in tqdm(loader, desc="val", leave=False):
         imgs = imgs.to(device, non_blocking=True)
         out = model(imgs)
         out_t = out["output"] if isinstance(out, dict) else out
@@ -186,7 +187,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         model.train()
         t0 = time.time()
         running = {"loss": 0.0, "l_hm": 0.0, "l_cxy": 0.0, "l_wh": 0.0}
-        for imgs, _, tgt in train_loader:
+        pbar = tqdm(train_loader, desc=f"epoch {epoch+1}/{epochs}", leave=False)
+        for imgs, _, tgt in pbar:
             for g in opt.param_groups:
                 g["lr"] = cosine_lr(step, total_steps, base_lr, warmup=warmup)
             imgs = imgs.to(device, non_blocking=True)
@@ -203,6 +205,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             for k in running:
                 running[k] += float(losses.get(k, torch.tensor(0.0)).detach()) if k in losses else 0.0
             step += 1
+            if step % 5 == 0:
+                pbar.set_postfix(loss=f"{losses['loss'].item():.3f}", lr=f"{opt.param_groups[0]['lr']:.1e}")
 
         n_iter = max(1, len(train_loader))
         avg = {k: v / n_iter for k, v in running.items()}
