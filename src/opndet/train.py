@@ -19,6 +19,8 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+import copy
+
 from opndet.augment import AugConfig, make_augment
 from opndet.dataset import OpndetDataset, collate, load_datasets, split_samples
 from opndet.decode import decode_batch
@@ -27,6 +29,23 @@ from opndet.loss import OpndetBboxLoss
 from opndet.presets import resolve as _resolve_preset
 from opndet.visualize import render_predictions
 from opndet.yaml_build import build_model_from_yaml
+
+
+class EMA:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model).eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        d = self.decay
+        for p_s, p in zip(self.shadow.parameters(), model.parameters()):
+            p_s.mul_(d).add_(p.detach(), alpha=1.0 - d)
+        for b_s, b in zip(self.shadow.buffers(), model.buffers()):
+            if b_s.dtype == b.dtype and b_s.shape == b.shape:
+                b_s.copy_(b)
 
 
 class _CfgShim:
@@ -248,7 +267,11 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     val_loader = DataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
     test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
 
-    loss_fn = OpndetBboxLoss(**(c.get("loss") or {}))
+    loss_kw = c.get("loss") or {}
+    loss_kw.setdefault("img_h", img_h)
+    loss_kw.setdefault("img_w", img_w)
+    loss_kw.setdefault("stride", cfg_shim.stride)
+    loss_fn = OpndetBboxLoss(**loss_kw)
     opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
@@ -264,8 +287,16 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     base_lr = float(c["lr"])
     warmup = int(c.get("warmup_steps", 200))
 
+    ema = None
+    ema_decay = float(c.get("ema_decay", 0.0))
+    if ema_decay > 0:
+        ema = EMA(model, decay=ema_decay)
+        if resume_state is not None and "ema" in resume_state and resume_state["ema"] is not None:
+            ema.shadow.load_state_dict(resume_state["ema"])
+        print(f"EMA enabled (decay={ema_decay})")
+
     n_vis = int(c.get("vis_samples", 4))
-    vis_every = int(c.get("vis_every", 5))   # render TB images every N epochs (0 = never)
+    vis_every = int(c.get("vis_every", 5))
     vis_imgs = []
     vis_boxes = []
     if n_vis > 0 and vis_every > 0:
@@ -316,6 +347,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 losses["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 opt.step()
+            if ema is not None:
+                ema.update(model)
             for k in running:
                 running[k] += float(losses.get(k, torch.tensor(0.0)).detach()) if k in losses else 0.0
             step += 1
@@ -325,7 +358,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         n_iter = max(1, len(train_loader))
         avg = {k: v / n_iter for k, v in running.items()}
         dt = time.time() - t0
-        m = evaluate(model, val_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+        eval_model = ema.shadow if ema is not None else model
+        m = evaluate(eval_model, val_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
         cur_lr = opt.param_groups[0]["lr"]
         print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  ({dt:.1f}s)")
 
@@ -345,11 +379,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
 
         cur = float(m[metric_for_best])
+        # If EMA is on, save EMA weights as the deployed model — they're the eval-quality ones.
+        deployed_state = ema.shadow.state_dict() if ema is not None else model.state_dict()
         ckpt = {
             "epoch": ep,
-            "model": model.state_dict(),
+            "model": deployed_state,
             "optimizer": opt.state_dict(),
             "scaler": scaler.state_dict() if needs_scaler else None,
+            "ema": ema.shadow.state_dict() if ema is not None else None,
             "step": step,
             "best_metric": best_metric,
             "best_epoch": best_epoch,

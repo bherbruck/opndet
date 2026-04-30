@@ -56,9 +56,14 @@ augment:
   cutout_size_frac: [0.05, 0.20]
   min_visible_frac: 0.5       # drop GT boxes whose visible area falls below this
 
+ema_decay: 0.999          # 0 = off; 0.999 is yolov8 default. Eval + best.pt use EMA weights when on.
+
 loss:
   w_hm: 1.0
   w_cxy: 1.0
-  w_wh: 5.0
+  w_wh: 1.5               # GIoU/CIoU loss is 0..2 range so weight should be near 1, not 5
   focal_alpha: 2.0
   focal_beta: 4.0
+  wh_loss: ciou           # l1 | giou | ciou | nwd. ciou is the universal best-default for normal-size objects.
+  repulsion_weight: 0.0   # set ~0.5 for crowded scenes with touching objects (only used with iou-based wh_loss)
+  nwd_c: 12.8             # only used when wh_loss: nwd
