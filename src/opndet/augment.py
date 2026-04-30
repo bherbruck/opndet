@@ -98,47 +98,41 @@ def _filter_visible(boxes: np.ndarray, orig_areas: np.ndarray, min_frac: float) 
 
 def _cutout(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
     """Paste random rectangles of mean-gray over the image, then drop boxes whose
-    visible area falls below cfg.min_visible_frac.
+    visible area falls below cfg.min_visible_frac. Visibility is computed
+    analytically as 1 - sum(box-hole intersections) / box_area; assumes holes
+    don't overlap each other significantly within any single box (true for the
+    typical small N_holes regime).
     """
     h, w = img.shape[:2]
-    if boxes.shape[0] > 0:
-        orig_areas = _box_orig_areas(boxes)
-        # track per-box "visible" pixel count by maintaining a binary visibility mask per box
-        vis_mask = np.ones((boxes.shape[0], h, w), dtype=bool)
-    else:
-        orig_areas = np.zeros(0, dtype=np.float32)
-        vis_mask = None
-
     pad_value = 114
-    for _ in range(cfg.cutout_count):
+    holes = np.zeros((cfg.cutout_count, 4), dtype=np.float32)
+    for k in range(cfg.cutout_count):
         sf = rng.uniform(*cfg.cutout_size_frac)
         ch = max(1, int(round(sf * h)))
         cw = max(1, int(round(sf * w)))
         y0 = int(rng.integers(0, max(1, h - ch)))
         x0 = int(rng.integers(0, max(1, w - cw)))
         img[y0:y0 + ch, x0:x0 + cw] = pad_value
-        if vis_mask is not None:
-            for i in range(boxes.shape[0]):
-                bx1, by1, bx2, by2 = [int(round(v)) for v in boxes[i]]
-                ix0 = max(bx1, x0); iy0 = max(by1, y0)
-                ix1 = min(bx2, x0 + cw); iy1 = min(by2, y0 + ch)
-                if ix1 > ix0 and iy1 > iy0:
-                    vis_mask[i, iy0:iy1, ix0:ix1] = False
+        holes[k] = (x0, y0, x0 + cw, y0 + ch)
 
-    if vis_mask is None or boxes.shape[0] == 0:
+    if boxes.shape[0] == 0:
         return img, boxes
-    keep_idx = []
-    for i in range(boxes.shape[0]):
-        bx1, by1, bx2, by2 = [int(round(v)) for v in boxes[i]]
-        bx1 = max(0, min(w, bx1)); by1 = max(0, min(h, by1))
-        bx2 = max(0, min(w, bx2)); by2 = max(0, min(h, by2))
-        if bx2 <= bx1 or by2 <= by1:
-            continue
-        visible = vis_mask[i, by1:by2, bx1:bx2].sum()
-        orig = orig_areas[i]
-        if orig <= 0 or visible / orig >= cfg.min_visible_frac:
-            keep_idx.append(i)
-    return img, boxes[keep_idx] if keep_idx else np.zeros((0, 4), dtype=np.float32)
+
+    bx = boxes
+    bw = (bx[:, 2] - bx[:, 0]).clip(min=0)
+    bh = (bx[:, 3] - bx[:, 1]).clip(min=0)
+    box_area = bw * bh
+
+    # pairwise intersection area: [N, K]
+    ix1 = np.maximum(bx[:, None, 0], holes[None, :, 0])
+    iy1 = np.maximum(bx[:, None, 1], holes[None, :, 1])
+    ix2 = np.minimum(bx[:, None, 2], holes[None, :, 2])
+    iy2 = np.minimum(bx[:, None, 3], holes[None, :, 3])
+    inter = (ix2 - ix1).clip(min=0) * (iy2 - iy1).clip(min=0)
+    obscured = inter.sum(axis=1)
+    visible_frac = np.where(box_area > 0, 1.0 - obscured / np.maximum(box_area, 1e-9), 1.0)
+    keep = visible_frac >= cfg.min_visible_frac
+    return img, boxes[keep]
 
 
 def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
