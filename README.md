@@ -52,11 +52,12 @@ The `--model` flag accepts a **bundled preset name** (`bbox-n`, `bbox-s`, `bbox-
 
 ## Bundled presets
 
-| Preset   | Params | Notes                        |
-|----------|--------|------------------------------|
-| `bbox-n` | 0.31M  | Nano. Edge devices.          |
-| `bbox-s` | 1.27M  | Small. Default.              |
-| `bbox-m` | 2.37M  | Medium. ≈ YOLOv8n FLOP budget. |
+| Preset   | Params  | Notes                                   |
+|----------|---------|-----------------------------------------|
+| `bbox-p` | 92K     | Pico. Microcontroller / TinyML class.   |
+| `bbox-n` | 0.31M   | Nano. Edge devices.                     |
+| `bbox-s` | 1.27M   | Small. Default.                         |
+| `bbox-m` | 2.37M   | Medium. ≈ YOLOv8n FLOP budget.          |
 
 All produce the same output layout: `[1, 5, H/4, W/4]`, fixed input `(3, 384, 512)`.
 
