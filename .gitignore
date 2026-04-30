@@ -42,9 +42,9 @@ htmlcov/
 Thumbs.db
 
 # stray images (e.g. shared screenshots)
-/image.png
-/image.jpg
-/image.jpeg
+/*.png
+/*.jpg
+/*.jpeg
 
 # Claude Code / agent scratch
 .claude/
