@@ -65,5 +65,9 @@ loss:
   focal_alpha: 2.0
   focal_beta: 4.0
   wh_loss: ciou           # l1 | giou | ciou | nwd. ciou is the universal best-default for normal-size objects.
+  cls_loss: focal         # focal | vfl. vfl pushes confidence toward IoU quality — use when you need bimodal
+                          #   confidence (clear=0.95+, noise=0.05-) for tracking pipelines that can't tolerate flapping.
+  vfl_alpha: 0.75
+  vfl_gamma: 2.0
   repulsion_weight: 0.0   # set ~0.5 for crowded scenes with touching objects (only used with iou-based wh_loss)
   nwd_c: 12.8             # only used when wh_loss: nwd

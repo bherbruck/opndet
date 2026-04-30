@@ -40,7 +40,7 @@ def _draw_gaussian(hm: np.ndarray, cx: int, cy: int, sigma: float) -> None:
 def encode_targets(
     boxes: np.ndarray,
     cfg: ModelConfig,
-    min_sigma: float = 1.5,
+    min_sigma: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Encode list of (x1,y1,x2,y2) pixel boxes into dense GT tensors.
 

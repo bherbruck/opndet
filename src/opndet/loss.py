@@ -79,6 +79,52 @@ def _nwd(p: torch.Tensor, g: torch.Tensor, c: float = 12.8, eps: float = 1e-7) -
     return 1.0 - torch.exp(-torch.sqrt(w2 + eps) / c)
 
 
+def _iou_only(p: torch.Tensor, g: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Pairwise per-cell IoU. p,g: [B,4,H,W] xyxy. Returns [B,1,H,W] in [0,1]."""
+    px1, py1, px2, py2 = p[:, 0:1], p[:, 1:2], p[:, 2:3], p[:, 3:4]
+    gx1, gy1, gx2, gy2 = g[:, 0:1], g[:, 1:2], g[:, 2:3], g[:, 3:4]
+    pw = (px2 - px1).clamp(min=0); ph = (py2 - py1).clamp(min=0)
+    gw = (gx2 - gx1).clamp(min=0); gh = (gy2 - gy1).clamp(min=0)
+    p_area = pw * ph; g_area = gw * gh
+    ix1 = torch.max(px1, gx1); iy1 = torch.max(py1, gy1)
+    ix2 = torch.min(px2, gx2); iy2 = torch.min(py2, gy2)
+    inter = (ix2 - ix1).clamp(min=0) * (iy2 - iy1).clamp(min=0)
+    union = p_area + g_area - inter + eps
+    return inter / union
+
+
+def varifocal_loss(
+    pred_logit: torch.Tensor,
+    pos_mask: torch.Tensor,
+    iou_target: torch.Tensor,
+    alpha: float = 0.75,
+    gamma: float = 2.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Varifocal Loss (Zhang et al., 2021).
+
+    pred_logit: [B,1,H,W] raw obj logit
+    pos_mask:   [B,1,H,W] 1.0 at positive cells, 0 elsewhere
+    iou_target: [B,1,H,W] IoU between predicted bbox and GT bbox at each cell
+                (0 elsewhere). Detach gradients — quality target is supervisory only.
+
+    Positive cells: BCE weighted by IoU (soft target = IoU).
+    Negative cells: focal-style alpha * p^gamma * BCE, downweights easy negatives.
+
+    Effect: confidence becomes bimodal — strong predictions push to ~IoU which is high
+    (0.8-1.0), weak predictions get pushed near 0. Eliminates the squishy mid-range
+    that causes detection flapping.
+    """
+    p = torch.sigmoid(pred_logit).clamp(eps, 1 - eps)
+    q = iou_target.detach() * pos_mask
+    pos = pos_mask
+    neg = 1.0 - pos_mask
+    weight = q * pos + alpha * p.pow(gamma) * neg
+    bce = -(q * torch.log(p) + (1 - q) * torch.log(1 - p))
+    n_pos = pos.sum().clamp(min=1.0)
+    return (weight * bce).sum() / n_pos
+
+
 def focal_heatmap_loss(pred_logit: torch.Tensor, gt: torch.Tensor, alpha: float = 2.0, beta: float = 4.0) -> torch.Tensor:
     """CornerNet/CenterNet focal loss on Gaussian heatmap.
 
@@ -106,7 +152,10 @@ class OpndetBboxLoss(nn.Module):
         focal_alpha: float = 2.0,
         focal_beta: float = 4.0,
         wh_loss: str = "l1",            # l1 | giou | ciou | nwd
-        repulsion_weight: float = 0.0,  # set >0 to enable RepGT-style penalty
+        cls_loss: str = "focal",        # focal | vfl
+        vfl_alpha: float = 0.75,
+        vfl_gamma: float = 2.0,
+        repulsion_weight: float = 0.0,
         nwd_c: float = 12.8,
         img_h: int = 384,
         img_w: int = 512,
@@ -119,6 +168,9 @@ class OpndetBboxLoss(nn.Module):
         self.alpha = focal_alpha
         self.beta = focal_beta
         self.wh_loss = wh_loss
+        self.cls_loss = cls_loss
+        self.vfl_alpha = vfl_alpha
+        self.vfl_gamma = vfl_gamma
         self.rep_w = repulsion_weight
         self.nwd_c = nwd_c
         self.img_h = img_h
@@ -130,8 +182,6 @@ class OpndetBboxLoss(nn.Module):
         cxy_logit = raw[:, 1:3]
         wh_logit = raw[:, 3:5]
 
-        l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
-
         pos = tgt["pos"]
         n_pos = pos.sum().clamp(min=1.0)
 
@@ -139,25 +189,34 @@ class OpndetBboxLoss(nn.Module):
         l_cxy = (F.l1_loss(cxy_pred, tgt["cxy"], reduction="none") * pos).sum() / n_pos
 
         wh_pred = torch.sigmoid(wh_logit)
-        if self.wh_loss == "l1":
-            l_wh = (F.l1_loss(wh_pred, tgt["wh"], reduction="none") * pos).sum() / n_pos
-        else:
+        # decoded boxes needed for ciou/giou/nwd wh loss AND for VFL IoU target
+        pred_xyxy = None
+        gt_xyxy = None
+        if self.wh_loss != "l1" or self.cls_loss == "vfl":
             pred_xyxy = _decode_pred_xyxy(cxy_pred, wh_pred, tgt["cxy"], pos, self.img_h, self.img_w, self.stride)
             gt_cx = (tgt["cxy"][:, 0:1] + _grid_xs(cxy_pred)) * self.stride
             gt_cy = (tgt["cxy"][:, 1:2] + _grid_ys(cxy_pred)) * self.stride
             gw = tgt["wh"][:, 0:1] * self.img_w
             gh = tgt["wh"][:, 1:2] * self.img_h
             gt_xyxy = torch.cat([gt_cx - gw/2, gt_cy - gh/2, gt_cx + gw/2, gt_cy + gh/2], dim=1)
-            if self.wh_loss == "nwd":
-                per_cell = _nwd(pred_xyxy, gt_xyxy, c=self.nwd_c)
-            else:
-                per_cell = _bbox_iou(pred_xyxy, gt_xyxy, mode=self.wh_loss)
-            l_wh = (per_cell * pos).sum() / n_pos
+
+        if self.wh_loss == "l1":
+            l_wh = (F.l1_loss(wh_pred, tgt["wh"], reduction="none") * pos).sum() / n_pos
+        elif self.wh_loss == "nwd":
+            l_wh = (_nwd(pred_xyxy, gt_xyxy, c=self.nwd_c) * pos).sum() / n_pos
+        else:
+            l_wh = (_bbox_iou(pred_xyxy, gt_xyxy, mode=self.wh_loss) * pos).sum() / n_pos
+
+        if self.cls_loss == "vfl":
+            iou_target = _iou_only(pred_xyxy, gt_xyxy) * pos
+            l_hm = varifocal_loss(hm_logit, pos, iou_target, alpha=self.vfl_alpha, gamma=self.vfl_gamma)
+        else:
+            l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
 
         total = self.w_hm * l_hm + self.w_cxy * l_cxy + self.w_wh * l_wh
         out = {"loss": total, "l_hm": l_hm.detach(), "l_cxy": l_cxy.detach(), "l_wh": l_wh.detach()}
 
-        if self.rep_w > 0 and self.wh_loss != "l1":
+        if self.rep_w > 0 and pred_xyxy is not None:
             l_rep = _repulsion_loss(pred_xyxy, tgt, pos, self.img_h, self.img_w, self.stride)
             out["loss"] = out["loss"] + self.rep_w * l_rep
             out["l_rep"] = l_rep.detach()

@@ -30,7 +30,7 @@ model:
     - {name: raw,   from: trunk, module: Conv,      args: {in_ch: 96, out_ch: 5,  k: 1, bias_init: [-2.19, 0.0, 0.0, 0.0, 0.0]}}
 
     - {name: obj_r, from: raw,   module: SplitChannels,       args: {start: 0, end: 1}}
-    - {name: obj,   from: obj_r, module: SigmoidPeakSuppress, args: {k: 3, eps: 1.0e-3}}
+    - {name: obj,   from: obj_r, module: SigmoidPeakSuppress, args: {k: 5, eps: 1.0e-3}}
     - {name: cxy_r, from: raw,   module: SplitChannels,       args: {start: 1, end: 3}}
     - {name: cxy,   from: cxy_r, module: Sigmoid,             args: {}}
     - {name: wh_r,  from: raw,   module: SplitChannels,       args: {start: 3, end: 5}}
