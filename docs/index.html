@@ -242,24 +242,67 @@ els.imageFile.onchange = async (e) => {
   img.src = URL.createObjectURL(f);
 };
 
+// Persistent hidden video element (detached video doesn't reliably play in many browsers).
+let webcamVideo = null;
+function ensureVideo() {
+  if (webcamVideo) return webcamVideo;
+  const v = document.createElement("video");
+  v.playsInline = true;
+  v.muted = true;            // Safari/iOS requires muted for autoplay
+  v.autoplay = true;
+  v.style.cssText = "position:fixed;left:-99999px;top:-99999px;width:1px;height:1px;";
+  document.body.appendChild(v);
+  webcamVideo = v;
+  return v;
+}
+
+async function getStream() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("getUserMedia not supported. Need HTTPS (or localhost) and a modern browser.");
+  }
+  // Try rear camera first; fall back to default.
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+  } catch {
+    return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  }
+}
+
 els.webcamBtn.onclick = async () => {
   try {
-    webcamStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 1280, height: 720, facingMode: "environment" },
+    if (webcamStream) return;
+    const v = ensureVideo();
+    webcamStream = await getStream();
+    v.srcObject = webcamStream;
+    await new Promise((res, rej) => {
+      const ok = () => { v.removeEventListener("loadedmetadata", ok); res(); };
+      v.addEventListener("loadedmetadata", ok, { once: true });
+      setTimeout(() => rej(new Error("video metadata timeout")), 5000);
     });
-    const v = document.createElement("video");
-    v.srcObject = webcamStream; v.playsInline = true;
-    await v.play();
+    try { await v.play(); } catch (e) { /* play may auto-trigger; ignore promise rejection */ }
+
     els.webcamBtn.disabled = true; els.stopWebcamBtn.disabled = false;
+
     const tick = async () => {
       if (!webcamStream) return;
-      lastImage = v;
-      if (session) await runOn(v); else drawOnly(v);
+      try {
+        lastImage = v;
+        if (session) await runOn(v); else drawOnly(v);
+      } catch (err) {
+        console.error("tick error", err);
+      }
       webcamRAF = requestAnimationFrame(tick);
     };
     tick();
   } catch (err) {
-    alert("webcam: " + err.message);
+    console.error(err);
+    alert("webcam error: " + err.message + "\n\nIf you're on iOS, you must use Safari over HTTPS. Tap the lock icon → Camera Access → Allow.");
+    if (webcamStream) webcamStream.getTracks().forEach(t => t.stop());
+    webcamStream = null;
+    els.webcamBtn.disabled = false; els.stopWebcamBtn.disabled = true;
   }
 };
 
