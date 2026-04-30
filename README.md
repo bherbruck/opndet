@@ -97,6 +97,12 @@ opndet trains on **any single-class detection dataset in COCO format**. Multi-so
 
    Auto train/val/test split (deterministic by seed). AdamW + cosine LR + AMP on CUDA. Checkpoints saved to `out_dir/{best,last}.pt`. F1 logged per epoch on the val split.
 
+   Logs land at `out_dir/tb/`. Launch TensorBoard:
+   ```bash
+   tensorboard --logdir runs/exp1/tb
+   ```
+   Each epoch logs scalars (loss, P/R/F1, LR) and image grids of validation predictions (GT red, preds green).
+
 5. Export to ONNX (opset 13):
 
    ```bash

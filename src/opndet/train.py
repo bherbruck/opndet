@@ -18,6 +18,7 @@ from opndet.decode import decode_batch
 from opndet.encode import encode_targets
 from opndet.loss import OpndetBboxLoss
 from opndet.presets import resolve as _resolve_preset
+from opndet.visualize import render_predictions
 from opndet.yaml_build import build_model_from_yaml
 
 
@@ -81,6 +82,19 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thre
     return {"precision": precision, "recall": recall, "f1": f1, "n_pred": float(n_pred), "n_gt": float(n_gt)}
 
 
+def _resolve_out_dir(base: Path, auto_increment: bool = True) -> Path:
+    """If base doesn't exist or is empty, return base. Otherwise pick base_2, base_3, ..."""
+    if not auto_increment:
+        return base
+    if not base.exists() or not any(base.iterdir()):
+        return base
+    parent, stem = base.parent, base.name
+    n = 2
+    while (parent / f"{stem}_{n}").exists():
+        n += 1
+    return parent / f"{stem}_{n}"
+
+
 def cosine_lr(step: int, total: int, base: float, warmup: int = 200, min_factor: float = 0.05) -> float:
     if step < warmup:
         return base * (step + 1) / max(1, warmup)
@@ -92,9 +106,16 @@ def train(cfg_path: str) -> None:
     with open(cfg_path) as f:
         c = yaml.safe_load(f)
 
-    out_dir = Path(c["out_dir"]); out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _resolve_out_dir(Path(c["out_dir"]), auto_increment=bool(c.get("auto_increment", True)))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tb_dir = out_dir / "tb"
+    print(f"out_dir: {out_dir}")
     seed = int(c.get("seed", 0))
     torch.manual_seed(seed); np.random.seed(seed)
+
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir=str(tb_dir))
+    print(f"tensorboard: {tb_dir}")
 
     device = torch.device("cuda" if torch.cuda.is_available() and c.get("device", "auto") != "cpu" else "cpu")
     print(f"device: {device}")
@@ -139,6 +160,15 @@ def train(cfg_path: str) -> None:
     base_lr = float(c["lr"])
     warmup = int(c.get("warmup_steps", 200))
 
+    n_vis = int(c.get("vis_samples", 8))
+    vis_imgs = []
+    vis_boxes = []
+    for i in range(min(n_vis, len(val_ds))):
+        img_t, boxes, _ = val_ds[i]
+        vis_imgs.append(img_t)
+        vis_boxes.append(boxes)
+    vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
+
     best_f1 = -1.0
     step = 0
     for epoch in range(epochs):
@@ -170,7 +200,22 @@ def train(cfg_path: str) -> None:
         cur_lr = opt.param_groups[0]["lr"]
         print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  hm={avg['l_hm']:.4f} cxy={avg['l_cxy']:.4f} wh={avg['l_wh']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  n_pred={m['n_pred']:.0f}/n_gt={m['n_gt']:.0f}  ({dt:.1f}s)")
 
-        ckpt = {"epoch": epoch + 1, "model": model.state_dict(), "metrics": m, "config": c}
+        ep = epoch + 1
+        writer.add_scalar("lr", cur_lr, ep)
+        for k, v in avg.items():
+            writer.add_scalar(f"train/{k}", v, ep)
+        for k, v in m.items():
+            writer.add_scalar(f"val/{k}", v, ep)
+        writer.add_scalar("time/epoch_s", dt, ep)
+
+        if vis_batch is not None:
+            grid = render_predictions(
+                model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
+                threshold=float(c.get("eval_threshold", 0.3)), device=device,
+            )
+            writer.add_images("val/preds", grid, ep, dataformats="NCHW")
+
+        ckpt = {"epoch": ep, "model": model.state_dict(), "metrics": m, "config": c}
         torch.save(ckpt, out_dir / "last.pt")
         if m["f1"] > best_f1:
             best_f1 = m["f1"]
@@ -182,6 +227,9 @@ def train(cfg_path: str) -> None:
     model.load_state_dict(state["model"])
     m = evaluate(model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
     print(f"TEST: P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  n_pred={m['n_pred']:.0f}/n_gt={m['n_gt']:.0f}")
+    for k, v in m.items():
+        writer.add_scalar(f"test/{k}", v, epochs)
+    writer.close()
 
 
 def main() -> None:

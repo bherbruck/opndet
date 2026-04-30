@@ -12,6 +12,7 @@ dependencies = [
     "pillow>=10.0",
     "opencv-python-headless>=4.8",
     "pyyaml>=6.0",
+    "tensorboard>=2.13",
 ]
 
 [project.optional-dependencies]
