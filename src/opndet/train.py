@@ -4,6 +4,7 @@ import argparse
 import math
 import time
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -14,15 +15,10 @@ from torch.utils.data import DataLoader
 from opndet.augment import AugConfig, make_augment
 from opndet.dataset import OpndetDataset, collate, load_datasets, split_samples
 from opndet.decode import decode_batch
-from opndet.encode import collate_targets, encode_targets
+from opndet.encode import encode_targets
 from opndet.loss import OpndetBboxLoss
 from opndet.presets import resolve as _resolve_preset
 from opndet.yaml_build import build_model_from_yaml
-
-
-def _make_targets_batch(boxes_list, cfg) -> dict[str, torch.Tensor]:
-    items = [encode_targets(b, cfg) for b in boxes_list]
-    return collate_targets(items)
 
 
 class _CfgShim:
@@ -55,7 +51,7 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thre
     model.eval()
     tp = fp = fn = 0
     n_pred = n_gt = 0
-    for imgs, boxes_list in loader:
+    for imgs, boxes_list, _ in loader:
         imgs = imgs.to(device, non_blocking=True)
         out = model(imgs)
         out_t = out["output"] if isinstance(out, dict) else out
@@ -120,12 +116,18 @@ def train(cfg_path: str) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}")
 
-    train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn)
-    val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None)
-    test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None)
-    train_loader = DataLoader(train_ds, batch_size=int(c["batch_size"]), shuffle=True, num_workers=int(c.get("num_workers", 2)), collate_fn=collate, pin_memory=device.type == "cuda")
-    val_loader = DataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, num_workers=int(c.get("num_workers", 2)), collate_fn=collate)
-    test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, num_workers=int(c.get("num_workers", 2)), collate_fn=collate)
+    encode_fn = partial(encode_targets, cfg=cfg_shim)
+    train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn, encode_fn=encode_fn)
+    val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn)
+    test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn)
+    nw = int(c.get("num_workers", 2))
+    pf = int(c.get("prefetch_factor", 4)) if nw > 0 else None
+    common = dict(num_workers=nw, collate_fn=collate, pin_memory=device.type == "cuda",
+                  persistent_workers=nw > 0, prefetch_factor=pf)
+    common = {k: v for k, v in common.items() if v is not None}
+    train_loader = DataLoader(train_ds, batch_size=int(c["batch_size"]), shuffle=True, **common)
+    val_loader = DataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, **common)
+    test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, **common)
 
     loss_fn = OpndetBboxLoss(**(c.get("loss") or {}))
     opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
@@ -143,11 +145,10 @@ def train(cfg_path: str) -> None:
         model.train()
         t0 = time.time()
         running = {"loss": 0.0, "l_hm": 0.0, "l_cxy": 0.0, "l_wh": 0.0}
-        for imgs, boxes_list in train_loader:
+        for imgs, _, tgt in train_loader:
             for g in opt.param_groups:
                 g["lr"] = cosine_lr(step, total_steps, base_lr, warmup=warmup)
             imgs = imgs.to(device, non_blocking=True)
-            tgt = _make_targets_batch(boxes_list, cfg_shim)
             tgt = {k: v.to(device, non_blocking=True) for k, v in tgt.items()}
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp):

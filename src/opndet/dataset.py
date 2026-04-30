@@ -83,7 +83,11 @@ def letterbox(img: np.ndarray, boxes: np.ndarray, target_h: int, target_w: int, 
 
 
 class OpndetDataset(Dataset):
-    """Returns (image_tensor [3,H,W], boxes [N,4] in resized pixel coords)."""
+    """Returns (image_tensor [3,H,W], boxes_xyxy, encoded_targets_dict).
+
+    GT encoding runs inside the worker so the main training loop just stacks
+    pre-encoded tensors — no CPU work between batches blocks the GPU.
+    """
 
     def __init__(
         self,
@@ -91,6 +95,7 @@ class OpndetDataset(Dataset):
         img_h: int,
         img_w: int,
         augment_fn=None,
+        encode_fn=None,
         mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: tuple[float, float, float] = (0.229, 0.224, 0.225),
     ):
@@ -98,13 +103,14 @@ class OpndetDataset(Dataset):
         self.img_h = img_h
         self.img_w = img_w
         self.aug = augment_fn
+        self.encode = encode_fn
         self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, np.ndarray]:
+    def __getitem__(self, idx: int):
         s = self.samples[idx]
         img = cv2.imread(str(s.image_path), cv2.IMREAD_COLOR)
         if img is None:
@@ -126,13 +132,19 @@ class OpndetDataset(Dataset):
         img_f = img.astype(np.float32) / 255.0
         img_f = (img_f - self.mean) / self.std
         img_t = torch.from_numpy(img_f.transpose(2, 0, 1)).contiguous()
-        return img_t, boxes
+
+        targets = self.encode(boxes) if self.encode is not None else None
+        return img_t, boxes, targets
 
 
-def collate(batch: list[tuple[torch.Tensor, np.ndarray]]) -> tuple[torch.Tensor, list[np.ndarray]]:
+def collate(batch):
     imgs = torch.stack([b[0] for b in batch], dim=0)
     boxes = [b[1] for b in batch]
-    return imgs, boxes
+    targets_list = [b[2] for b in batch]
+    if targets_list[0] is None:
+        return imgs, boxes, None
+    targets = {k: torch.stack([t[k] for t in targets_list], dim=0) for k in targets_list[0]}
+    return imgs, boxes, targets
 
 
 def split_samples(
