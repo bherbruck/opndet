@@ -32,15 +32,26 @@ from opndet.yaml_build import build_model_from_yaml
 
 
 class EMA:
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+    """Exponential moving average with progressive decay (YOLOv5/8 style).
+
+    Effective decay ramps from 0 to `decay` over `tau` steps:
+        d(t) = decay * (1 - exp(-t / tau))
+    This avoids the pathological early-training lag where shadow weights
+    are still close to random init at high decay (e.g. 0.999).
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999, tau: int = 2000):
         self.decay = decay
+        self.tau = tau
+        self.step = 0
         self.shadow = copy.deepcopy(model).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
-        d = self.decay
+        self.step += 1
+        d = self.decay * (1.0 - math.exp(-self.step / self.tau))
         for p_s, p in zip(self.shadow.parameters(), model.parameters()):
             p_s.mul_(d).add_(p.detach(), alpha=1.0 - d)
         for b_s, b in zip(self.shadow.buffers(), model.buffers()):
@@ -289,11 +300,16 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     ema = None
     ema_decay = float(c.get("ema_decay", 0.0))
+    # auto-scale tau so EMA warms up over ~2 epochs by default — better fit for short
+    # opndet runs than YOLOv8's tau=2000 which is tuned for COCO-length schedules.
+    default_tau = max(500, len(train_loader) * 2)
+    ema_tau = int(c.get("ema_tau", default_tau))
     if ema_decay > 0:
-        ema = EMA(model, decay=ema_decay)
+        ema = EMA(model, decay=ema_decay, tau=ema_tau)
         if resume_state is not None and "ema" in resume_state and resume_state["ema"] is not None:
             ema.shadow.load_state_dict(resume_state["ema"])
-        print(f"EMA enabled (decay={ema_decay})")
+            ema.step = int(resume_state.get("ema_step", 0))
+        print(f"EMA enabled (decay={ema_decay}, tau={ema_tau})")
 
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
@@ -387,6 +403,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             "optimizer": opt.state_dict(),
             "scaler": scaler.state_dict() if needs_scaler else None,
             "ema": ema.shadow.state_dict() if ema is not None else None,
+            "ema_step": ema.step if ema is not None else 0,
             "step": step,
             "best_metric": best_metric,
             "best_epoch": best_epoch,
