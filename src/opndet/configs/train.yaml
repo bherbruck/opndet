@@ -1,8 +1,9 @@
 # opndet training config. Drives src/opndet/train.py.
 # Works for ANY single-class detection task: point at COCO json(s) + image dir(s).
 
-out_dir: runs/exp1
-auto_increment: true      # if out_dir exists+nonempty, save to <out_dir>_2, _3, ...
+runs_dir: runs            # parent dir for all run output
+name: exp1                # this run's subdir; override with `--run-name $(date +%s)`
+auto_increment: true      # if runs_dir/name exists+nonempty, save to ..._2, _3, ...
 seed: 0
 device: auto              # auto | cpu | cuda
 amp: true

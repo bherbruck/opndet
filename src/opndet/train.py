@@ -102,11 +102,22 @@ def cosine_lr(step: int, total: int, base: float, warmup: int = 200, min_factor:
     return base * (min_factor + 0.5 * (1 - min_factor) * (1 + math.cos(math.pi * p)))
 
 
-def train(cfg_path: str) -> None:
+def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = None) -> None:
     with open(cfg_path) as f:
         c = yaml.safe_load(f)
 
-    out_dir = _resolve_out_dir(Path(c["out_dir"]), auto_increment=bool(c.get("auto_increment", True)))
+    if runs_dir is not None:
+        c["runs_dir"] = runs_dir
+    if run_name is not None:
+        c["name"] = run_name
+
+    if "runs_dir" in c or "name" in c:
+        rd = Path(c.get("runs_dir", "runs"))
+        nm = c.get("name", "exp1")
+        base = rd / nm
+    else:
+        base = Path(c.get("out_dir", "runs/exp1"))
+    out_dir = _resolve_out_dir(base, auto_increment=bool(c.get("auto_increment", True)))
     out_dir.mkdir(parents=True, exist_ok=True)
     tb_dir = out_dir / "tb"
     print(f"out_dir: {out_dir}")
@@ -235,8 +246,10 @@ def train(cfg_path: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
+    ap.add_argument("--run-name", default=None, help="Override config 'name'")
+    ap.add_argument("--runs-dir", default=None, help="Override config 'runs_dir'")
     args = ap.parse_args()
-    train(args.config)
+    train(args.config, run_name=args.run_name, runs_dir=args.runs_dir)
 
 
 if __name__ == "__main__":
