@@ -79,7 +79,7 @@ class PeakSuppress(nn.Module):
     is mathematically equivalent and uses only Sub/Mul/Clip (all opset 13 + Myriad).
     """
 
-    def __init__(self, k: int = 3, eps: float = 1e-3):
+    def __init__(self, k: int = 3, eps: float = 5e-3):
         super().__init__()
         self.k = k
         self.eps = eps

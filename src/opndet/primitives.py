@@ -58,17 +58,21 @@ class Tanh(nn.Module):
 def _peak_mask(hm: torch.Tensor, k: int, eps: float, mode: str) -> torch.Tensor:
     """Local-max mask via either:
       mode='arith' (default): mask = clip((hm + eps - MaxPool(hm)) * BIG, 0, 1)
-        — pure arithmetic, no comparison op. Required for OpenVINO 2022.1 Myriad
-        which has a known plugin bug lowering GreaterOrEqual to a buggy Logical_OR
-        stage that asserts FP16 inputs and fails for float32 operands.
+        Pure arithmetic, no comparison op. Required for OpenVINO 2022.1 Myriad
+        which has a known plugin bug lowering GreaterOrEqual to a buggy
+        Logical_OR stage that asserts FP16 inputs and fails for float32.
       mode='compare': mask = (hm + eps >= MaxPool(hm)). Smaller graph but breaks
         on Myriad VPU. OK for CPU/GPU OpenVINO and ORT.
+
+    eps must be large enough to absorb the runtime's MaxPool rounding error.
+    fp32: 1e-3 is fine. fp16 (Myriad): need ~5e-3 because fp16 precision at
+    sigmoid-output values 0.5..1.0 is roughly 5e-4..1e-3, and MaxPool's
+    rounding path can disagree with the hm path by a few units in the last
+    place, pushing real peaks just below the eps margin.
     """
     pooled = F.max_pool2d(hm, kernel_size=k, stride=1, padding=k // 2)
     if mode == "compare":
         return (hm + eps >= pooled).to(hm.dtype)
-    # arith: scale chosen so any positive diff > eps clips to 1, any negative diff clips to 0.
-    # BIG = 1/eps gives diff=eps -> scaled=1 (exact peak), diff<-eps -> scaled<-1 (clipped to 0).
     big = 1.0 / max(eps, 1e-9)
     diff = (hm + eps) - pooled
     return torch.clamp(diff * big, 0.0, 1.0)
@@ -78,10 +82,11 @@ def _peak_mask(hm: torch.Tensor, k: int, eps: float, mode: str) -> torch.Tensor:
 class PeakSuppress(nn.Module):
     """In-graph local-max suppression. Default mode='arith' is Myriad-safe.
 
-    eps absorbs FP drift PyTorch <-> ORT/OpenVINO so mask is bit-stable.
+    eps must exceed the runtime's MaxPool rounding error. Default 5e-3 is
+    sized for fp16 (Myriad). For fp32-only deployment 1e-3 is enough.
     """
 
-    def __init__(self, k: int = 3, eps: float = 1e-3, mode: str = "arith"):
+    def __init__(self, k: int = 3, eps: float = 5e-3, mode: str = "arith"):
         super().__init__()
         self.k = k
         self.eps = eps
@@ -95,7 +100,7 @@ class PeakSuppress(nn.Module):
 class SigmoidPeakSuppress(nn.Module):
     """Sigmoid then peak-suppress (fused op for the obj head). Default mode='arith'."""
 
-    def __init__(self, k: int = 3, eps: float = 1e-3, mode: str = "arith"):
+    def __init__(self, k: int = 3, eps: float = 5e-3, mode: str = "arith"):
         super().__init__()
         self.k = k
         self.eps = eps
