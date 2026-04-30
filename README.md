@@ -54,6 +54,7 @@ The `--model` flag accepts a **bundled preset name** (`bbox-n`, `bbox-s`, `bbox-
 
 | Preset   | Params  | Notes                                   |
 |----------|---------|-----------------------------------------|
+| `bbox-f` | 28K     | Femto. Sub-1MB int8. Quality drops.     |
 | `bbox-p` | 92K     | Pico. Microcontroller / TinyML class.   |
 | `bbox-n` | 0.31M   | Nano. Edge devices.                     |
 | `bbox-s` | 1.27M   | Small. Default.                         |
