@@ -1,0 +1,85 @@
+%%writefile train.yaml
+# opndet training config — bbox-m for high-quality count+track on egg-class data.
+# Local SSD runs_dir, no cache (RAM-safe), CIoU+VFL for tight boxes + bimodal
+# confidence, EMA on. Stride 4 (standard).
+
+runs_dir: /content/runs
+name: exp1
+seed: 0
+device: cuda
+amp: true
+amp_dtype: fp16
+
+# EMA: smoother val curve, +1-2pp F1, progressive ramp
+ema_decay: 0.999
+
+# TB visualization
+vis_samples: 32
+vis_every: 1
+
+# Model — medium variant (~2.37M params, ~10x bbox-f, still tiny vs YOLOv8n)
+model_config: bbox-m                     # bbox-f | bbox-p | bbox-n | bbox-s | bbox-m
+model:
+  stride: 4
+
+# Data
+data:
+  sources:
+    - coco: /content/dataset/train/_annotations.coco.json
+      images: /content/dataset/train
+  split_ratios: [0.8, 0.15, 0.05]
+
+# Schedule
+epochs: 100
+patience: 20
+metric_for_best: map50                   # f1 | map50 | map_50_95
+
+batch_size: 64
+lr: 5.0e-3                               # aggressive — drop to 3e-3 if loss spikes
+warmup_steps: 200                        # ~3.5 epochs at batch 64
+
+# RAM-safe data pipeline
+cache_images: false
+num_workers: 16
+prefetch_factor: 4
+
+weight_decay: 1.0e-4
+eval_threshold: 0.2
+
+# Augmentation: photometric + simple geometric.
+# bbox-m has enough capacity for mosaic/cutout — add them if you want stronger
+# regularization, but on a clean dataset they're not necessary.
+augment:
+  enabled: true
+  brightness: 0.4
+  contrast: 0.4
+  gamma: [0.6, 1.6]
+  hue: 20
+  saturation: 0.5
+  grayscale_prob: 0.2
+  blur_prob: 0.1
+  noise_sigma: 0.02
+  hflip_prob: 0.5
+  vflip_prob: 0.5
+  rotate90_prob: 0.5
+  scale_jitter: [0.7, 1.3]
+  translate_frac: 0.1
+  mosaic_prob: 0.0
+  cutout_prob: 0.0
+  cutout_count: 3
+  cutout_size_frac: [0.05, 0.20]
+  min_visible_frac: 0.5
+
+# Loss: CIoU bbox + VFL objectness for tight boxes + bimodal flap-resistant confidence.
+loss:
+  w_hm: 1.0
+  w_cxy: 1.0
+  w_wh: 1.5                              # CIoU range is 0..2
+  focal_alpha: 2.0                       # unused when cls_loss: vfl
+  focal_beta: 4.0                        # unused when cls_loss: vfl
+  wh_loss: ciou
+  cls_loss: vfl
+  vfl_alpha: 0.75
+  vfl_gamma: 2.0
+  repulsion_weight: 0.0                  # set ~0.5 if eggs touch heavily
+  nwd_c: 12.8                            # unused unless wh_loss: nwd

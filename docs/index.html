@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>opndet — ONNX in-browser tester</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d1117; --fg:#c9d1d9; --mut:#7d8590; --acc:#58a6ff; --ok:#3fb950; --warn:#d29922; --err:#f85149; --line:#30363d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:14px; font-weight:600; letter-spacing:.5px; }
+  header .mut { color:var(--mut); }
+  main { display:grid; grid-template-columns: 320px 1fr; gap:0; height:calc(100vh - 49px); }
+  aside { padding:16px; border-right:1px solid var(--line); overflow-y:auto; }
+  section.canvas-wrap { display:flex; align-items:center; justify-content:center; padding:16px; overflow:auto; }
+  canvas { max-width:100%; max-height:100%; background:#161b22; border:1px solid var(--line); }
+  fieldset { border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin:0 0 12px 0; }
+  legend { color:var(--mut); padding:0 6px; font-size:11px; text-transform:uppercase; letter-spacing:1px; }
+  label { display:block; margin:8px 0 4px; color:var(--mut); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  input[type=file], input[type=number], select { width:100%; background:#161b22; color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:6px 8px; font:inherit; }
+  input[type=range] { width:100%; }
+  button { width:100%; background:var(--acc); color:#0d1117; border:0; padding:8px 12px; border-radius:4px; cursor:pointer; font-weight:600; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.secondary { background:#21262d; color:var(--fg); border:1px solid var(--line); font-weight:400; }
+  .stats { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:12px; line-height:1.7; }
+  .stats .row { display:flex; justify-content:space-between; gap:8px; }
+  .stats .row .k { color:var(--mut); }
+  .stats .row .v { color:var(--fg); font-variant-numeric:tabular-nums; }
+  .ok { color:var(--ok); }
+  .warn { color:var(--warn); }
+  .err { color:var(--err); }
+  .small { font-size:11px; color:var(--mut); }
+</style>
+</head>
+<body>
+<header>
+  <h1>opndet</h1>
+  <span class="mut">in-browser ONNX tester</span>
+  <span class="mut">·</span>
+  <a class="mut" href="https://github.com/bherbruck/opndet" target="_blank">github.com/bherbruck/opndet</a>
+</header>
+<main>
+  <aside>
+    <fieldset>
+      <legend>Model</legend>
+      <label>ONNX file</label>
+      <input id="onnxFile" type="file" accept=".onnx" />
+      <label style="margin-top:8px">Execution provider</label>
+      <select id="ep">
+        <option value="auto">auto (WebGPU → WASM)</option>
+        <option value="webgpu">WebGPU</option>
+        <option value="wasm">WASM</option>
+      </select>
+      <div class="small" style="margin-top:6px" id="modelInfo">No model loaded.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Input</legend>
+      <label>Image file</label>
+      <input id="imageFile" type="file" accept="image/*" />
+      <div style="display:flex; gap:6px; margin-top:8px">
+        <button id="webcamBtn" class="secondary">Use webcam</button>
+        <button id="stopWebcamBtn" class="secondary" disabled>Stop</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Decoding</legend>
+      <label>Threshold: <span id="thresholdVal">0.50</span></label>
+      <input id="threshold" type="range" min="0" max="1" step="0.01" value="0.5" />
+      <label>Stride</label>
+      <input id="stride" type="number" min="1" max="32" step="1" value="4" />
+      <label style="margin-top:10px"><input type="checkbox" id="bakedNorm" checked /> ONNX has input norm baked in (--bake-input-norm)</label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Stats</legend>
+      <div class="stats" id="stats">
+        <div class="row"><span class="k">model</span><span class="v" id="sModel">—</span></div>
+        <div class="row"><span class="k">input</span><span class="v" id="sInput">—</span></div>
+        <div class="row"><span class="k">output</span><span class="v" id="sOutput">—</span></div>
+        <div class="row"><span class="k">infer</span><span class="v" id="sInfer">—</span></div>
+        <div class="row"><span class="k">fps</span><span class="v" id="sFps">—</span></div>
+        <div class="row"><span class="k">obj_max</span><span class="v" id="sObjMax">—</span></div>
+        <div class="row"><span class="k">dets</span><span class="v" id="sDets">—</span></div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Notes</legend>
+      <div class="small">
+        <p style="margin:6px 0">Runs entirely in browser via onnxruntime-web (WASM). No upload to server.</p>
+        <p style="margin:6px 0">Default expects a 5-channel <code>[1,5,H/4,W/4]</code> output: <code>(obj, cx, cy, w, h)</code> with cell-relative offsets and image-normalized w/h.</p>
+        <p style="margin:6px 0">If your ONNX expects already-normalized fp32 [0,1] - mean/std input, uncheck the <em>baked norm</em> box.</p>
+      </div>
+    </fieldset>
+  </aside>
+
+  <section class="canvas-wrap">
+    <canvas id="canvas" width="512" height="384"></canvas>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/ort.min.js"></script>
+<script>
+const ort = window.ort;
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/";
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+const els = {
+  onnxFile: document.getElementById("onnxFile"),
+  imageFile: document.getElementById("imageFile"),
+  webcamBtn: document.getElementById("webcamBtn"),
+  stopWebcamBtn: document.getElementById("stopWebcamBtn"),
+  threshold: document.getElementById("threshold"),
+  thresholdVal: document.getElementById("thresholdVal"),
+  stride: document.getElementById("stride"),
+  bakedNorm: document.getElementById("bakedNorm"),
+  modelInfo: document.getElementById("modelInfo"),
+  sModel: document.getElementById("sModel"),
+  sInput: document.getElementById("sInput"),
+  sOutput: document.getElementById("sOutput"),
+  sInfer: document.getElementById("sInfer"),
+  sFps: document.getElementById("sFps"),
+  sObjMax: document.getElementById("sObjMax"),
+  sDets: document.getElementById("sDets"),
+};
+
+let session = null;
+let modelInputName = null;
+let modelInputShape = null;
+let inputH = 384, inputW = 512;
+let webcamStream = null;
+let webcamRAF = null;
+let lastImage = null;   // ImageData / HTMLImageElement / VideoFrame
+const fpsBuf = [];
+
+const IMAGENET_MEAN = [0.485, 0.456, 0.406];
+const IMAGENET_STD  = [0.229, 0.224, 0.225];
+
+els.threshold.oninput = () => {
+  els.thresholdVal.textContent = parseFloat(els.threshold.value).toFixed(2);
+  if (lastImage) renderFromCache();
+};
+els.stride.oninput = () => { if (lastImage) renderFromCache(); };
+els.bakedNorm.oninput = () => { if (lastImage) runOn(lastImage); };
+document.getElementById("ep").onchange = () => {
+  if (els.onnxFile.files[0]) els.onnxFile.onchange({ target: els.onnxFile });
+};
+
+async function pickProviders() {
+  const choice = document.getElementById("ep").value;
+  if (choice === "wasm") return ["wasm"];
+  if (choice === "webgpu") return ["webgpu"];
+  // auto: try webgpu, fall back to wasm
+  if (navigator.gpu) {
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (adapter) return ["webgpu", "wasm"];
+    } catch {}
+  }
+  return ["wasm"];
+}
+
+els.onnxFile.onchange = async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  els.modelInfo.textContent = "Loading...";
+  try {
+    const buf = await f.arrayBuffer();
+    const providers = await pickProviders();
+    session = await ort.InferenceSession.create(buf, {
+      executionProviders: providers,
+      graphOptimizationLevel: "all",
+    });
+    const inp = session.inputNames[0];
+    modelInputName = inp;
+    modelInputShape = session.inputMetadata?.[inp]?.shape ||
+                      session.inputNames.map(n => session.inputNames[n])[0];
+    if (modelInputShape && modelInputShape.length === 4) {
+      inputH = modelInputShape[2];
+      inputW = modelInputShape[3];
+      canvas.width = inputW; canvas.height = inputH;
+    }
+    const epUsed = providers[0];   // first one accepted by ORT
+    els.modelInfo.innerHTML = `<span class="ok">OK</span> · ${f.name} · ep <code>${epUsed}</code> · input <code>${inp}</code> shape <code>[${modelInputShape}]</code>`;
+    els.sModel.textContent = `${f.name} (${epUsed})`;
+    els.sInput.textContent = `${modelInputShape}`;
+    if (lastImage) runOn(lastImage);
+  } catch (err) {
+    els.modelInfo.innerHTML = `<span class="err">ERR</span> ${err.message}`;
+    console.error(err);
+  }
+};
+
+els.imageFile.onchange = async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const img = new Image();
+  img.onload = async () => {
+    lastImage = img;
+    if (session) await runOn(img); else drawOnly(img);
+  };
+  img.src = URL.createObjectURL(f);
+};
+
+els.webcamBtn.onclick = async () => {
+  try {
+    webcamStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: "environment" },
+    });
+    const v = document.createElement("video");
+    v.srcObject = webcamStream; v.playsInline = true;
+    await v.play();
+    els.webcamBtn.disabled = true; els.stopWebcamBtn.disabled = false;
+    const tick = async () => {
+      if (!webcamStream) return;
+      lastImage = v;
+      if (session) await runOn(v); else drawOnly(v);
+      webcamRAF = requestAnimationFrame(tick);
+    };
+    tick();
+  } catch (err) {
+    alert("webcam: " + err.message);
+  }
+};
+
+els.stopWebcamBtn.onclick = () => {
+  if (webcamRAF) cancelAnimationFrame(webcamRAF);
+  if (webcamStream) webcamStream.getTracks().forEach(t => t.stop());
+  webcamStream = null; webcamRAF = null;
+  els.webcamBtn.disabled = false; els.stopWebcamBtn.disabled = true;
+};
+
+function drawOnly(src) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawLetterbox(src);
+}
+
+// Draw input letterboxed onto canvas at (inputW, inputH).
+function drawLetterbox(src) {
+  const sw = src.videoWidth || src.naturalWidth || src.width;
+  const sh = src.videoHeight || src.naturalHeight || src.height;
+  const scale = Math.min(inputW / sw, inputH / sh);
+  const nw = Math.round(sw * scale), nh = Math.round(sh * scale);
+  const ox = Math.floor((inputW - nw) / 2), oy = Math.floor((inputH - nh) / 2);
+  ctx.fillStyle = "#727272"; ctx.fillRect(0, 0, inputW, inputH);
+  ctx.drawImage(src, ox, oy, nw, nh);
+  return { scale, ox, oy, sw, sh, nw, nh };
+}
+
+// Convert canvas pixels to NCHW float32 tensor with optional ImageNet norm.
+function canvasToTensor(bakedNorm) {
+  const img = ctx.getImageData(0, 0, inputW, inputH);
+  const N = inputH * inputW;
+  const data = new Float32Array(3 * N);
+  if (bakedNorm) {
+    // ONNX expects raw uint8-range fp32 [0..255], graph does (x-mean255)/std255 internally
+    for (let i = 0; i < N; i++) {
+      data[i]         = img.data[i*4 + 0];   // R
+      data[i + N]     = img.data[i*4 + 1];   // G
+      data[i + 2*N]   = img.data[i*4 + 2];   // B
+    }
+  } else {
+    for (let i = 0; i < N; i++) {
+      data[i]         = (img.data[i*4 + 0]/255 - IMAGENET_MEAN[0]) / IMAGENET_STD[0];
+      data[i + N]     = (img.data[i*4 + 1]/255 - IMAGENET_MEAN[1]) / IMAGENET_STD[1];
+      data[i + 2*N]   = (img.data[i*4 + 2]/255 - IMAGENET_MEAN[2]) / IMAGENET_STD[2];
+    }
+  }
+  return new ort.Tensor("float32", data, [1, 3, inputH, inputW]);
+}
+
+let lastDecodeArgs = null;
+
+async function runOn(src) {
+  if (!session) return;
+  const lb = drawLetterbox(src);
+  const tensor = canvasToTensor(els.bakedNorm.checked);
+
+  const t0 = performance.now();
+  const out = await session.run({ [modelInputName]: tensor });
+  const dt = performance.now() - t0;
+
+  const outName = Object.keys(out)[0];
+  const o = out[outName];
+  const [B, C, H, W] = o.dims;
+
+  const stride = parseInt(els.stride.value, 10) || 4;
+  const threshold = parseFloat(els.threshold.value);
+  const dets = decode(o.data, C, H, W, inputH, inputW, stride, threshold);
+  lastDecodeArgs = { o, C, H, W, lb };
+
+  // FPS accumulator
+  fpsBuf.push(performance.now());
+  while (fpsBuf.length > 30) fpsBuf.shift();
+  const fps = fpsBuf.length >= 2 ? (fpsBuf.length - 1) / ((fpsBuf[fpsBuf.length-1] - fpsBuf[0]) / 1000) : 0;
+
+  let objMax = 0;
+  const objLen = H * W;
+  for (let i = 0; i < objLen; i++) if (o.data[i] > objMax) objMax = o.data[i];
+
+  els.sOutput.textContent = `[${B},${C},${H},${W}]`;
+  els.sInfer.textContent = `${dt.toFixed(1)} ms`;
+  els.sFps.textContent = fps.toFixed(1);
+  els.sObjMax.textContent = objMax.toFixed(3);
+  els.sDets.textContent = dets.length;
+
+  drawDetections(dets);
+}
+
+function renderFromCache() {
+  if (!lastDecodeArgs) return;
+  const { o, C, H, W, lb } = lastDecodeArgs;
+  const stride = parseInt(els.stride.value, 10) || 4;
+  const threshold = parseFloat(els.threshold.value);
+  const dets = decode(o.data, C, H, W, inputH, inputW, stride, threshold);
+  els.sDets.textContent = dets.length;
+  if (lastImage) drawLetterbox(lastImage);
+  drawDetections(dets);
+}
+
+// Decode 5-channel head: [obj, cx_rel, cy_rel, w_norm, h_norm]
+function decode(buf, C, H, W, imgH, imgW, stride, threshold) {
+  const dets = [];
+  if (C !== 5) {
+    console.warn(`expected 5 channels, got ${C}`);
+  }
+  const planeSize = H * W;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const off = y * W + x;
+      const obj = buf[off];
+      if (obj <= threshold) continue;
+      const cx_rel = buf[off + planeSize];
+      const cy_rel = buf[off + 2*planeSize];
+      const w_norm = buf[off + 3*planeSize];
+      const h_norm = buf[off + 4*planeSize];
+      const cx_px = (x + cx_rel) * stride;
+      const cy_px = (y + cy_rel) * stride;
+      const w_px = w_norm * imgW;
+      const h_px = h_norm * imgH;
+      dets.push({
+        x1: cx_px - w_px/2, y1: cy_px - h_px/2,
+        x2: cx_px + w_px/2, y2: cy_px + h_px/2,
+        score: obj,
+      });
+    }
+  }
+  return dets;
+}
+
+function drawDetections(dets) {
+  ctx.lineWidth = 1;
+  ctx.font = "11px ui-monospace, Menlo, monospace";
+  ctx.textBaseline = "bottom";
+  for (const d of dets) {
+    ctx.strokeStyle = "rgba(63,185,80,0.95)";
+    ctx.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+    const label = d.score.toFixed(2);
+    const tw = ctx.measureText(label).width + 4;
+    ctx.fillStyle = "rgba(63,185,80,0.95)";
+    ctx.fillRect(d.x1, d.y1 - 13, tw, 13);
+    ctx.fillStyle = "#0d1117";
+    ctx.fillText(label, d.x1 + 2, d.y1 - 1);
+  }
+}
+</script>
+</body>
+</html>

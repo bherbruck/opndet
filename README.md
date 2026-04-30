@@ -64,6 +64,10 @@ All produce the same output layout: `[1, 5, H/4, W/4]`, fixed input `(3, 384, 51
 
 ---
 
+## Try in browser (no install)
+
+Drop your `.onnx` into the in-browser tester at **[bherbruck.github.io/opndet](https://bherbruck.github.io/opndet)** — runs entirely client-side via onnxruntime-web (WebGPU when available, WASM fallback). Image upload or webcam input. Useful for sanity-checking deployment ONNX before flashing to edge hardware. Works on phones too — opndet is small enough to run on any modern mobile CPU.
+
 ## Quickstart on Colab
 
 Use the bundled notebook: [`notebooks/colab_quickstart.ipynb`](notebooks/colab_quickstart.ipynb). Open it in Colab → set GPU runtime → set `OPNDET_REPO` → run all. Trains, exports ONNX, downloads artifacts.
