@@ -28,6 +28,7 @@ batch_size: 64            # bbox-s ≈ 1.3M params; bump to 256 on H100
 num_workers: 8
 prefetch_factor: 4
 epochs: 100
+patience: 15            # early-stop if F1 hasn't improved in this many epochs (0 = off)
 lr: 3.0e-3
 weight_decay: 1.0e-4
 warmup_steps: 200

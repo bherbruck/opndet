@@ -197,6 +197,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
 
     best_f1 = -1.0
+    best_epoch = 0
+    patience = int(c.get("patience", 0))   # 0 = disabled
     step = 0
     for epoch in range(epochs):
         model.train()
@@ -254,8 +256,13 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         torch.save(ckpt, out_dir / "last.pt")
         if m["f1"] > best_f1:
             best_f1 = m["f1"]
+            best_epoch = ep
             torch.save(ckpt, out_dir / "best.pt")
             print(f"  -> saved best (F1={best_f1:.3f})")
+
+        if patience > 0 and (ep - best_epoch) >= patience:
+            print(f"early stop: no F1 improvement for {patience} epochs (best F1={best_f1:.3f} @ epoch {best_epoch})")
+            break
 
     print("running final test eval ...")
     state = torch.load(out_dir / "best.pt", map_location=device, weights_only=True)
