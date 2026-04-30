@@ -32,7 +32,7 @@ def load_coco_single_class(coco_path: str | Path, image_root: str | Path) -> lis
     for ann in coco["annotations"]:
         if ann.get("iscrowd", 0):
             continue
-        x, y, w, h = ann["bbox"]
+        x, y, w, h = (float(v) for v in ann["bbox"])
         if w <= 0 or h <= 0:
             continue
         boxes_by_image[ann["image_id"]].append([x, y, x + w, y + h])
