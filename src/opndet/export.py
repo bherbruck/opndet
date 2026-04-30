@@ -28,19 +28,48 @@ def build_pt_model(ckpt_path: str | None, cfg: ModelConfig) -> OpndetBbox:
     return m
 
 
+class _InputNormalizer(torch.nn.Module):
+    """Wraps a model to accept raw uint8-range fp32 inputs [0, 255] and apply
+    ImageNet (or arbitrary) mean/std normalization in-graph. Makes the exported
+    ONNX consumable by embedded runtimes (depthai DetectionNetwork, OpenVINO,
+    TFLite Micro) that pass raw camera frames without preprocessing.
+    """
+
+    def __init__(self, model: torch.nn.Module, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+        super().__init__()
+        self.model = model
+        m = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1) * 255.0
+        s = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1) * 255.0
+        self.register_buffer("mean255", m)
+        self.register_buffer("std255", s)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x - self.mean255) / self.std255
+        return self.model(x)
+
+
 def export_onnx(
     pt_model: OpndetBbox,
     out_path: str,
     cfg: ModelConfig | None = None,
     opset: int = 13,
+    bake_input_norm: bool = False,
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225),
 ) -> str:
     cfg = cfg or pt_model.cfg
     dummy = torch.randn(1, cfg.in_ch, cfg.img_h, cfg.img_w)
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)
 
+    export_model = pt_model
+    if bake_input_norm:
+        export_model = _InputNormalizer(pt_model, mean=mean, std=std).eval()
+        # dummy input is now in raw 0-255 range to exercise the new prefix
+        dummy = torch.rand(1, cfg.in_ch, cfg.img_h, cfg.img_w) * 255.0
+
     torch.onnx.export(
-        pt_model,
+        export_model,
         dummy,
         str(out_path_p),
         input_names=["image"],

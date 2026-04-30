@@ -18,6 +18,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
     from opndet.presets import resolve
 
     if args.model:
+        from opndet.export import _InputNormalizer
         from opndet.yaml_build import build_model_from_yaml
         m = build_model_from_yaml(resolve(args.model)).eval()
         if args.ckpt:
@@ -26,14 +27,18 @@ def _cmd_export(args: argparse.Namespace) -> int:
             m.load_state_dict(sd["model"] if "model" in sd else sd)
         import torch
         c, h, w = m.input_shape
-        dummy = torch.randn(1, c, h, w)
+        if args.bake_input_norm:
+            m = _InputNormalizer(m).eval()
+            dummy = torch.rand(1, c, h, w) * 255.0
+        else:
+            dummy = torch.randn(1, c, h, w)
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         torch.onnx.export(m, dummy, str(out_path),
                           input_names=["image"], output_names=["output"],
                           opset_version=args.opset, do_constant_folding=True,
                           dynamic_axes=None, dynamo=False)
-        print(f"exported: {out_path}")
+        print(f"exported: {out_path}{' (with input norm baked in: expects raw 0-255)' if args.bake_input_norm else ''}")
         return 0
 
     cfg = ModelConfig()
@@ -134,6 +139,10 @@ def main(argv: list[str] | None = None) -> int:
     pe.add_argument("--out", default="opndet.onnx", help="Output ONNX path")
     pe.add_argument("--opset", type=int, default=13)
     pe.add_argument("--model", default=None, help="Preset name (bbox-n|s|m) or path to YAML")
+    pe.add_argument("--bake-input-norm", action="store_true",
+                    help="Prepend ImageNet mean/std normalization to the graph. "
+                         "Use for embedded deployment (depthai, OpenVINO) that "
+                         "passes raw uint8 0-255 RGB frames without preprocessing.")
     pe.set_defaults(func=_cmd_export)
 
     pp = sub.add_parser("predict", help="Run inference on a single image")
