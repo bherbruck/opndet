@@ -41,10 +41,13 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# stray images (e.g. shared screenshots)
+# stray files at repo root (screenshots, scratch yaml/onnx, ckpts)
 /*.png
 /*.jpg
 /*.jpeg
+/*.onnx
+/*.pt
+/train.yaml
 
 # Claude Code / agent scratch
 .claude/
