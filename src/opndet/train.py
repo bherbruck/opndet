@@ -252,7 +252,8 @@ def cosine_lr(step: int, total: int, base: float, warmup: int = 200, min_factor:
     return base * (min_factor + 0.5 * (1 - min_factor) * (1 + math.cos(math.pi * p)))
 
 
-def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = None, resume: str | None = None) -> None:
+def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = None,
+          resume: str | None = None, teacher: str | None = None, self_distill: bool = False) -> None:
     with open(cfg_path) as f:
         c = yaml.safe_load(f)
 
@@ -373,6 +374,26 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             ema.step = int(resume_state.get("ema_step", 0))
         print(f"EMA enabled (decay={ema_decay}, tau={ema_tau})")
 
+    teacher_model = None
+    if teacher and self_distill:
+        raise ValueError("--teacher and --self-distill are mutually exclusive")
+    if teacher:
+        from opndet.distill import load_teacher
+        teacher_model, teacher_preset = load_teacher(teacher, device)
+        if teacher_model.input_shape != model.input_shape:
+            raise ValueError(f"teacher input_shape {teacher_model.input_shape} != student {model.input_shape}")
+        print(f"distillation: teacher={teacher_preset} ({teacher})")
+    elif self_distill:
+        if ema is None:
+            raise ValueError("--self-distill requires ema_decay > 0 in the config")
+        print("self-distillation: teacher = EMA shadow")
+    distill_cfg = (c.get("distill") or {}) if (teacher or self_distill) else {}
+    distill_kw = {
+        "hm_weight": float(distill_cfg.get("hm_weight", 1.0)),
+        "reg_weight": float(distill_cfg.get("reg_weight", 0.5)),
+        "conf_gate": float(distill_cfg.get("conf_gate", 0.5)),
+    }
+
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
     vis_imgs = []
@@ -415,6 +436,17 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 raw5 = model.forward_with_alias(imgs, "raw")
                 losses = loss_fn(raw5, tgt)
+
+                if teacher_model is not None or self_distill:
+                    from opndet.distill import distillation_loss
+                    active_teacher = teacher_model if teacher_model is not None else ema.shadow
+                    with torch.no_grad():
+                        t_out = active_teacher(imgs)
+                        t_out = t_out["output"] if isinstance(t_out, dict) else t_out
+                    kd = distillation_loss(raw5, t_out, **distill_kw)
+                    losses["loss"] = losses["loss"] + kd["l_kd"]
+                    losses["l_kd_hm"] = kd["l_kd_hm"].detach()
+                    losses["l_kd_reg"] = kd["l_kd_reg"].detach()
             if needs_scaler:
                 scaler.scale(losses["loss"]).backward()
                 scaler.unscale_(opt)

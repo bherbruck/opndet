@@ -8,7 +8,8 @@ from pathlib import Path
 
 def _cmd_train(args: argparse.Namespace) -> int:
     from opndet.train import train
-    train(args.config, run_name=args.run_name, runs_dir=args.runs_dir, resume=args.resume)
+    train(args.config, run_name=args.run_name, runs_dir=args.runs_dir, resume=args.resume,
+          teacher=args.teacher, self_distill=args.self_distill)
     return 0
 
 
@@ -183,6 +184,12 @@ def main(argv: list[str] | None = None) -> int:
     pt.add_argument("--run-name", default=None, help="Override config 'name' (the run subdir)")
     pt.add_argument("--runs-dir", default=None, help="Override config 'runs_dir' (parent of run dirs)")
     pt.add_argument("--resume", default=None, help="Resume from ckpt .pt or run dir (uses last.pt)")
+    distill_group = pt.add_mutually_exclusive_group()
+    distill_group.add_argument("--teacher", default=None,
+                               help="Path to a trained teacher .pt; enables knowledge distillation. "
+                                    "Architecture is read from the teacher's saved config.")
+    distill_group.add_argument("--self-distill", action="store_true",
+                               help="Use the model's own EMA shadow as the teacher. Requires ema_decay > 0.")
     pt.set_defaults(func=_cmd_train)
 
     pe = sub.add_parser("export", help="Export to ONNX (opset 13)")

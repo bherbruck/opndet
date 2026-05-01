@@ -58,6 +58,14 @@ augment:
 
 ema_decay: 0.999          # 0 = off; 0.999 is yolov8 default. Eval + best.pt use EMA weights when on.
 
+# Distillation hyperparams (used when `opndet train --teacher PATH` or --self-distill is set).
+# Path lives only on the CLI — keeps yaml reproducible across machines (Colab won't have your
+# local /content/runs path). Block is harmless when distillation isn't enabled.
+distill:
+  hm_weight: 1.0          # weight on KD heatmap BCE at gated cells
+  reg_weight: 0.5         # weight on KD L1 over (cxy, wh) at gated cells
+  conf_gate: 0.5          # only distill where teacher's peak-suppressed obj > gate
+
 loss:
   w_hm: 1.0
   w_cxy: 1.0

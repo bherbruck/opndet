@@ -234,19 +234,21 @@ For convex objects of known type, pixel dimensions can be converted to real-worl
 
 These are general-purpose improvements that apply regardless of the convex specialization. Most are independent of each other; pick them up in any order.
 
-### 3.1 Knowledge distillation
+### 3.1 Knowledge distillation — **SHIPPED**
 
 bbox-m teaches bbox-f. The big model produces soft targets, the small model learns from them. For tiny detectors this is genuinely transformational — published distillation papers regularly show 5-10 mAP improvements at fixed param count.
 
+**Status**: shipped via `opndet train --teacher PATH` (or `--self-distill`). Teacher arch is read from its saved `config.model_config` so the student command is self-describing — no `--teacher-arch` flag needed. Path lives only on the CLI to keep yaml reproducible across machines (Colab won't have your local `/content/runs` paths). Hyperparams in `distill: { hm_weight, reg_weight, conf_gate }` yaml block. `train/l_kd_hm` and `train/l_kd_reg` logged to TB.
+
 **Plan**:
 
-1. **Distillation loss**: KL divergence between teacher's heatmap and student's heatmap, plus L2 between teacher's regression outputs and student's. Weight scales with confidence (high-confidence teacher predictions are higher-weighted in the student loss).
+1. ✅ **Distillation loss**: KL divergence between teacher's heatmap and student's heatmap, plus L2 between teacher's regression outputs and student's. Weight scales with confidence (high-confidence teacher predictions are higher-weighted in the student loss). *(Shipped: BCE on student `sigmoid(obj_logit)` against teacher's post-peak `obj` at gated cells (where `t_obj > conf_gate`); L1 on (cxy, wh) at the same gated cells. Teacher's calibration temperature, if present, is auto-applied on load.)*
 
-2. **Training loop**: optional `--teacher PATH` flag in `opndet train`. Teacher runs in eval mode, no gradients. Student trains normally with the additional loss term.
+2. ✅ **Training loop**: optional `--teacher PATH` flag in `opndet train`. Teacher runs in eval mode, no gradients. Student trains normally with the additional loss term. *(Shipped via opndet/distill.py.)*
 
-3. **Recipe**: standard practice is teacher = bbox-m, student = anything smaller. Document the recipe and bundle distilled checkpoints alongside the from-scratch checkpoints.
+3. **Recipe**: standard practice is teacher = bbox-m, student = anything smaller. Document the recipe and bundle distilled checkpoints alongside the from-scratch checkpoints. *(Recipe: train teacher → calibrate teacher → `opndet train --teacher` for the student. Bundling pre-distilled checkpoints is a release-time concern.)*
 
-4. **Self-distillation**: bbox-s teaches bbox-s with EMA of itself as the teacher. Often gives 1-2 mAP for free, especially on small datasets. Add as `--self-distill` option.
+4. ✅ **Self-distillation**: bbox-s teaches bbox-s with EMA of itself as the teacher. Often gives 1-2 mAP for free, especially on small datasets. Add as `--self-distill` option. *(Shipped: `--self-distill` reuses the existing EMA shadow as the teacher, no extra memory. Mutually exclusive with `--teacher`.)*
 
 **Definition of done**: distillation is a documented training mode. Distilled bbox-f has ≥3 mAP improvement over scratch-trained bbox-f at the same training budget on a benchmark dataset.
 
