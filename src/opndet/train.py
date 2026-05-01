@@ -500,6 +500,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 writer.add_scalar("eval/T", _T, ep)
                 writer.add_scalar("eval/ece_pre", _ece_pre, ep)
                 writer.add_scalar("eval/ece_post", _ece_post, ep)
+                print(f"  calib: T={_T:.3f}  ECE {_ece_pre:.3f} -> {_ece_post:.3f}")
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs):
             grid = render_predictions(
