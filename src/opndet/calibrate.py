@@ -104,15 +104,22 @@ def collect_calibration_data(
 
 def calibrate_ckpt(
     ckpt_path: str | Path,
-    config_path: str | Path,
+    config_path: str | Path | None = None,
     split: str = "val",
     save: bool = True,
 ) -> dict:
     """Fit a Platt-style temperature on `split`, write it back to the ckpt under key 'temperature'.
-    Returns a dict with the fitted T plus before/after ECE.
-    """
-    with open(config_path) as f:
-        c = yaml.safe_load(f)
+    Returns a dict with the fitted T plus before/after ECE. When config_path is None, uses the
+    ckpt's saved config (works when running on the same machine that trained the model)."""
+    if config_path is None:
+        sd_peek = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if not isinstance(sd_peek, dict) or "config" not in sd_peek:
+            raise ValueError(f"--config required: ckpt {ckpt_path} has no saved config block")
+        c = sd_peek["config"]
+        print(f"using saved config from ckpt (model_config={c.get('model_config')})")
+    else:
+        with open(config_path) as f:
+            c = yaml.safe_load(f)
 
     device = torch.device("cuda" if torch.cuda.is_available() and c.get("device", "auto") != "cpu" else "cpu")
 

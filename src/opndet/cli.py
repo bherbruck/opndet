@@ -227,14 +227,14 @@ def main(argv: list[str] | None = None) -> int:
 
     pcal = sub.add_parser("calibrate", help="Fit Platt-style temperature on val split; bake it into the ckpt")
     pcal.add_argument("--ckpt", required=True, help="Trained checkpoint .pt")
-    pcal.add_argument("--config", required=True, help="Training YAML used to define data + model")
+    pcal.add_argument("--config", default=None, help="Training YAML (optional — falls back to the ckpt's saved config)")
     pcal.add_argument("--split", default="val", choices=["train", "val", "test"], help="Which split to fit on")
     pcal.add_argument("--dry-run", action="store_true", help="Compute T but don't write back to ckpt")
     pcal.set_defaults(func=_cmd_calibrate)
 
     pev = sub.add_parser("eval", help="Run full validation suite (Hungarian-matched, calibration, count, size strata) and write report")
     pev.add_argument("--ckpt", required=True, help="Trained checkpoint .pt")
-    pev.add_argument("--config", required=True, help="Training YAML used to define data + model")
+    pev.add_argument("--config", default=None, help="Training YAML (optional — falls back to the ckpt's saved config)")
     pev.add_argument("--split", default="val", choices=["train", "val", "test"], help="Which split to evaluate")
     pev.add_argument("--out", default=None, help="Output dir (default: <ckpt_dir>/eval_<split>)")
     pev.add_argument("--score-thresh", type=float, default=None, help="Confidence threshold for fixed-threshold metrics (default: cfg.eval_threshold)")

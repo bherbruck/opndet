@@ -365,7 +365,7 @@ def write_tb_scalars(report: dict, writer, step: int = 0) -> None:
 
 def run_eval(
     ckpt_path: str | Path,
-    config_path: str | Path,
+    config_path: str | Path | None = None,
     split: str = "val",
     out_dir: str | Path | None = None,
     score_thresh: float | None = None,
@@ -374,9 +374,18 @@ def run_eval(
     stability: bool = False,
     n_perturbations: int = 8,
 ) -> dict:
-    """Stand-alone eval entry point (used by the CLI)."""
-    with open(config_path) as f:
-        c = yaml.safe_load(f)
+    """Stand-alone eval entry point (used by the CLI). When config_path is None,
+    falls back to the ckpt's saved config (works when running on the same machine
+    that trained the model)."""
+    if config_path is None:
+        sd_peek = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if not isinstance(sd_peek, dict) or "config" not in sd_peek:
+            raise ValueError(f"--config required: ckpt {ckpt_path} has no saved config block")
+        c = sd_peek["config"]
+        print(f"using saved config from ckpt (model_config={c.get('model_config')})")
+    else:
+        with open(config_path) as f:
+            c = yaml.safe_load(f)
 
     device = torch.device("cuda" if torch.cuda.is_available() and c.get("device", "auto") != "cpu" else "cpu")
     print(f"device: {device}")
