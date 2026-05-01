@@ -135,6 +135,19 @@ def compute_full_report(
     # P-R sweep.
     pr = pr_curve(full["scores"], full["is_tp"], n_gt=int(full["gt_matched"].shape[0]))
 
+    # F1-optimal operating point. Detects "your threshold is off the knee" — common with
+    # KD/calibrated models that produce a sharply bimodal score distribution.
+    if pr["f1"].size > 0 and pr["f1"].max() > 0:
+        idx = int(np.argmax(pr["f1"]))
+        opt = {
+            "threshold": float(pr["thresholds"][idx]),
+            "f1": float(pr["f1"][idx]),
+            "precision": float(pr["precision"][idx]),
+            "recall": float(pr["recall"][idx]),
+        }
+    else:
+        opt = {"threshold": 0.0, "f1": 0.0, "precision": 0.0, "recall": 0.0}
+
     # Size strata at fixed threshold.
     s_recall = stratified_recall(fix["gt_size"], fix["gt_matched"])
     s_prec = stratified_precision(fix["pred_size"], fix["is_tp"])
@@ -154,6 +167,7 @@ def compute_full_report(
         "calibration": cal,
         "conf_iou_hist": cih,
         "pr_curve": pr,
+        "optimal_threshold": opt,
         "size_strata_recall": s_recall,
         "size_strata_precision": s_prec,
     }
@@ -171,11 +185,15 @@ def _save_reliability_png(cal: dict, path: Path) -> None:
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
 
-def _save_pr_png(pr: dict, path: Path) -> None:
+def _save_pr_png(pr: dict, path: Path, opt: dict | None = None) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(pr["thresholds"], pr["precision"], "-", label="precision")
     ax.plot(pr["thresholds"], pr["recall"], "-", label="recall")
     ax.plot(pr["thresholds"], pr["f1"], "--", label="F1")
+    if opt is not None and opt.get("f1", 0) > 0:
+        ax.axvline(opt["threshold"], color="red", linestyle=":", lw=1, alpha=0.6)
+        ax.scatter([opt["threshold"]], [opt["f1"]], color="red", s=40, zorder=5,
+                   label=f"F1 knee @ {opt['threshold']:.2f}: {opt['f1']:.3f}")
     ax.set_xlabel("confidence threshold"); ax.set_ylabel("metric")
     ax.set_title("P / R / F1 vs threshold")
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.grid(alpha=0.3); ax.legend()
@@ -216,7 +234,7 @@ def _abs_count_errors(images: list[tuple[np.ndarray, np.ndarray, np.ndarray]], s
 def write_report(report: dict, out_dir: Path, abs_errs: np.ndarray) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     _save_reliability_png(report["calibration"], out_dir / "reliability.png")
-    _save_pr_png(report["pr_curve"], out_dir / "pr_curve.png")
+    _save_pr_png(report["pr_curve"], out_dir / "pr_curve.png", opt=report.get("optimal_threshold"))
     _save_conf_iou_png(report["conf_iou_hist"], out_dir / "conf_iou_hist.png")
     _save_count_png(report["counts"], abs_errs, out_dir / "count_error.png")
 
@@ -232,6 +250,19 @@ def write_report(report: dict, out_dir: Path, abs_errs: np.ndarray) -> Path:
     md.append("")
     md.append(f"images: **{s['n_images']}**  •  iou_thresh: **{report['iou_thresh']}**  •  score_thresh: **{report['score_thresh']}**")
     md.append("")
+
+    opt = report.get("optimal_threshold")
+    if opt is not None and opt["f1"] > 0:
+        gap = opt["threshold"] - report["score_thresh"]
+        f1_gap = opt["f1"] - s["f1"]
+        md.append("## optimal operating point (F1-max across PR sweep)")
+        md.append("")
+        md.append(f"- F1-optimal threshold: **{opt['threshold']:.3f}**  (you chose: {report['score_thresh']:.3f}, delta: {gap:+.3f})")
+        md.append(f"- at optimum: P={opt['precision']:.3f}, R={opt['recall']:.3f}, **F1={opt['f1']:.3f}**  (gap vs your threshold: {f1_gap:+.3f})")
+        if abs(gap) >= 0.1:
+            direction = "higher" if gap > 0 else "lower"
+            md.append(f"- ⚠ your chosen threshold is meaningfully off the F1 knee. **Try score_thresh={opt['threshold']:.2f}** for a {direction} threshold that better matches the model's confidence distribution.")
+        md.append("")
     md.append("## summary")
     md.append("")
     md.append(f"- precision = **{s['precision']:.3f}**, recall = **{s['recall']:.3f}**, F1 = **{s['f1']:.3f}**")
@@ -329,6 +360,8 @@ def write_report(report: dict, out_dir: Path, abs_errs: np.ndarray) -> Path:
     }
     if "stability" in report:
         scalars["stability"] = report["stability"]
+    if "optimal_threshold" in report:
+        scalars["optimal_threshold"] = report["optimal_threshold"]
     (out_dir / "eval-report.json").write_text(json.dumps(scalars, indent=2))
     return path
 
@@ -373,6 +406,7 @@ def run_eval(
     batch_size: int | None = None,
     stability: bool = False,
     n_perturbations: int = 8,
+    auto_threshold: bool = False,
 ) -> dict:
     """Stand-alone eval entry point (used by the CLI). When config_path is None,
     falls back to the ckpt's saved config (works when running on the same machine
@@ -421,6 +455,15 @@ def run_eval(
     images = collect_predictions(model, loader, cfg_shim, device, decode_threshold=0.05)
     report = compute_full_report(images, iou_thresh=iou_thresh, score_thresh=score_thresh)
     abs_errs = _abs_count_errors(images, score_thresh)
+
+    if auto_threshold:
+        opt = report.get("optimal_threshold", {})
+        opt_thresh = float(opt.get("threshold", score_thresh))
+        if abs(opt_thresh - score_thresh) >= 0.01:
+            print(f"--auto-threshold: chosen={score_thresh:.3f}, F1-optimal={opt_thresh:.3f} -> recomputing fixed-threshold metrics at the optimum")
+            score_thresh = opt_thresh
+            report = compute_full_report(images, iou_thresh=iou_thresh, score_thresh=score_thresh)
+            abs_errs = _abs_count_errors(images, score_thresh)
 
     if stability:
         from opndet.stability import perturbation_stability

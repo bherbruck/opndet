@@ -113,6 +113,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         stability=args.stability,
         n_perturbations=args.n_perturbations,
+        auto_threshold=args.auto_threshold,
     )
     s = out["report"]["summary"]
     cs = out["report"]["counts"]
@@ -244,6 +245,9 @@ def main(argv: list[str] | None = None) -> int:
                      help="Run perturbation-stability metric (proxy for flapping). ~Nx slower (default N=8).")
     pev.add_argument("--n-perturbations", type=int, default=8,
                      help="Number of small perturbations per image when --stability is set")
+    pev.add_argument("--auto-threshold", action="store_true",
+                     help="After the first pass, snap score_thresh to the F1-optimal value from the PR sweep "
+                          "and recompute fixed-threshold metrics. Honest reporting when the chosen threshold is off the knee.")
     pev.set_defaults(func=_cmd_eval)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
