@@ -29,6 +29,10 @@ num_workers: 8
 prefetch_factor: 4
 epochs: 100
 patience: 15            # early-stop if best metric hasn't improved in this many epochs (0 = off)
+patience_smart: false   # when true, fire only if NO tracked metric (f1/map50/map_50_95 +
+                        #   _cal versions) has improved by patience_min_delta in patience epochs.
+                        #   Useful when raw mAP plateaus but precision / calibration still climbing.
+patience_min_delta: 0.003   # minimum improvement to count (filter eval noise)
 metric_for_best: f1     # f1 | map50 | map_50_95 | f1_cal | map50_cal | map_50_95_cal
                         # _cal versions select on the post-calibration metric (forces calibrate_every=1)
                         # — picks the "best deployed" checkpoint, not just the best raw one

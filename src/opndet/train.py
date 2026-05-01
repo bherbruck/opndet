@@ -398,6 +398,12 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     calibrate_every = int(c.get("calibrate_every", 0))
     test_every = int(c.get("test_every", 0))
 
+    patience_smart = bool(c.get("patience_smart", False))
+    patience_min_delta = float(c.get("patience_min_delta", 0.003))
+    # When patience_smart is True, patience fires only if NO tracked metric has improved
+    # by patience_min_delta in `patience` epochs. Tracks both raw and calibrated f1/map.
+    best_per_metric: dict[str, tuple[float, int]] = {}
+
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
     vis_imgs = []
@@ -582,9 +588,32 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             torch.save(ckpt, out_dir / "best.pt")
             print(f"  -> saved best ({metric_for_best}={best_metric:.3f}, T={cur_T:.3f})")
 
-        if patience > 0 and (ep - best_epoch) >= patience:
-            print(f"early stop: no {metric_for_best} improvement for {patience} epochs (best={best_metric:.3f} @ epoch {best_epoch})")
-            break
+        if patience > 0:
+            if patience_smart:
+                # Update best for each tracked metric (raw + calibrated where available).
+                for k in ("f1", "map50", "map_50_95"):
+                    v = float(m.get(k, 0.0))
+                    prev_v, _ = best_per_metric.get(k, (-1e9, 0))
+                    if v > prev_v + patience_min_delta:
+                        best_per_metric[k] = (v, ep)
+                    if m_cal is not None and k in m_cal:
+                        ck = f"{k}_cal"
+                        cv = float(m_cal[k])
+                        cprev_v, _ = best_per_metric.get(ck, (-1e9, 0))
+                        if cv > cprev_v + patience_min_delta:
+                            best_per_metric[ck] = (cv, ep)
+                last_improvement = max(
+                    [ep_ for _, ep_ in best_per_metric.values()] + [best_epoch],
+                    default=best_epoch,
+                )
+                if (ep - last_improvement) >= patience:
+                    last_table = ", ".join(f"{k}={v:.3f}@{e}" for k, (v, e) in sorted(best_per_metric.items()))
+                    print(f"early stop: no metric improved by >={patience_min_delta} in {patience} epochs.  bests: {last_table}")
+                    break
+            else:
+                if (ep - best_epoch) >= patience:
+                    print(f"early stop: no {metric_for_best} improvement for {patience} epochs (best={best_metric:.3f} @ epoch {best_epoch})")
+                    break
 
     print("running final test eval ...")
     state = torch.load(out_dir / "best.pt", map_location=device, weights_only=False)
