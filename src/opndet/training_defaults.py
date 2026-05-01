@@ -38,6 +38,8 @@ COMMON: dict[str, Any] = {
     "metric_for_best": "f1_opt_cal",  # picks best.pt by calibrated F1 at the optimal threshold
     "calibrate_every": 1,             # forced anyway by _cal metric; explicit for clarity
     "auto_calibrate": True,
+    "auto_bundle": True,              # zip the run dir at end; on Colab, also triggers download
+    "bundle_include_tb": False,       # include tfevents in the bundle (big — opt in)
 
     "weight_decay": 1.0e-4,
     "eval_threshold": 0.2,

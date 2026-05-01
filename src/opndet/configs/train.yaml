@@ -35,6 +35,9 @@ epochs: 100
 #
 # calibrate_every: 1              # default 1 — fits T per epoch + recomputes calibrated metrics
 # auto_calibrate: true            # default true — final auto-calibrate at end of training
+# auto_bundle: true               # default true — zip run dir at end (skips tfevents). On Colab,
+#                                 #   also triggers files.download() automatically.
+# bundle_include_tb: false        # default false — set true to include tfevents in the zip (big)
 #
 # loss:
 #   wh_loss: ciou                 # default

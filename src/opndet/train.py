@@ -257,6 +257,45 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
             "n_pred": float(n_pred), "n_gt": float(n_gt)}
 
 
+def _bundle_run(out_dir: Path, include_tb: bool = False) -> Path | None:
+    """Zip the run dir at end of training. Skips tfevents by default (huge). On Colab, also
+    triggers a browser download. Returns the zip path."""
+    import zipfile
+    bundle = out_dir.parent / f"{out_dir.name}.zip"
+    skipped_tb = 0
+    n = 0
+    try:
+        with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in out_dir.rglob("*"):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(out_dir)
+                if not include_tb and rel.parts and rel.parts[0] == "tb":
+                    skipped_tb += 1
+                    continue
+                z.write(f, rel)
+                n += 1
+        sz_mb = bundle.stat().st_size / 1024 / 1024
+        msg = f"bundled run -> {bundle} ({sz_mb:.1f} MB, {n} files"
+        if not include_tb:
+            msg += f", skipped {skipped_tb} tb events — pass bundle_include_tb: true to include"
+        msg += ")"
+        print(msg)
+    except Exception as e:
+        print(f"bundle failed: {e}")
+        return None
+
+    try:
+        from google.colab import files  # type: ignore
+        print(f"colab detected — triggering download of {bundle.name}")
+        files.download(str(bundle))
+    except ImportError:
+        pass  # not on Colab, skip auto-download
+    except Exception as e:
+        print(f"colab download failed (zip is still at {bundle}): {e}")
+    return bundle
+
+
 def _resolve_out_dir(base: Path, auto_increment: bool = True) -> Path:
     """If base doesn't exist or is empty, return base. Otherwise pick base_2, base_3, ..."""
     if not auto_increment:
@@ -683,6 +722,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         except Exception as e:
             print(f"  calibration failed: {e}")
     writer.close()
+
+    if c.get("auto_bundle", True):
+        _bundle_run(out_dir, include_tb=bool(c.get("bundle_include_tb", False)))
 
 
 def main() -> None:
