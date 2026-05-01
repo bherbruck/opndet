@@ -614,6 +614,17 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 # Restore T=1.0 so subsequent epochs' raw eval starts clean.
                 apply_temperature(eval_model, 1.0)
 
+        # Resolve vis threshold: explicit `vis_threshold: <num>` always wins.
+        # Otherwise: when selecting on f1_opt*, track the dynamic per-epoch optimum
+        # (so the grid shows what the model would actually deploy at). Else eval_threshold.
+        _vt = c.get("vis_threshold", "auto")
+        if isinstance(_vt, (int, float)):
+            vis_thresh_now = float(_vt)
+        elif metric_for_best.startswith("f1_opt") and "threshold_opt" in m:
+            vis_thresh_now = float(m["threshold_opt"])
+        else:
+            vis_thresh_now = float(c.get("eval_threshold", 0.3))
+
         if test_every > 0 and ep % test_every == 0 and len(test_ds) > 0:
             mt = evaluate(eval_model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
             print(f"  test: P={mt['precision']:.3f} R={mt['recall']:.3f} F1={mt['f1']:.3f}  mAP@.5={mt['map50']:.3f} mAP@.5:.95={mt['map_50_95']:.3f}")
@@ -622,14 +633,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             if test_vis_batch is not None:
                 grid = render_predictions(
                     eval_model, test_vis_batch, test_vis_boxes, img_h, img_w, cfg_shim.stride,
-                    threshold=float(c.get("vis_threshold", c.get("eval_threshold", 0.3))), device=device,
+                    threshold=vis_thresh_now, device=device,
                 )
                 writer.add_images("test/preds", grid, ep, dataformats="NCHW")
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs):
             grid = render_predictions(
                 model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
-                threshold=float(c.get("vis_threshold", c.get("eval_threshold", 0.3))), device=device,
+                threshold=vis_thresh_now, device=device,
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
 
