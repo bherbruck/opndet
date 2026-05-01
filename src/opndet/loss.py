@@ -196,7 +196,7 @@ class OpndetBboxLoss(nn.Module):
         peak_eps: float = 5e-3,
         convexity_weight: float = 0.0,
         convexity_radius: int = 2,
-        dist_weight: float = 1.0,
+        dist_weight: float = 0.5,
         img_h: int = 384,
         img_w: int = 512,
         stride: int = 4,

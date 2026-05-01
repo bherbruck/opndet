@@ -32,7 +32,10 @@ model:
 
     - {name: trunk, from: nout,  module: ConvBnAct, args: {in_ch: 96, out_ch: 96, k: 3}}
     # 6 channels: obj_logit, cx_logit, cy_logit, w_logit, h_logit, dist_logit
-    - {name: raw,   from: trunk, module: Conv,      args: {in_ch: 96, out_ch: 6, k: 1, bias_init: [-2.19, 0.0, 0.0, 0.0, 0.0, 0.0]}}
+    # dist bias_init = +3.0 -> sigmoid(3) ≈ 0.95 at init, so obj_modulated ≈ obj_sig at start.
+    # The model learns to push dist DOWN at non-object regions over training (L1 pulls toward 0
+    # at background); much smaller learning surface than starting at 0.5 (which collapses obj).
+    - {name: raw,   from: trunk, module: Conv,      args: {in_ch: 96, out_ch: 6, k: 1, bias_init: [-2.19, 0.0, 0.0, 0.0, 0.0, 3.0]}}
 
     - {name: obj_r,  from: raw,    module: SplitChannels, args: {start: 0, end: 1}}
     - {name: obj_s,  from: obj_r,  module: SigmoidT,      args: {}}
