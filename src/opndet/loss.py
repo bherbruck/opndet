@@ -125,6 +125,15 @@ def varifocal_loss(
     return (weight * bce).sum() / n_pos
 
 
+def _peak_suppress(hm: torch.Tensor, k: int = 5, eps: float = 5e-3) -> torch.Tensor:
+    """Differentiable arithmetic peak suppression matching the deployed in-graph op.
+    Used at train time so count-aware loss sees the same sparse peak map as inference."""
+    pad = k // 2
+    pooled = F.max_pool2d(hm, kernel_size=k, stride=1, padding=pad)
+    mask = ((hm + eps - pooled) * (1.0 / eps)).clamp(0.0, 1.0)
+    return hm * mask
+
+
 def focal_heatmap_loss(pred_logit: torch.Tensor, gt: torch.Tensor, alpha: float = 2.0, beta: float = 4.0) -> torch.Tensor:
     """CornerNet/CenterNet focal loss on Gaussian heatmap.
 
@@ -157,6 +166,9 @@ class OpndetBboxLoss(nn.Module):
         vfl_gamma: float = 2.0,
         repulsion_weight: float = 0.0,
         nwd_c: float = 12.8,
+        count_weight: float = 0.0,
+        peak_kernel: int = 5,
+        peak_eps: float = 5e-3,
         img_h: int = 384,
         img_w: int = 512,
         stride: int = 4,
@@ -173,6 +185,9 @@ class OpndetBboxLoss(nn.Module):
         self.vfl_gamma = vfl_gamma
         self.rep_w = repulsion_weight
         self.nwd_c = nwd_c
+        self.count_w = count_weight
+        self.peak_kernel = peak_kernel
+        self.peak_eps = peak_eps
         self.img_h = img_h
         self.img_w = img_w
         self.stride = stride
@@ -220,6 +235,17 @@ class OpndetBboxLoss(nn.Module):
             l_rep = _repulsion_loss(pred_xyxy, tgt, pos, self.img_h, self.img_w, self.stride)
             out["loss"] = out["loss"] + self.rep_w * l_rep
             out["l_rep"] = l_rep.detach()
+
+        if self.count_w > 0:
+            # Sparse peak map matches deployed graph; sum at peak cells = predicted count.
+            # GT count = number of positive cells (one per object's center).
+            hm_sig = torch.sigmoid(hm_logit)
+            peaks = _peak_suppress(hm_sig, k=self.peak_kernel, eps=self.peak_eps)
+            pred_count = peaks.flatten(1).sum(dim=1)        # [B]
+            gt_count = pos.flatten(1).sum(dim=1)            # [B]
+            l_count = (pred_count - gt_count).abs().mean()
+            out["loss"] = out["loss"] + self.count_w * l_count
+            out["l_count"] = l_count.detach()
 
         return out
 

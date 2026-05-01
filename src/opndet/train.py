@@ -386,7 +386,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     for epoch in range(start_epoch, epochs):
         model.train()
         t0 = time.time()
-        running = {"loss": 0.0, "l_hm": 0.0, "l_cxy": 0.0, "l_wh": 0.0}
+        running: dict[str, float] = {}
         pbar = tqdm(train_loader, desc=f"epoch {epoch+1}/{epochs}", leave=False)
         for imgs, _, tgt in pbar:
             for g in opt.param_groups:
@@ -409,8 +409,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 opt.step()
             if ema is not None:
                 ema.update(model)
-            for k in running:
-                running[k] += float(losses.get(k, torch.tensor(0.0)).detach()) if k in losses else 0.0
+            for k, v in losses.items():
+                if isinstance(v, torch.Tensor):
+                    running[k] = running.get(k, 0.0) + float(v.detach())
             step += 1
             if step % 5 == 0:
                 pbar.set_postfix(loss=f"{losses['loss'].item():.3f}", lr=f"{opt.param_groups[0]['lr']:.1e}")
