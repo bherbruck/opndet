@@ -125,6 +125,31 @@ def varifocal_loss(
     return (weight * bce).sum() / n_pos
 
 
+def convexity_loss(hm_pred: torch.Tensor, pos: torch.Tensor, k: int = 2, eps: float = 1e-6) -> torch.Tensor:
+    """Center-mass convexity regularizer.
+
+    For each positive cell, extract the (2k+1)×(2k+1) patch from the predicted heatmap
+    and compute the mass-weighted centroid offset from the cell center. Penalize.
+    Forces the model to produce symmetric, centroid-aligned peaks — matches the
+    convex-object prior (round / radially symmetric appearance).
+
+    hm_pred: [B,1,H,W] post-sigmoid objectness.
+    pos:     [B,1,H,W] positive cell mask (1 at GT center cell, 0 elsewhere).
+    k:       neighborhood radius (k=2 -> 5×5 patch).
+    """
+    K = 2 * k + 1
+    patches = F.unfold(hm_pred, kernel_size=K, padding=k, stride=1)  # [B, K*K, H*W]
+    coords = torch.arange(K, device=hm_pred.device, dtype=hm_pred.dtype) - float(k)  # [-k..k]
+    dx = coords.repeat(K).view(1, K * K, 1)              # x offset within patch
+    dy = coords.repeat_interleave(K).view(1, K * K, 1)   # y offset within patch
+    mass = patches.sum(dim=1, keepdim=True) + eps        # [B, 1, HW]
+    cx_off = (patches * dx).sum(dim=1, keepdim=True) / mass
+    cy_off = (patches * dy).sum(dim=1, keepdim=True) / mass
+    pos_flat = pos.flatten(2)                            # [B, 1, HW]
+    n_pos = pos_flat.sum().clamp(min=1.0)
+    return ((cx_off.abs() + cy_off.abs()) * pos_flat).sum() / n_pos
+
+
 def _peak_suppress(hm: torch.Tensor, k: int = 5, eps: float = 5e-3) -> torch.Tensor:
     """Differentiable arithmetic peak suppression matching the deployed in-graph op.
     Used at train time so count-aware loss sees the same sparse peak map as inference."""
@@ -169,6 +194,8 @@ class OpndetBboxLoss(nn.Module):
         count_weight: float = 0.0,
         peak_kernel: int = 5,
         peak_eps: float = 5e-3,
+        convexity_weight: float = 0.0,
+        convexity_radius: int = 2,
         img_h: int = 384,
         img_w: int = 512,
         stride: int = 4,
@@ -188,6 +215,8 @@ class OpndetBboxLoss(nn.Module):
         self.count_w = count_weight
         self.peak_kernel = peak_kernel
         self.peak_eps = peak_eps
+        self.convex_w = convexity_weight
+        self.convex_r = convexity_radius
         self.img_h = img_h
         self.img_w = img_w
         self.stride = stride
@@ -236,16 +265,23 @@ class OpndetBboxLoss(nn.Module):
             out["loss"] = out["loss"] + self.rep_w * l_rep
             out["l_rep"] = l_rep.detach()
 
+        if self.count_w > 0 or self.convex_w > 0:
+            hm_sig = torch.sigmoid(hm_logit)
+
         if self.count_w > 0:
             # Sparse peak map matches deployed graph; sum at peak cells = predicted count.
             # GT count = number of positive cells (one per object's center).
-            hm_sig = torch.sigmoid(hm_logit)
             peaks = _peak_suppress(hm_sig, k=self.peak_kernel, eps=self.peak_eps)
             pred_count = peaks.flatten(1).sum(dim=1)        # [B]
             gt_count = pos.flatten(1).sum(dim=1)            # [B]
             l_count = (pred_count - gt_count).abs().mean()
             out["loss"] = out["loss"] + self.count_w * l_count
             out["l_count"] = l_count.detach()
+
+        if self.convex_w > 0:
+            l_convex = convexity_loss(hm_sig, pos, k=self.convex_r)
+            out["loss"] = out["loss"] + self.convex_w * l_convex
+            out["l_convex"] = l_convex.detach()
 
         return out
 

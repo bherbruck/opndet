@@ -76,3 +76,8 @@ loss:
                           #   Most useful for industrial counting where mAP can hide miscount.
                           #   peak_kernel and peak_eps are auto-mirrored from the model's
                           #   (Sigmoid)PeakSuppress layer; only set them here to override.
+  convexity_weight: 0.0   # >0 penalizes mass-weighted centroid offset of the obj heatmap in a small
+                          #   neighborhood of each positive cell. Forces symmetric / radially round
+                          #   peaks — exploits the convex-object prior. ~0.1-0.5 is sane. l_convex
+                          #   is logged when on.
+  convexity_radius: 2     # neighborhood radius (k=2 -> 5×5 patch around each positive cell)
