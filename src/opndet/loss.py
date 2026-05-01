@@ -286,10 +286,15 @@ class OpndetBboxLoss(nn.Module):
             out["l_convex"] = l_convex.detach()
 
         # Optional distance-transform aux head: raw has 6 channels, target has "dist".
-        # Per-pixel L1 between sigmoid(dist_logit) and the inscribed-ellipse linear ramp.
+        # Target-weighted L1: cells get gradient weight proportional to their target value,
+        # so fg cells (target ~1 at object centers) dominate gradient mass and bg cells
+        # (target=0, ~82% of pixels) barely contribute. Without this, the bg-pixel majority
+        # drives the dist BIAS toward 0 globally, collapsing obj_modulated within ~1 epoch.
         if raw.shape[1] >= 6 and "dist" in tgt and self.dist_w > 0:
             dist_pred = torch.sigmoid(raw[:, 5:6])
-            l_dist = F.l1_loss(dist_pred, tgt["dist"])
+            base_w = 0.1                                     # bg cells get 10% of fg's weight
+            w = tgt["dist"] * (1.0 - base_w) + base_w
+            l_dist = (torch.abs(dist_pred - tgt["dist"]) * w).mean()
             out["loss"] = out["loss"] + self.dist_w * l_dist
             out["l_dist"] = l_dist.detach()
 
