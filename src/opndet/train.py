@@ -59,6 +59,37 @@ class EMA:
                 b_s.copy_(b)
 
 
+class _RepeatSampler:
+    """Wraps a sampler to yield from it forever (YOLOv5 trick)."""
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    def __iter__(self):
+        while True:
+            yield from iter(self.sampler)
+
+
+class InfiniteDataLoader(DataLoader):
+    """DataLoader that calls super().__iter__() exactly once and reuses it for the entire run.
+
+    Workers spawn on first __init__ and never die; prefetch pipeline never resets at epoch
+    boundaries. Drop-in replacement: callers still write `for batch in loader:` and get one
+    epoch's worth of batches per call.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # batch_sampler is the BatchSampler PyTorch built from sampler+batch_size+drop_last.
+        object.__setattr__(self, "batch_sampler", _RepeatSampler(self.batch_sampler))
+        self.iterator = super().__iter__()
+
+    def __len__(self) -> int:
+        return len(self.batch_sampler.sampler)  # number of batches per epoch
+
+    def __iter__(self):
+        for _ in range(len(self)):
+            yield next(self.iterator)
+
+
 class _CfgShim:
     """encode_targets needs an object with img_h/img_w/stride/out_h/out_w."""
 
@@ -84,71 +115,87 @@ def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return inter / union
 
 
-def _ap_at_iou(per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]], iou_thresh: float) -> float:
-    """COCO-style 101-point AP at one IoU threshold. per_image: list of (scores, pred_boxes, gt_boxes)."""
-    n_gt_total = sum(gt.shape[0] for _, _, gt in per_image)
-    if n_gt_total == 0:
-        return 0.0
-    all_scores: list[float] = []
-    all_is_tp: list[int] = []
+def _accumulate_correct(
+    per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    iouv: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """For each image: compute IoU once, greedy-match by score desc per IoU threshold (vectorized over thresholds).
+    Concatenate. Returns (all_scores [N], all_correct [N, n_iouv], total_n_gt)."""
+    n_t = iouv.shape[0]
+    parts_scores: list[np.ndarray] = []
+    parts_correct: list[np.ndarray] = []
+    total_gt = 0
     for scores, boxes, gt_boxes in per_image:
+        total_gt += int(gt_boxes.shape[0])
         if boxes.shape[0] == 0:
             continue
         order = np.argsort(-scores)
-        boxes = boxes[order]
-        scores = scores[order]
+        s_sorted = scores[order]
+        parts_scores.append(s_sorted.astype(np.float32))
         if gt_boxes.shape[0] == 0:
-            all_scores.extend(scores.tolist())
-            all_is_tp.extend([0] * len(scores))
+            parts_correct.append(np.zeros((boxes.shape[0], n_t), dtype=bool))
             continue
-        ious = _iou_xyxy(boxes, gt_boxes)
-        matched = np.zeros(gt_boxes.shape[0], dtype=bool)
+        iou = _iou_xyxy(boxes[order], gt_boxes)  # [n_p, n_g]
+        correct = np.zeros((boxes.shape[0], n_t), dtype=bool)
+        avail = np.ones((n_t, gt_boxes.shape[0]), dtype=bool)
         for i in range(boxes.shape[0]):
-            best_j = -1
-            best_iou = iou_thresh
-            for j in range(gt_boxes.shape[0]):
-                if matched[j]:
-                    continue
-                if ious[i, j] > best_iou:
-                    best_iou = ious[i, j]
-                    best_j = j
-            if best_j >= 0:
-                matched[best_j] = True
-                all_is_tp.append(1)
-            else:
-                all_is_tp.append(0)
-            all_scores.append(float(scores[i]))
-    if not all_scores:
-        return 0.0
-    s = np.array(all_scores); t = np.array(all_is_tp, dtype=np.float32)
-    order = np.argsort(-s)
-    t = t[order]
-    cum_tp = np.cumsum(t)
-    cum_fp = np.cumsum(1.0 - t)
+            row = iou[i]                             # [n_g]
+            masked = row[None, :] * avail            # [n_t, n_g]
+            best = masked.max(axis=1)                # [n_t]
+            am = masked.argmax(axis=1)               # [n_t]
+            ok = best > iouv                         # strict, matches prior semantics
+            if ok.any():
+                tis = np.where(ok)[0]
+                correct[i, tis] = True
+                avail[tis, am[tis]] = False
+        parts_correct.append(correct)
+    if not parts_scores:
+        return np.zeros(0, dtype=np.float32), np.zeros((0, n_t), dtype=bool), total_gt
+    return np.concatenate(parts_scores), np.concatenate(parts_correct, axis=0), total_gt
+
+
+def _ap_from_correct(all_scores: np.ndarray, all_correct: np.ndarray, total_gt: int) -> np.ndarray:
+    """COCO 101-point AP per IoU threshold. Returns array of length all_correct.shape[1]."""
+    n_t = all_correct.shape[1]
+    if total_gt == 0 or all_scores.shape[0] == 0:
+        return np.zeros(n_t, dtype=np.float64)
+    order = np.argsort(-all_scores)
+    c = all_correct[order].astype(np.float64)
+    cum_tp = np.cumsum(c, axis=0)
+    cum_fp = np.cumsum(1.0 - c, axis=0)
     p = cum_tp / np.maximum(1.0, cum_tp + cum_fp)
-    r = cum_tp / max(1, n_gt_total)
-    ap = 0.0
-    for level in np.linspace(0, 1, 101):
-        mask = r >= level
-        ap += (p[mask].max() if mask.any() else 0.0) / 101.0
-    return float(ap)
+    r = cum_tp / max(1, total_gt)
+    levels = np.linspace(0, 1, 101)
+    ap = np.zeros(n_t)
+    for ti in range(n_t):
+        rt = r[:, ti]; pt = p[:, ti]
+        # for each recall level, max precision at recall >= level
+        for level in levels:
+            mask = rt >= level
+            ap[ti] += (pt[mask].max() if mask.any() else 0.0) / 101.0
+    return ap
 
 
 @torch.no_grad()
-def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thresh: float = 0.3, iou_thresh: float = 0.5) -> dict[str, float]:
-    """Hungarian-matched eval. Returns the same dict shape as before so train loop is unchanged."""
+def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
+             score_thresh: float = 0.3, iou_thresh: float = 0.5,
+             decode_threshold: float = 0.05) -> dict[str, float]:
+    """Hungarian-matched eval. Computes IoU once per image, AP across the IoU grid in a single pass.
+
+    decode_threshold filters peaks before AP; 0.05 is plenty since AP is rank-driven and dense
+    scenes can produce thousands of low-conf peaks that contribute essentially nothing to AP.
+    """
     from opndet.metrics import hungarian_match
     model.eval()
     tp = fp = fn = 0
     n_pred = n_gt = 0
-    per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []  # (scores, boxes, gt) for AP
+    per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     for imgs, boxes_list, _ in tqdm(loader, desc="val", leave=False):
         imgs = imgs.to(device, non_blocking=True)
         out = model(imgs)
         out_t = out["output"] if isinstance(out, dict) else out
         out_np = out_t.cpu().numpy()
-        # decode at very low threshold to capture the full PR curve for AP
-        dets_per_full = decode_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=1e-3)
+        dets_per_full = decode_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=decode_threshold)
         for dets_full, gt in zip(dets_per_full, boxes_list):
             scores_full = np.array([d.score for d in dets_full], dtype=np.float32) if dets_full else np.zeros(0, dtype=np.float32)
             boxes_full = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets_full], dtype=np.float32) if dets_full else np.zeros((0, 4), dtype=np.float32)
@@ -167,9 +214,11 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thre
     recall = tp / max(1, tp + fn)
     f1 = 2 * precision * recall / max(1e-9, precision + recall)
 
-    map50 = _ap_at_iou(per_image, 0.5)
-    iou_grid = np.arange(0.5, 1.0, 0.05)
-    map_50_95 = float(np.mean([_ap_at_iou(per_image, float(t)) for t in iou_grid]))
+    iouv = np.arange(0.5, 1.0, 0.05, dtype=np.float64)
+    all_scores, all_correct, total_gt = _accumulate_correct(per_image, iouv)
+    aps = _ap_from_correct(all_scores, all_correct, total_gt)
+    map50 = float(aps[0])
+    map_50_95 = float(aps.mean())
 
     return {"precision": precision, "recall": recall, "f1": f1, "map50": map50, "map_50_95": map_50_95, "n_pred": float(n_pred), "n_gt": float(n_gt)}
 
@@ -268,8 +317,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     eval_kw = {**train_kw, "pin_memory": False}  # val/test don't need pinned memory
     train_kw = {k: v for k, v in train_kw.items() if v is not None}
     eval_kw = {k: v for k, v in eval_kw.items() if v is not None}
-    train_loader = DataLoader(train_ds, batch_size=int(c["batch_size"]), shuffle=True, **train_kw)
-    val_loader = DataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
+    train_loader = InfiniteDataLoader(train_ds, batch_size=int(c["batch_size"]), shuffle=True, **train_kw)
+    val_loader = InfiniteDataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
+    # test_loader runs once at end of training; no benefit to keeping it alive.
     test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
 
     loss_kw = c.get("loss") or {}

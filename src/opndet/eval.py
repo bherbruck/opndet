@@ -39,7 +39,7 @@ def collect_predictions(
     loader: DataLoader,
     cfg_shim: _CfgShim,
     device: torch.device,
-    decode_threshold: float = 1e-3,
+    decode_threshold: float = 0.05,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Forward pass over loader. Returns list of (scores, pred_boxes_xyxy, gt_boxes_xyxy) per image."""
     model.eval()
@@ -370,7 +370,7 @@ def run_eval(
 
     score_thresh = float(score_thresh if score_thresh is not None else c.get("eval_threshold", 0.3))
 
-    images = collect_predictions(model, loader, cfg_shim, device, decode_threshold=1e-3)
+    images = collect_predictions(model, loader, cfg_shim, device, decode_threshold=0.05)
     report = compute_full_report(images, iou_thresh=iou_thresh, score_thresh=score_thresh)
     abs_errs = _abs_count_errors(images, score_thresh)
 
