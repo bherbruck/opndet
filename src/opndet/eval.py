@@ -359,6 +359,11 @@ def run_eval(
     model = build_model_from_yaml(model_path).to(device).eval()
     sd = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(sd["model"] if "model" in sd else sd)
+    T = float(sd.get("temperature", 1.0)) if isinstance(sd, dict) else 1.0
+    if T != 1.0:
+        from opndet.calibrate import apply_temperature
+        apply_temperature(model, T)
+        print(f"applied calibration temperature T={T:.4f}")
     in_ch, img_h, img_w = model.input_shape
     cfg_shim = _CfgShim(img_h, img_w, stride=int(c["model"].get("stride", 4)))
 

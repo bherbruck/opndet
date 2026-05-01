@@ -17,8 +17,13 @@ from opndet.yaml_build import build_model_from_yaml
 def load_model(model_config: str, ckpt: str | None, device: str = "cpu") -> torch.nn.Module:
     m = build_model_from_yaml(model_config).to(device).eval()
     if ckpt:
-        sd = torch.load(ckpt, map_location=device, weights_only=True)
+        sd = torch.load(ckpt, map_location=device, weights_only=False)
         m.load_state_dict(sd["model"] if "model" in sd else sd)
+        T = float(sd.get("temperature", 1.0)) if isinstance(sd, dict) else 1.0
+        if T != 1.0:
+            from opndet.calibrate import apply_temperature
+            apply_temperature(m, T)
+            print(f"applied calibration temperature T={T:.4f}")
     return m
 
 

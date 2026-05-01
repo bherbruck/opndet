@@ -23,8 +23,13 @@ def _cmd_export(args: argparse.Namespace) -> int:
         m = build_model_from_yaml(resolve(args.model)).eval()
         if args.ckpt:
             import torch
-            sd = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+            sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)
             m.load_state_dict(sd["model"] if "model" in sd else sd)
+            T = float(sd.get("temperature", 1.0)) if isinstance(sd, dict) else 1.0
+            if T != 1.0:
+                from opndet.calibrate import apply_temperature
+                apply_temperature(m, T)
+                print(f"baking calibration temperature T={T:.4f} into the graph")
         import torch
         c, h, w = m.input_shape
         if args.bake_input_norm:
@@ -85,6 +90,13 @@ def _cmd_predict(args: argparse.Namespace) -> int:
     print(json.dumps(results, indent=2))
     if args.save:
         print(f"vis saved: {args.save}", file=sys.stderr)
+    return 0
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    from opndet.calibrate import calibrate_ckpt
+    out = calibrate_ckpt(args.ckpt, args.config, split=args.split, save=not args.dry_run)
+    print(f"T={out['temperature']:.4f}  ECE {out['ece_before']:.4f} -> {out['ece_after']:.4f}  n={out['n_samples']}")
     return 0
 
 
@@ -203,6 +215,13 @@ def main(argv: list[str] | None = None) -> int:
     pinit = sub.add_parser("init-config", help="Write the bundled training config template to stdout (or --out path)")
     pinit.add_argument("--out", default="-", help="Path or - for stdout")
     pinit.set_defaults(func=_cmd_init_config)
+
+    pcal = sub.add_parser("calibrate", help="Fit Platt-style temperature on val split; bake it into the ckpt")
+    pcal.add_argument("--ckpt", required=True, help="Trained checkpoint .pt")
+    pcal.add_argument("--config", required=True, help="Training YAML used to define data + model")
+    pcal.add_argument("--split", default="val", choices=["train", "val", "test"], help="Which split to fit on")
+    pcal.add_argument("--dry-run", action="store_true", help="Compute T but don't write back to ckpt")
+    pcal.set_defaults(func=_cmd_calibrate)
 
     pev = sub.add_parser("eval", help="Run full validation suite (Hungarian-matched, calibration, count, size strata) and write report")
     pev.add_argument("--ckpt", required=True, help="Trained checkpoint .pt")

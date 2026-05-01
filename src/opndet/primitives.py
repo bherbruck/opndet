@@ -98,15 +98,22 @@ class PeakSuppress(nn.Module):
 
 @register("SigmoidPeakSuppress")
 class SigmoidPeakSuppress(nn.Module):
-    """Sigmoid then peak-suppress (fused op for the obj head). Default mode='arith'."""
+    """Sigmoid then peak-suppress (fused op for the obj head). Default mode='arith'.
 
-    def __init__(self, k: int = 3, eps: float = 5e-3, mode: str = "arith"):
+    Optional `temperature` divides the input logit before sigmoid (Platt-style calibration).
+    Default 1.0 = no-op. Set per-ckpt via `opndet calibrate`. ONNX-traceable: T folds in as a Constant.
+    """
+
+    def __init__(self, k: int = 3, eps: float = 5e-3, mode: str = "arith", temperature: float = 1.0):
         super().__init__()
         self.k = k
         self.eps = eps
         self.mode = mode
+        self.temperature = float(temperature)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.temperature != 1.0:
+            x = x * (1.0 / self.temperature)
         hm = torch.sigmoid(x)
         return hm * _peak_mask(hm, self.k, self.eps, self.mode)
 
