@@ -88,6 +88,25 @@ def _cmd_predict(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    from opndet.eval import run_eval
+    out = run_eval(
+        ckpt_path=args.ckpt,
+        config_path=args.config,
+        split=args.split,
+        out_dir=args.out,
+        score_thresh=args.score_thresh,
+        iou_thresh=args.iou_thresh,
+        batch_size=args.batch_size,
+    )
+    s = out["report"]["summary"]
+    cs = out["report"]["counts"]
+    print(f"P={s['precision']:.3f} R={s['recall']:.3f} F1={s['f1']:.3f}  mAP@.5={s['map50']:.3f} mAP@.5:.95={s['map_50_95']:.3f}")
+    print(f"count exact={cs['exact_count_frac']:.1%}  abs_err mean={cs['abs_err_mean']:.2f} p95={cs['abs_err_p95']:.0f}")
+    print(f"out: {out['out_dir']}")
+    return 0
+
+
 def _cmd_quantize(args: argparse.Namespace) -> int:
     from opndet.quantize import parity_check, quantize_onnx
     info = quantize_onnx(args.onnx, args.out, args.calib, n_calib=args.n_calib, quant_format=args.format)
@@ -184,6 +203,16 @@ def main(argv: list[str] | None = None) -> int:
     pinit = sub.add_parser("init-config", help="Write the bundled training config template to stdout (or --out path)")
     pinit.add_argument("--out", default="-", help="Path or - for stdout")
     pinit.set_defaults(func=_cmd_init_config)
+
+    pev = sub.add_parser("eval", help="Run full validation suite (Hungarian-matched, calibration, count, size strata) and write report")
+    pev.add_argument("--ckpt", required=True, help="Trained checkpoint .pt")
+    pev.add_argument("--config", required=True, help="Training YAML used to define data + model")
+    pev.add_argument("--split", default="val", choices=["train", "val", "test"], help="Which split to evaluate")
+    pev.add_argument("--out", default=None, help="Output dir (default: <ckpt_dir>/eval_<split>)")
+    pev.add_argument("--score-thresh", type=float, default=None, help="Confidence threshold for fixed-threshold metrics (default: cfg.eval_threshold)")
+    pev.add_argument("--iou-thresh", type=float, default=0.5, help="IoU threshold for TP/FN matching")
+    pev.add_argument("--batch-size", type=int, default=None, help="Override config batch_size")
+    pev.set_defaults(func=_cmd_eval)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
     pq.add_argument("--onnx", required=True, help="Input fp32 ONNX")

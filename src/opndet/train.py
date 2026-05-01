@@ -136,39 +136,33 @@ def _ap_at_iou(per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]], iou_t
 
 @torch.no_grad()
 def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device, score_thresh: float = 0.3, iou_thresh: float = 0.5) -> dict[str, float]:
+    """Hungarian-matched eval. Returns the same dict shape as before so train loop is unchanged."""
+    from opndet.metrics import hungarian_match
     model.eval()
     tp = fp = fn = 0
     n_pred = n_gt = 0
-    per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []  # (scores, boxes, gt) for mAP
+    per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []  # (scores, boxes, gt) for AP
     for imgs, boxes_list, _ in tqdm(loader, desc="val", leave=False):
         imgs = imgs.to(device, non_blocking=True)
         out = model(imgs)
         out_t = out["output"] if isinstance(out, dict) else out
         out_np = out_t.cpu().numpy()
-        # decode at very low threshold to capture full PR curve for AP
+        # decode at very low threshold to capture the full PR curve for AP
         dets_per_full = decode_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=1e-3)
-        dets_per = decode_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=score_thresh)
-        for dets, dets_full, gt in zip(dets_per, dets_per_full, boxes_list):
-            n_pred += len(dets)
-            n_gt += gt.shape[0]
-            scores_arr = np.array([d.score for d in dets_full], dtype=np.float32) if dets_full else np.zeros(0, dtype=np.float32)
-            boxes_arr = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets_full], dtype=np.float32) if dets_full else np.zeros((0, 4), dtype=np.float32)
-            per_image.append((scores_arr, boxes_arr, gt.astype(np.float32)))
-            if not dets or gt.shape[0] == 0:
-                fn += gt.shape[0]
-                fp += len(dets)
-                continue
-            pred_boxes = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32)
-            ious = _iou_xyxy(pred_boxes, gt)
-            matched_gt = set()
-            for pi in np.argsort([-d.score for d in dets]):
-                gj = ious[pi].argmax()
-                if ious[pi, gj] >= iou_thresh and gj not in matched_gt:
-                    matched_gt.add(int(gj))
-                    tp += 1
-                else:
-                    fp += 1
-            fn += gt.shape[0] - len(matched_gt)
+        for dets_full, gt in zip(dets_per_full, boxes_list):
+            scores_full = np.array([d.score for d in dets_full], dtype=np.float32) if dets_full else np.zeros(0, dtype=np.float32)
+            boxes_full = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets_full], dtype=np.float32) if dets_full else np.zeros((0, 4), dtype=np.float32)
+            per_image.append((scores_full, boxes_full, gt.astype(np.float32)))
+
+            keep = scores_full >= score_thresh
+            pb = boxes_full[keep]
+            n_pred += int(pb.shape[0]); n_gt += int(gt.shape[0])
+            m = hungarian_match(pb, gt.astype(np.float32), iou_thresh=iou_thresh)
+            tp_i = m.pairs.shape[0]
+            tp += tp_i
+            fp += int(pb.shape[0]) - tp_i
+            fn += int(gt.shape[0]) - tp_i
+
     precision = tp / max(1, tp + fp)
     recall = tp / max(1, tp + fn)
     f1 = 2 * precision * recall / max(1e-9, precision + recall)
