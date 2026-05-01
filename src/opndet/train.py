@@ -396,6 +396,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     auto_calibrate = bool(c.get("auto_calibrate", True))
     calibrate_every = int(c.get("calibrate_every", 0))
+    test_every = int(c.get("test_every", 0))
 
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
@@ -407,6 +408,15 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             vis_imgs.append(img_t)
             vis_boxes.append(boxes)
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
+
+    test_vis_imgs = []
+    test_vis_boxes = []
+    if n_vis > 0 and test_every > 0 and len(test_ds) > 0:
+        for i in range(min(n_vis, len(test_ds))):
+            img_t, boxes, _ = test_ds[i]
+            test_vis_imgs.append(img_t)
+            test_vis_boxes.append(boxes)
+    test_vis_batch = torch.stack(test_vis_imgs, dim=0) if test_vis_imgs else None
 
     metric_for_best = str(c.get("metric_for_best", "f1"))   # f1 | map50 | map_50_95
     if metric_for_best not in ("f1", "map50", "map_50_95"):
@@ -501,6 +511,18 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 writer.add_scalar("eval/ece_pre", _ece_pre, ep)
                 writer.add_scalar("eval/ece_post", _ece_post, ep)
                 print(f"  calib: T={_T:.3f}  ECE {_ece_pre:.3f} -> {_ece_post:.3f}")
+
+        if test_every > 0 and ep % test_every == 0 and len(test_ds) > 0:
+            mt = evaluate(eval_model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+            print(f"  test: P={mt['precision']:.3f} R={mt['recall']:.3f} F1={mt['f1']:.3f}  mAP@.5={mt['map50']:.3f} mAP@.5:.95={mt['map_50_95']:.3f}")
+            for k, v in mt.items():
+                writer.add_scalar(f"test/{k}", v, ep)
+            if test_vis_batch is not None:
+                grid = render_predictions(
+                    eval_model, test_vis_batch, test_vis_boxes, img_h, img_w, cfg_shim.stride,
+                    threshold=float(c.get("eval_threshold", 0.3)), device=device,
+                )
+                writer.add_images("test/preds", grid, ep, dataformats="NCHW")
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs):
             grid = render_predictions(

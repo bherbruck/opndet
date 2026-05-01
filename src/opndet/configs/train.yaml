@@ -61,6 +61,7 @@ ema_decay: 0.999          # 0 = off; 0.999 is yolov8 default. Eval + best.pt use
 # Calibration (Platt-style temperature on the obj sigmoid).
 auto_calibrate: true      # at end of training, fit T on val + bake into best.pt + re-run test eval (calibrated)
 calibrate_every: 0        # 0 = off; >0 = fit T every N epochs and log eval/T, eval/ece_pre, eval/ece_post to TB
+test_every: 0             # 0 = off; >0 = run test eval every N epochs (logs test/* scalars and test/preds images)
 
 # Distillation hyperparams (used when `opndet train --teacher PATH` or --self-distill is set).
 # Path lives only on the CLI — keeps yaml reproducible across machines (Colab won't have your
