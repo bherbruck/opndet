@@ -417,6 +417,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         "hm_weight": float(distill_cfg.get("hm_weight", 1.0)),
         "reg_weight": float(distill_cfg.get("reg_weight", 0.5)),
         "conf_gate": float(distill_cfg.get("conf_gate", 0.5)),
+        "full_distill": bool(distill_cfg.get("full_distill", False)),
+        "neg_gate": float(distill_cfg.get("neg_gate", 0.0)),
+        "kd_temperature": float(distill_cfg.get("kd_temperature", 1.0)),
     }
 
     auto_calibrate = bool(c.get("auto_calibrate", True))
