@@ -37,10 +37,36 @@ def _draw_gaussian(hm: np.ndarray, cx: int, cy: int, sigma: float) -> None:
     hm[y0:y1, x0:x1] = np.maximum(hm[y0:y1, x0:x1], g)
 
 
+def _render_dist_target(boxes: np.ndarray, Hp: int, Wp: int, s: int) -> np.ndarray:
+    """Per-pixel distance target at output resolution. For each GT, renders the inscribed
+    ellipse with values that ramp linearly from 1 at center to 0 at the boundary, then
+    aggregates with elementwise max across objects. The convex prior: midplanes between
+    touching objects naturally drop to ~0 because both objects' ramps decay there.
+    """
+    dist = np.zeros((Hp, Wp), dtype=np.float32)
+    if len(boxes) == 0:
+        return dist
+    yy, xx = np.mgrid[0:Hp, 0:Wp].astype(np.float32)
+    for x1, y1, x2, y2 in boxes:
+        bw = max(0.0, x2 - x1) / s
+        bh = max(0.0, y2 - y1) / s
+        if bw < 2.0 or bh < 2.0:
+            continue
+        cx_g = (x1 + x2) * 0.5 / s
+        cy_g = (y1 + y2) * 0.5 / s
+        a = bw * 0.5; b = bh * 0.5
+        # ((x-cx)/a)^2 + ((y-cy)/b)^2 = 1 at boundary, 0 at center
+        r = np.sqrt(((xx - cx_g) / a) ** 2 + ((yy - cy_g) / b) ** 2)
+        obj = np.clip(1.0 - r, 0.0, 1.0)
+        np.maximum(dist, obj, out=dist)
+    return dist
+
+
 def encode_targets(
     boxes: np.ndarray,
     cfg: ModelConfig,
     min_sigma: float = 1.0,
+    dist_head: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Encode list of (x1,y1,x2,y2) pixel boxes into dense GT tensors.
 
@@ -49,6 +75,7 @@ def encode_targets(
       cxy  : [2, H', W']     cell-relative center offset GT (only valid where pos)
       wh   : [2, H', W']     image-normalized w,h GT (only valid where pos)
       pos  : [1, H', W']     1.0 at positive cells (peak), 0 elsewhere — for size loss masking
+      dist : [1, H', W']     (only if dist_head=True) inscribed-ellipse linear ramp, [0,1]
     """
     H, W = cfg.img_h, cfg.img_w
     s = cfg.stride
@@ -81,12 +108,16 @@ def encode_targets(
             wh[1, iy, ix] = bh / H
             pos[iy, ix] = 1.0
 
-    return {
+    out = {
         "hm": torch.from_numpy(hm).unsqueeze(0),
         "cxy": torch.from_numpy(cxy),
         "wh": torch.from_numpy(wh),
         "pos": torch.from_numpy(pos).unsqueeze(0),
     }
+    if dist_head:
+        d = _render_dist_target(boxes, Hp, Wp, s)
+        out["dist"] = torch.from_numpy(d).unsqueeze(0)
+    return out
 
 
 def collate_targets(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:

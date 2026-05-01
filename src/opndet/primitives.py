@@ -26,6 +26,15 @@ class Add(nn.Module):
         return out
 
 
+@register("Mul")
+class Mul(nn.Module):
+    def forward(self, xs: list[torch.Tensor]) -> torch.Tensor:
+        out = xs[0]
+        for x in xs[1:]:
+            out = out * x
+        return out
+
+
 @register("ResizeNearest2x")
 class ResizeNearest2x(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -46,6 +55,26 @@ class MaxPool(nn.Module):
 @register("Sigmoid")
 class Sigmoid(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(x)
+
+
+@register("SigmoidT")
+class SigmoidT(nn.Module):
+    """Sigmoid with optional Platt-style temperature divisor.
+
+    Use in place of Sigmoid on the obj path of architectures where the obj logit
+    isn't fused with peak suppression (e.g. dist-head variants where Sigmoid →
+    Mul(dist) → PeakSuppress). `opndet calibrate` finds and updates this layer's
+    `temperature` attr just like SigmoidPeakSuppress.
+    """
+
+    def __init__(self, temperature: float = 1.0):
+        super().__init__()
+        self.temperature = float(temperature)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.temperature != 1.0:
+            x = x * (1.0 / self.temperature)
         return torch.sigmoid(x)
 
 

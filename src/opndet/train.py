@@ -309,9 +309,10 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     in_ch, img_h, img_w = model.input_shape
     cfg_shim = _CfgShim(img_h, img_w, stride=int(c["model"].get("stride", 4)))
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}")
+    has_dist = "dist" in getattr(model, "aliases", {})
+    print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}{'  (dist head)' if has_dist else ''}")
 
-    encode_fn = partial(encode_targets, cfg=cfg_shim)
+    encode_fn = partial(encode_targets, cfg=cfg_shim, dist_head=has_dist)
     cache = bool(c.get("cache_images", False))
     mosaic_prob = float(aug_cfg.mosaic_prob if hasattr(aug_cfg, "mosaic_prob") else 0.0)
     min_vis = float(aug_cfg.min_visible_frac if hasattr(aug_cfg, "min_visible_frac") else 0.5)

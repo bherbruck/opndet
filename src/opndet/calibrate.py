@@ -28,10 +28,11 @@ class _CfgShim:
 
 
 def apply_temperature(model: torch.nn.Module, T: float) -> int:
-    """Set SigmoidPeakSuppress.temperature on all matching layers. Returns count of layers updated."""
+    """Set temperature on all calibration-aware layers (SigmoidPeakSuppress, SigmoidT).
+    Returns count of layers updated."""
     n = 0
     for m in model.modules():
-        if type(m).__name__ == "SigmoidPeakSuppress":
+        if type(m).__name__ in ("SigmoidPeakSuppress", "SigmoidT"):
             m.temperature = float(T)
             n += 1
     return n

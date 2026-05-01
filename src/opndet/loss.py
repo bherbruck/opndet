@@ -196,6 +196,7 @@ class OpndetBboxLoss(nn.Module):
         peak_eps: float = 5e-3,
         convexity_weight: float = 0.0,
         convexity_radius: int = 2,
+        dist_weight: float = 1.0,
         img_h: int = 384,
         img_w: int = 512,
         stride: int = 4,
@@ -217,6 +218,7 @@ class OpndetBboxLoss(nn.Module):
         self.peak_eps = peak_eps
         self.convex_w = convexity_weight
         self.convex_r = convexity_radius
+        self.dist_w = dist_weight
         self.img_h = img_h
         self.img_w = img_w
         self.stride = stride
@@ -282,6 +284,14 @@ class OpndetBboxLoss(nn.Module):
             l_convex = convexity_loss(hm_sig, pos, k=self.convex_r)
             out["loss"] = out["loss"] + self.convex_w * l_convex
             out["l_convex"] = l_convex.detach()
+
+        # Optional distance-transform aux head: raw has 6 channels, target has "dist".
+        # Per-pixel L1 between sigmoid(dist_logit) and the inscribed-ellipse linear ramp.
+        if raw.shape[1] >= 6 and "dist" in tgt and self.dist_w > 0:
+            dist_pred = torch.sigmoid(raw[:, 5:6])
+            l_dist = F.l1_loss(dist_pred, tgt["dist"])
+            out["loss"] = out["loss"] + self.dist_w * l_dist
+            out["l_dist"] = l_dist.detach()
 
         return out
 
