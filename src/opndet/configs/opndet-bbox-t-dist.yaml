@@ -1,0 +1,54 @@
+# opndet-bbox-t-dist: bbox-t + auxiliary distance-transform head.
+# Output contract is unchanged ([1, 5, H/4, W/4]). The dist channel is internal:
+# multiplied with the obj heatmap inside the graph before peak suppression so peaks
+# at midplanes between touching objects get pushed down. Helps for dense / touching
+# convex object scenes (eggs in a flat, pills on a tray).
+
+model:
+  in_ch: 3
+  img_h: 384
+  img_w: 512
+  layers:
+    - {name: stem, from: 0,    module: ConvBnAct, args: {in_ch: 3,    out_ch: 224,  k: 3, s: 2}}
+    - {name: p1,   from: stem, module: CSPBlock,  args: {in_ch: 224,  out_ch: 448,  n: 3, s: 2}}
+    - {name: p2,   from: p1,   module: CSPBlock,  args: {in_ch: 448,  out_ch: 896,  n: 9, s: 2}}
+    - {name: p3,   from: p2,   module: CSPBlock,  args: {in_ch: 896,  out_ch: 1536, n: 14, s: 2}}
+    - {name: p4,   from: p3,   module: CSPBlock,  args: {in_ch: 1536, out_ch: 1792, n: 9, s: 2}}
+
+    - {name: lat4, from: p4,   module: ConvBnAct, args: {in_ch: 1792, out_ch: 768, k: 1}}
+    - {name: lat3, from: p3,   module: ConvBnAct, args: {in_ch: 1536, out_ch: 768, k: 1}}
+    - {name: lat2, from: p2,   module: ConvBnAct, args: {in_ch: 896,  out_ch: 768, k: 1}}
+    - {name: lat1, from: p1,   module: ConvBnAct, args: {in_ch: 448,  out_ch: 768, k: 1}}
+
+    - {name: up4,   from: lat4,        module: ResizeNearest2x, args: {}}
+    - {name: add3,  from: [up4, lat3], module: Add,             args: {}}
+    - {name: fuse3, from: add3,        module: ConvBnAct,       args: {in_ch: 768, out_ch: 768, k: 3}}
+    - {name: up3,   from: fuse3,       module: ResizeNearest2x, args: {}}
+    - {name: add2,  from: [up3, lat2], module: Add,             args: {}}
+    - {name: fuse2, from: add2,        module: ConvBnAct,       args: {in_ch: 768, out_ch: 768, k: 3}}
+    - {name: up2,   from: fuse2,       module: ResizeNearest2x, args: {}}
+    - {name: add1,  from: [up2, lat1], module: Add,             args: {}}
+    - {name: nout,  from: add1,        module: ConvBnAct,       args: {in_ch: 768, out_ch: 768, k: 3}}
+
+    - {name: trunk, from: nout,  module: ConvBnAct, args: {in_ch: 768, out_ch: 768, k: 3}}
+    # 6 channels: obj_logit, cx_logit, cy_logit, w_logit, h_logit, dist_logit
+    # dist bias_init = +3.0 -> sigmoid(3) ≈ 0.95 at init, so obj_modulated ≈ obj_sig at start.
+    # The model learns to push dist DOWN at non-object regions over training (L1 pulls toward 0
+    # at background); much smaller learning surface than starting at 0.5 (which collapses obj).
+    - {name: raw,   from: trunk, module: Conv,      args: {in_ch: 768, out_ch: 6, k: 1, bias_init: [-2.19, 0.0, 0.0, 0.0, 0.0, 3.0]}}
+
+    - {name: obj_r,  from: raw,    module: SplitChannels, args: {start: 0, end: 1}}
+    - {name: obj_s,  from: obj_r,  module: SigmoidT,      args: {}}
+    - {name: dist_r, from: raw,    module: SplitChannels, args: {start: 5, end: 6}}
+    - {name: dist,   from: dist_r, module: Sigmoid,       args: {}}
+    - {name: obj_md, from: [obj_s, dist], module: Mul,    args: {}}
+    - {name: obj,    from: obj_md, module: PeakSuppress,  args: {k: 5, eps: 5.0e-3}}
+
+    - {name: cxy_r, from: raw,   module: SplitChannels, args: {start: 1, end: 3}}
+    - {name: cxy,   from: cxy_r, module: Sigmoid,       args: {}}
+    - {name: wh_r,  from: raw,   module: SplitChannels, args: {start: 3, end: 5}}
+    - {name: wh,    from: wh_r,  module: Sigmoid,       args: {}}
+    - {name: out,   from: [obj, cxy, wh], module: Concat, args: {dim: 1}}
+
+  outputs:
+    - {name: output, from: out, activation: none}
