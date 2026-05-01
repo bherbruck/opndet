@@ -90,6 +90,15 @@ class InfiniteDataLoader(DataLoader):
             yield next(self.iterator)
 
 
+def _detect_peak_op(model: torch.nn.Module) -> tuple[int | None, float | None]:
+    """Walk the built model, find the (Sigmoid)PeakSuppress layer and return its (k, eps).
+    Returns (None, None) if the model has no peak op (custom arch)."""
+    for m in model.modules():
+        if type(m).__name__ in ("PeakSuppress", "SigmoidPeakSuppress"):
+            return int(m.k), float(m.eps)
+    return None, None
+
+
 class _CfgShim:
     """encode_targets needs an object with img_h/img_w/stride/out_h/out_w."""
 
@@ -326,6 +335,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     loss_kw.setdefault("img_h", img_h)
     loss_kw.setdefault("img_w", img_w)
     loss_kw.setdefault("stride", cfg_shim.stride)
+    # Auto-mirror the model's peak op so count-aware loss sees the same sparse map as inference.
+    # User can still override by setting peak_kernel/peak_eps explicitly in the yaml's `loss:` block.
+    peak_k, peak_eps = _detect_peak_op(model)
+    if peak_k is not None:
+        loss_kw.setdefault("peak_kernel", peak_k)
+        loss_kw.setdefault("peak_eps", peak_eps)
+        if loss_kw.get("count_weight", 0.0) > 0:
+            print(f"count-aware loss: peak_kernel={peak_k}, peak_eps={peak_eps} (auto-detected from model)")
     loss_fn = OpndetBboxLoss(**loss_kw)
     opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
     if resume_state is not None and "optimizer" in resume_state:

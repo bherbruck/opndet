@@ -74,5 +74,5 @@ loss:
   count_weight: 0.0       # >0 enables the count-aware term: λ · |Σ pred_peaks - n_gt| per image.
                           #   Pushes total mass at peak cells toward the GT count. ~0.05-0.1 is a sane start.
                           #   Most useful for industrial counting where mAP can hide miscount.
-  peak_kernel: 5          # MaxPool kernel for the in-graph peak op; matches the deployed graph default
-  peak_eps: 5.0e-3        # arithmetic-mask epsilon; matches deployed graph default
+                          #   peak_kernel and peak_eps are auto-mirrored from the model's
+                          #   (Sigmoid)PeakSuppress layer; only set them here to override.
