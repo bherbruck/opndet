@@ -33,9 +33,11 @@ patience_smart: false   # when true, fire only if NO tracked metric (f1/map50/ma
                         #   _cal versions) has improved by patience_min_delta in patience epochs.
                         #   Useful when raw mAP plateaus but precision / calibration still climbing.
 patience_min_delta: 0.003   # minimum improvement to count (filter eval noise)
-metric_for_best: f1     # f1 | map50 | map_50_95 | f1_cal | map50_cal | map_50_95_cal
+metric_for_best: f1     # f1 | map50 | map_50_95 | f1_opt | f1_cal | map50_cal | map_50_95_cal | f1_opt_cal
+                        # f1_opt: F1 at the auto-detected optimal threshold per epoch (no longer
+                        #   penalizing model for over-predicting at score_thresh=0.2 when its
+                        #   real operating point is 0.4+). Best for KD / sharply-bimodal models.
                         # _cal versions select on the post-calibration metric (forces calibrate_every=1)
-                        # — picks the "best deployed" checkpoint, not just the best raw one
 lr: 3.0e-3
 weight_decay: 1.0e-4
 warmup_steps: 200

@@ -229,7 +229,32 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
     map50 = float(aps[0])
     map_50_95 = float(aps.mean())
 
-    return {"precision": precision, "recall": recall, "f1": f1, "map50": map50, "map_50_95": map_50_95, "n_pred": float(n_pred), "n_gt": float(n_gt)}
+    # F1 sweep across thresholds. Uses the iou=0.5 correctness column we already computed.
+    # Picks best operating point automatically — robust to over-prediction at score_thresh=0.2.
+    if all_scores.shape[0] > 0 and total_gt > 0:
+        is_tp = all_correct[:, 0].astype(np.int64)
+        thresholds = np.arange(0.10, 0.91, 0.05)
+        best_f1 = 0.0
+        best_t = float(score_thresh)
+        for t in thresholds:
+            keep = all_scores >= t
+            tp_t = int(is_tp[keep].sum())
+            fp_t = int(keep.sum()) - tp_t
+            fn_t = total_gt - tp_t
+            denom = 2 * tp_t + fp_t + fn_t
+            f1_t = 2.0 * tp_t / denom if denom > 0 else 0.0
+            if f1_t > best_f1:
+                best_f1 = f1_t
+                best_t = float(t)
+        f1_opt = best_f1
+        threshold_opt = best_t
+    else:
+        f1_opt = 0.0
+        threshold_opt = float(score_thresh)
+
+    return {"precision": precision, "recall": recall, "f1": f1, "map50": map50, "map_50_95": map_50_95,
+            "f1_opt": f1_opt, "threshold_opt": threshold_opt,
+            "n_pred": float(n_pred), "n_gt": float(n_gt)}
 
 
 def _resolve_out_dir(base: Path, auto_increment: bool = True) -> Path:
@@ -426,7 +451,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     test_vis_batch = torch.stack(test_vis_imgs, dim=0) if test_vis_imgs else None
 
     metric_for_best = str(c.get("metric_for_best", "f1"))
-    valid_metrics = ("f1", "map50", "map_50_95", "f1_cal", "map50_cal", "map_50_95_cal")
+    valid_metrics = ("f1", "map50", "map_50_95", "f1_opt",
+                     "f1_cal", "map50_cal", "map_50_95_cal", "f1_opt_cal")
     if metric_for_best not in valid_metrics:
         raise ValueError(f"metric_for_best must be one of {valid_metrics}, got {metric_for_best}")
     metric_is_cal = metric_for_best.endswith("_cal")
@@ -499,7 +525,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         eval_model = ema.shadow if ema is not None else model
         m = evaluate(eval_model, val_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
         cur_lr = opt.param_groups[0]["lr"]
-        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  ({dt:.1f}s)")
+        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  ({dt:.1f}s)")
 
         ep = epoch + 1
         writer.add_scalar("lr", cur_lr, ep)
