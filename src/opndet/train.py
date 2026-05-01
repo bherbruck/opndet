@@ -419,9 +419,16 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             test_vis_boxes.append(boxes)
     test_vis_batch = torch.stack(test_vis_imgs, dim=0) if test_vis_imgs else None
 
-    metric_for_best = str(c.get("metric_for_best", "f1"))   # f1 | map50 | map_50_95
-    if metric_for_best not in ("f1", "map50", "map_50_95"):
-        raise ValueError(f"metric_for_best must be one of f1|map50|map_50_95, got {metric_for_best}")
+    metric_for_best = str(c.get("metric_for_best", "f1"))
+    valid_metrics = ("f1", "map50", "map_50_95", "f1_cal", "map50_cal", "map_50_95_cal")
+    if metric_for_best not in valid_metrics:
+        raise ValueError(f"metric_for_best must be one of {valid_metrics}, got {metric_for_best}")
+    metric_is_cal = metric_for_best.endswith("_cal")
+    metric_base = metric_for_best.removesuffix("_cal")
+    # If selecting on calibrated metric, force per-epoch calibration regardless of calibrate_every.
+    if metric_is_cal and calibrate_every == 0:
+        calibrate_every = 1
+        print(f"metric_for_best={metric_for_best}: forcing calibrate_every=1")
     best_metric = -1.0
     best_epoch = 0
     patience = int(c.get("patience", 0))   # 0 = disabled
@@ -496,22 +503,34 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             writer.add_scalar(f"val/{k}", v, ep)
         writer.add_scalar("time/epoch_s", dt, ep)
 
+        m_cal = None
+        cur_T = 1.0
         if calibrate_every > 0 and ep % calibrate_every == 0:
             from opndet.calibrate import (apply_temperature, collect_calibration_data,
                                             fit_temperature)
             from opndet.metrics import calibration_bins
-            apply_temperature(eval_model, 1.0)   # raw logits for fitting
+            apply_temperature(eval_model, 1.0)
             _logits, _labels = collect_calibration_data(eval_model, val_loader, cfg_shim, device)
             if _logits.shape[0] > 0:
-                _T = fit_temperature(_logits, _labels)
+                cur_T = fit_temperature(_logits, _labels)
                 _sig_raw = (1.0 / (1.0 + np.exp(-_logits))).astype(np.float32)
-                _sig_cal = (1.0 / (1.0 + np.exp(-_logits / _T))).astype(np.float32)
+                _sig_cal = (1.0 / (1.0 + np.exp(-_logits / cur_T))).astype(np.float32)
                 _ece_pre = calibration_bins(_sig_raw, _labels)["ece"]
                 _ece_post = calibration_bins(_sig_cal, _labels)["ece"]
-                writer.add_scalar("eval/T", _T, ep)
+                writer.add_scalar("eval/T", cur_T, ep)
                 writer.add_scalar("eval/ece_pre", _ece_pre, ep)
                 writer.add_scalar("eval/ece_post", _ece_post, ep)
-                print(f"  calib: T={_T:.3f}  ECE {_ece_pre:.3f} -> {_ece_post:.3f}")
+                # Re-eval with T applied to get true calibrated metrics; needed when selecting on _cal,
+                # also useful as a TB readout when calibrate_every fires.
+                apply_temperature(eval_model, cur_T)
+                m_cal = evaluate(eval_model, val_loader, cfg_shim, device,
+                                 score_thresh=float(c.get("eval_threshold", 0.3)))
+                for k, v in m_cal.items():
+                    writer.add_scalar(f"val_cal/{k}", v, ep)
+                print(f"  calib: T={cur_T:.3f}  ECE {_ece_pre:.3f} -> {_ece_post:.3f}  "
+                      f"F1_cal={m_cal['f1']:.3f}  mAP_cal={m_cal['map50']:.3f}/{m_cal['map_50_95']:.3f}")
+                # Restore T=1.0 so subsequent epochs' raw eval starts clean.
+                apply_temperature(eval_model, 1.0)
 
         if test_every > 0 and ep % test_every == 0 and len(test_ds) > 0:
             mt = evaluate(eval_model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
@@ -532,7 +551,12 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
 
-        cur = float(m[metric_for_best])
+        # Selection metric: calibrated value if metric_for_best ends in _cal AND we got m_cal this epoch.
+        # Falls back to raw if calibration didn't fire (e.g. calibrate_every step skipped).
+        if metric_is_cal and m_cal is not None:
+            cur = float(m_cal[metric_base])
+        else:
+            cur = float(m[metric_base if metric_is_cal else metric_for_best])
         # If EMA is on, save EMA weights as the deployed model — they're the eval-quality ones.
         deployed_state = ema.shadow.state_dict() if ema is not None else model.state_dict()
         ckpt = {
@@ -547,6 +571,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             "best_epoch": best_epoch,
             "metric_for_best": metric_for_best,
             "metrics": m,
+            "metrics_cal": m_cal,
+            "temperature": float(cur_T),
             "config": c,
         }
         torch.save(ckpt, out_dir / "last.pt")
@@ -554,7 +580,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             best_metric = cur
             best_epoch = ep
             torch.save(ckpt, out_dir / "best.pt")
-            print(f"  -> saved best ({metric_for_best}={best_metric:.3f})")
+            print(f"  -> saved best ({metric_for_best}={best_metric:.3f}, T={cur_T:.3f})")
 
         if patience > 0 and (ep - best_epoch) >= patience:
             print(f"early stop: no {metric_for_best} improvement for {patience} epochs (best={best_metric:.3f} @ epoch {best_epoch})")
