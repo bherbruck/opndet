@@ -110,6 +110,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         score_thresh=args.score_thresh,
         iou_thresh=args.iou_thresh,
         batch_size=args.batch_size,
+        stability=args.stability,
+        n_perturbations=args.n_perturbations,
     )
     s = out["report"]["summary"]
     cs = out["report"]["counts"]
@@ -231,6 +233,10 @@ def main(argv: list[str] | None = None) -> int:
     pev.add_argument("--score-thresh", type=float, default=None, help="Confidence threshold for fixed-threshold metrics (default: cfg.eval_threshold)")
     pev.add_argument("--iou-thresh", type=float, default=0.5, help="IoU threshold for TP/FN matching")
     pev.add_argument("--batch-size", type=int, default=None, help="Override config batch_size")
+    pev.add_argument("--stability", action="store_true",
+                     help="Run perturbation-stability metric (proxy for flapping). ~Nx slower (default N=8).")
+    pev.add_argument("--n-perturbations", type=int, default=8,
+                     help="Number of small perturbations per image when --stability is set")
     pev.set_defaults(func=_cmd_eval)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")

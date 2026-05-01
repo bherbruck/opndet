@@ -288,6 +288,30 @@ def write_report(report: dict, out_dir: Path, abs_errs: np.ndarray) -> Path:
     md.append("![conf-iou hist](conf_iou_hist.png)")
     md.append("")
 
+    stab = report.get("stability")
+    if stab is not None:
+        md.append("## perturbation stability (proxy for frame-to-frame flapping)")
+        md.append("")
+        if stab["n_objects_tracked"] == 0:
+            md.append("- no objects tracked across perturbations (model didn't match any GT)")
+        else:
+            md.append(f"- N perturbations / image: **{stab['n_perturbations']}**  (each: ±2px translate, ±5% brightness, ±5% contrast)")
+            md.append(f"- objects tracked: **{stab['n_objects_tracked']} / {stab['n_gt_total']}**  ({stab['track_completion_rate']:.1%} GT matched in ≥2 versions)")
+            md.append("")
+            md.append("Per-object stddev of detection across perturbed versions (lower = more stable):")
+            md.append("")
+            md.append("| signal | mean | p95 | max |")
+            md.append("|--------|------|-----|-----|")
+            for k, label in [("score", "score"), ("center_x_px", "center x (px)"),
+                             ("center_y_px", "center y (px)"), ("w_px", "width (px)"), ("h_px", "height (px)")]:
+                v = stab[k]
+                md.append(f"| {label} | {v['mean']:.4f} | {v['p95']:.4f} | {v['max']:.4f} |")
+            md.append("")
+            md.append("- **score stddev** is the flapping signal — high = confidence wobbles under tiny input changes.")
+            md.append("- **center x/y stddev** is jitter in the predicted center after correcting for the perturbation translate.")
+            md.append("- **width/height stddev** is bbox-dimension wobble.")
+        md.append("")
+
     path = out_dir / "eval-report.md"
     path.write_text("\n".join(md))
 
@@ -303,6 +327,8 @@ def write_report(report: dict, out_dir: Path, abs_errs: np.ndarray) -> Path:
         "iou_thresh": report["iou_thresh"],
         "score_thresh": report["score_thresh"],
     }
+    if "stability" in report:
+        scalars["stability"] = report["stability"]
     (out_dir / "eval-report.json").write_text(json.dumps(scalars, indent=2))
     return path
 
@@ -329,6 +355,12 @@ def write_tb_scalars(report: dict, writer, step: int = 0) -> None:
         writer.add_scalar(f"eval/recall_{sz}", sr[sz]["recall"], step)
         writer.add_scalar(f"eval/precision_{sz}", sp[sz]["precision"], step)
     writer.add_scalar("eval/ece", report["calibration"]["ece"], step)
+    stab = report.get("stability")
+    if stab is not None and stab.get("n_objects_tracked", 0) > 0:
+        for sig in ("score", "center_x_px", "center_y_px", "w_px", "h_px"):
+            writer.add_scalar(f"eval/stability/{sig}_mean", stab[sig]["mean"], step)
+            writer.add_scalar(f"eval/stability/{sig}_p95", stab[sig]["p95"], step)
+        writer.add_scalar("eval/stability/track_completion", stab["track_completion_rate"], step)
 
 
 def run_eval(
@@ -339,6 +371,8 @@ def run_eval(
     score_thresh: float | None = None,
     iou_thresh: float = 0.5,
     batch_size: int | None = None,
+    stability: bool = False,
+    n_perturbations: int = 8,
 ) -> dict:
     """Stand-alone eval entry point (used by the CLI)."""
     with open(config_path) as f:
@@ -378,6 +412,16 @@ def run_eval(
     images = collect_predictions(model, loader, cfg_shim, device, decode_threshold=0.05)
     report = compute_full_report(images, iou_thresh=iou_thresh, score_thresh=score_thresh)
     abs_errs = _abs_count_errors(images, score_thresh)
+
+    if stability:
+        from opndet.stability import perturbation_stability
+        print(f"perturbation stability ({n_perturbations} perturbations × {len(sel)} samples) ...")
+        stab = perturbation_stability(
+            model, sel, img_h=img_h, img_w=img_w, stride=cfg_shim.stride,
+            n_perturbations=n_perturbations, decode_threshold=0.05,
+            iou_thresh=iou_thresh, device=device,
+        )
+        report["stability"] = stab
 
     if out_dir is None:
         ckpt_p = Path(ckpt_path)
