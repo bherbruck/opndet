@@ -280,7 +280,15 @@ def cosine_lr(step: int, total: int, base: float, warmup: int = 200, min_factor:
 def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = None,
           resume: str | None = None, teacher: str | None = None, self_distill: bool = False) -> None:
     with open(cfg_path) as f:
-        c = yaml.safe_load(f)
+        user_cfg = yaml.safe_load(f) or {}
+
+    if "model_config" not in user_cfg:
+        raise ValueError("train.yaml must specify model_config (e.g. bbox-m, bbox-x)")
+
+    # Layered defaults: per-preset training defaults + user yaml on top.
+    # User can omit anything they don't want to override.
+    from opndet.training_defaults import defaults_for, deep_merge
+    c = deep_merge(defaults_for(user_cfg["model_config"]), user_cfg)
 
     if runs_dir is not None:
         c["runs_dir"] = runs_dir

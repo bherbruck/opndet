@@ -1,117 +1,54 @@
-# opndet training config. Drives src/opndet/train.py.
-# Works for ANY single-class detection task: point at COCO json(s) + image dir(s).
+# Minimum-viable opndet train.yaml — everything not specified inherits sane per-preset
+# defaults from src/opndet/training_defaults.py (LR scales with model size, aug profile
+# scales with capacity, etc).  Run `opndet info` to see all presets.
 
-runs_dir: runs            # parent dir for all run output
-name: exp1                # this run's subdir; override with `--run-name $(date +%s)`
-auto_increment: true      # if runs_dir/name exists+nonempty, save to ..._2, _3, ...
-seed: 0
-device: auto              # auto | cpu | cuda
-amp: true
-amp_dtype: fp16           # fp16 (default; needs GradScaler) or bf16 (H100/A100 — no scaler, faster)
-cache_images: false       # cache decoded RGB in worker RAM after first epoch (saves JPEG decode)
-vis_samples: 4            # # val images logged to TensorBoard
-vis_every: 5              # log image grid every N epochs (scalars still logged every epoch)
-vis_threshold: 0.05       # confidence threshold for the val/preds + test/preds image grids.
-                          #   Set low (0.05) to surface low-conf "extras" — boxes are color-coded
-                          #   by confidence (green=high, yellow=mid, red=low) with conf labels,
-                          #   so over-detections are visually obvious. Raise (e.g. 0.3) for cleaner
-                          #   "deployment-style" visualizations.
+runs_dir: runs
+name: exp1
 
-model_config: bbox-s          # bundled preset name (bbox-n | bbox-s | bbox-m) or path to a YAML
-model:
-  stride: 4               # must match the model's output stride
+model_config: bbox-s          # bbox-f | bbox-p | bbox-n | bbox-s | bbox-m
+                              # bbox-l | bbox-x | bbox-h | bbox-g | bbox-t   (and -dist variants)
 
 data:
-  # one or more sources merged into a single pool, then split.
   sources:
     - {coco: data/site_a/_annotations.coco.json, images: data/site_a}
-    # add more here, e.g.:
-    # - {coco: data/site_b/anno.json, images: data/site_b/imgs}
-  split_ratios: [0.8, 0.1, 0.1]   # train/val/test
+  # split_ratios: [0.8, 0.1, 0.1]   # default
 
-batch_size: 64            # bbox-s ≈ 1.3M params; bump to 256 on H100
-num_workers: 8
-prefetch_factor: 4
 epochs: 100
-patience: 15            # early-stop if best metric hasn't improved in this many epochs (0 = off)
-patience_smart: false   # when true, fire only if NO tracked metric (f1/map50/map_50_95 +
-                        #   _cal versions) has improved by patience_min_delta in patience epochs.
-                        #   Useful when raw mAP plateaus but precision / calibration still climbing.
-patience_min_delta: 0.003   # minimum improvement to count (filter eval noise)
-metric_for_best: f1     # f1 | map50 | map_50_95 | f1_opt | f1_cal | map50_cal | map_50_95_cal | f1_opt_cal
-                        # f1_opt: F1 at the auto-detected optimal threshold per epoch (no longer
-                        #   penalizing model for over-predicting at score_thresh=0.2 when its
-                        #   real operating point is 0.4+). Best for KD / sharply-bimodal models.
-                        # _cal versions select on the post-calibration metric (forces calibrate_every=1)
-lr: 3.0e-3
-weight_decay: 1.0e-4
-warmup_steps: 200
-eval_threshold: 0.3
 
-augment:
-  enabled: true
-  brightness: 0.4
-  contrast: 0.4
-  gamma: [0.6, 1.6]
-  hue: 20
-  saturation: 0.5
-  grayscale_prob: 0.2
-  blur_prob: 0.1
-  noise_sigma: 0.02
-  hflip_prob: 0.5
-  vflip_prob: 0.5
-  rotate90_prob: 0.5
-  scale_jitter: [0.7, 1.3]
-  translate_frac: 0.1
-  mosaic_prob: 0.5            # combine 4 images into 1, strong regularization
-  cutout_prob: 0.3            # randomly erase rectangles
-  cutout_count: 3
-  cutout_size_frac: [0.05, 0.20]
-  min_visible_frac: 0.5       # drop GT boxes whose visible area falls below this
-
-ema_decay: 0.999          # 0 = off; 0.999 is yolov8 default. Eval + best.pt use EMA weights when on.
-
-# Calibration (Platt-style temperature on the obj sigmoid).
-auto_calibrate: true      # at end of training, fit T on val + bake into best.pt + re-run test eval (calibrated)
-calibrate_every: 0        # 0 = off; >0 = fit T every N epochs and log eval/T, eval/ece_pre, eval/ece_post to TB
-test_every: 0             # 0 = off; >0 = run test eval every N epochs (logs test/* scalars and test/preds images)
-test_samples: null        # # test images for the test/preds grid; null/0 = use vis_samples value
-
-# Distillation hyperparams (used when `opndet train --teacher PATH` or --self-distill is set).
-# Path lives only on the CLI — keeps yaml reproducible across machines (Colab won't have your
-# local /content/runs path). Block is harmless when distillation isn't enabled.
-distill:
-  hm_weight: 1.0          # weight on KD heatmap BCE
-  reg_weight: 0.5         # weight on KD L1 over (cxy, wh) at teacher-confident cells
-  conf_gate: 0.5          # min teacher_obj for positive KD supervision (also gates regression always)
-  full_distill: false     # if true: BCE on every cell, student must match teacher's full distribution
-                          #   incl. background. Strongest anti-FP signal — try if student over-predicts.
-  neg_gate: 0.0           # >0: asymmetric mode. Also push student DOWN where teacher_obj < neg_gate.
-                          #   E.g. neg_gate=0.05: positive supervision >=0.5, negative <=0.05, ignore middle.
-                          #   (Ignored when full_distill=true.)
-  kd_temperature: 1.0     # >1 softens teacher targets — useful if teacher is over-sharp and student
-                          #   has trouble matching the bimodal extremes. 1.0 = no-op.
-
-loss:
-  w_hm: 1.0
-  w_cxy: 1.0
-  w_wh: 1.5               # GIoU/CIoU loss is 0..2 range so weight should be near 1, not 5
-  focal_alpha: 2.0
-  focal_beta: 4.0
-  wh_loss: ciou           # l1 | giou | ciou | nwd. ciou is the universal best-default for normal-size objects.
-  cls_loss: focal         # focal | vfl. vfl pushes confidence toward IoU quality — use when you need bimodal
-                          #   confidence (clear=0.95+, noise=0.05-) for tracking pipelines that can't tolerate flapping.
-  vfl_alpha: 0.75
-  vfl_gamma: 2.0
-  repulsion_weight: 0.0   # set ~0.5 for crowded scenes with touching objects (only used with iou-based wh_loss)
-  nwd_c: 12.8             # only used when wh_loss: nwd
-  count_weight: 0.0       # >0 enables the count-aware term: λ · |Σ pred_peaks - n_gt| per image.
-                          #   Pushes total mass at peak cells toward the GT count. ~0.05-0.1 is a sane start.
-                          #   Most useful for industrial counting where mAP can hide miscount.
-                          #   peak_kernel and peak_eps are auto-mirrored from the model's
-                          #   (Sigmoid)PeakSuppress layer; only set them here to override.
-  convexity_weight: 0.0   # >0 penalizes mass-weighted centroid offset of the obj heatmap in a small
-                          #   neighborhood of each positive cell. Forces symmetric / radially round
-                          #   peaks — exploits the convex-object prior. ~0.1-0.5 is sane. l_convex
-                          #   is logged when on.
-  convexity_radius: 2     # neighborhood radius (k=2 -> 5×5 patch around each positive cell)
+# Common overrides users actually want to set. Uncomment any to override the per-preset defaults.
+#
+# patience: 30
+# patience_smart: true            # default true — won't stop while any tracked metric improves
+# metric_for_best: f1_opt_cal     # default — selects best.pt by calibrated F1 at auto-detected threshold
+#
+# batch_size: 64                  # default scales with size: f/p=256, s/n=128, m/l=64, x=32, h/g/t=16
+# lr: 3.0e-3                      # default scales: bbox-m=3e-3, halves per ~4x params (bbox-x=1.5e-3, bbox-t=5e-4)
+# warmup_steps: 200               # default 200, bigger sizes get longer
+#
+# vis_samples: 4                  # default 4 — image grid count for val/preds
+# vis_every: 5                    # default 5 — log image grid every N epochs
+# vis_threshold: 0.05             # default 0.05 — show low-conf preds for honest viz (color-coded)
+# test_samples: 4
+# test_every: 0                   # default 0 — test eval at end only; >0 logs test/* every N epochs
+#
+# calibrate_every: 1              # default 1 — fits T per epoch + recomputes calibrated metrics
+# auto_calibrate: true            # default true — final auto-calibrate at end of training
+#
+# loss:
+#   wh_loss: ciou                 # default
+#   cls_loss: vfl                 # default — bimodal confidence
+#   count_weight: 0.05            # >0 enables count-aware loss term
+#   convexity_weight: 0.2         # >0 enforces radially-symmetric peaks
+#   repulsion_weight: 0.5         # >0 for crowded touching objects
+#
+# augment:                        # full per-tier defaults already set; override here if needed
+#   mosaic_prob: 0.0              # bbox-f/p default; bbox-s+ default 0.1; bbox-h+ default 0.3
+#   cutout_prob: 0.0
+#
+# distill:                        # used only with --teacher PATH or --self-distill on the CLI
+#   hm_weight: 1.0                # default; bumped to 1.5 for tiny students (auto)
+#   reg_weight: 0.5               # default; bumped to 0.75 for tiny students (auto)
+#   conf_gate: 0.5
+#   full_distill: false           # true: BCE on every cell (anti-FP supervision)
+#   neg_gate: 0.0                 # asymmetric mode when >0
+#   kd_temperature: 1.0
