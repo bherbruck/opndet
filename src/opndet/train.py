@@ -409,10 +409,11 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             vis_boxes.append(boxes)
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
 
+    n_test_vis = int(c.get("test_samples", n_vis))
     test_vis_imgs = []
     test_vis_boxes = []
-    if n_vis > 0 and test_every > 0 and len(test_ds) > 0:
-        for i in range(min(n_vis, len(test_ds))):
+    if n_test_vis > 0 and test_every > 0 and len(test_ds) > 0:
+        for i in range(min(n_test_vis, len(test_ds))):
             img_t, boxes, _ = test_ds[i]
             test_vis_imgs.append(img_t)
             test_vis_boxes.append(boxes)
