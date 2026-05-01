@@ -21,12 +21,14 @@ COMMON: dict[str, Any] = {
 
     "ema_decay": 0.999,
 
-    # TB visualization defaults — small + infrequent + low threshold for honest viz.
+    # TB visualization defaults — small + infrequent. vis_threshold defaults to eval_threshold
+    # (resolved at train-time, see train.py) so you see what passes deployment filter, with
+    # color-coding making marginal preds (near the threshold) visually distinct from confident ones.
     "vis_samples": 4,
     "vis_every": 5,
     "test_samples": 4,
     "test_every": 0,
-    "vis_threshold": 0.05,
+    # vis_threshold: <unset>  -> falls back to eval_threshold
 
     # Schedule defaults
     "epochs": 100,

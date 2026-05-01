@@ -27,7 +27,9 @@ epochs: 100
 #
 # vis_samples: 4                  # default 4 — image grid count for val/preds
 # vis_every: 5                    # default 5 — log image grid every N epochs
-# vis_threshold: 0.05             # default 0.05 — show low-conf preds for honest viz (color-coded)
+# vis_threshold: 0.05             # default = eval_threshold (shows what's ABOVE deployment cutoff,
+                                  #   color-coded so marginal preds near the threshold are visible).
+                                  #   Lower to ~0.05 to see everything for over-prediction debugging.
 # test_samples: 4
 # test_every: 0                   # default 0 — test eval at end only; >0 logs test/* every N epochs
 #
