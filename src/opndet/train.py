@@ -394,6 +394,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         "conf_gate": float(distill_cfg.get("conf_gate", 0.5)),
     }
 
+    auto_calibrate = bool(c.get("auto_calibrate", True))
+    calibrate_every = int(c.get("calibrate_every", 0))
+
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
     vis_imgs = []
@@ -482,6 +485,22 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             writer.add_scalar(f"val/{k}", v, ep)
         writer.add_scalar("time/epoch_s", dt, ep)
 
+        if calibrate_every > 0 and ep % calibrate_every == 0:
+            from opndet.calibrate import (apply_temperature, collect_calibration_data,
+                                            fit_temperature)
+            from opndet.metrics import calibration_bins
+            apply_temperature(eval_model, 1.0)   # raw logits for fitting
+            _logits, _labels = collect_calibration_data(eval_model, val_loader, cfg_shim, device)
+            if _logits.shape[0] > 0:
+                _T = fit_temperature(_logits, _labels)
+                _sig_raw = (1.0 / (1.0 + np.exp(-_logits))).astype(np.float32)
+                _sig_cal = (1.0 / (1.0 + np.exp(-_logits / _T))).astype(np.float32)
+                _ece_pre = calibration_bins(_sig_raw, _labels)["ece"]
+                _ece_post = calibration_bins(_sig_cal, _labels)["ece"]
+                writer.add_scalar("eval/T", _T, ep)
+                writer.add_scalar("eval/ece_pre", _ece_pre, ep)
+                writer.add_scalar("eval/ece_post", _ece_post, ep)
+
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs):
             grid = render_predictions(
                 model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
@@ -518,12 +537,35 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             break
 
     print("running final test eval ...")
-    state = torch.load(out_dir / "best.pt", map_location=device, weights_only=True)
+    state = torch.load(out_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(state["model"])
+    if "temperature" in state and float(state["temperature"]) != 1.0:
+        from opndet.calibrate import apply_temperature
+        apply_temperature(model, float(state["temperature"]))
     m = evaluate(model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
     print(f"TEST: P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  n_pred={m['n_pred']:.0f}/n_gt={m['n_gt']:.0f}")
     for k, v in m.items():
         writer.add_scalar(f"test/{k}", v, epochs)
+
+    if auto_calibrate:
+        print("auto-calibrating best.pt on val ...")
+        try:
+            from opndet.calibrate import calibrate_ckpt
+            res = calibrate_ckpt(out_dir / "best.pt", config_path=None, split="val", save=True)
+            print(f"  T={res['temperature']:.4f}  ECE {res['ece_before']:.4f} -> {res['ece_after']:.4f}")
+            writer.add_scalar("test_cal/T", res["temperature"], epochs)
+            writer.add_scalar("test_cal/ece", res["ece_after"], epochs)
+            # re-run test eval with the calibrated weights
+            state = torch.load(out_dir / "best.pt", map_location=device, weights_only=False)
+            model.load_state_dict(state["model"])
+            from opndet.calibrate import apply_temperature
+            apply_temperature(model, float(state.get("temperature", 1.0)))
+            m_cal = evaluate(model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+            print(f"TEST(cal): P={m_cal['precision']:.3f} R={m_cal['recall']:.3f} F1={m_cal['f1']:.3f}  n_pred={m_cal['n_pred']:.0f}/n_gt={m_cal['n_gt']:.0f}")
+            for k, v in m_cal.items():
+                writer.add_scalar(f"test_cal/{k}", v, epochs)
+        except Exception as e:
+            print(f"  calibration failed: {e}")
     writer.close()
 
 
