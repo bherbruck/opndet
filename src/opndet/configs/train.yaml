@@ -11,6 +11,11 @@ amp_dtype: fp16           # fp16 (default; needs GradScaler) or bf16 (H100/A100 
 cache_images: false       # cache decoded RGB in worker RAM after first epoch (saves JPEG decode)
 vis_samples: 4            # # val images logged to TensorBoard
 vis_every: 5              # log image grid every N epochs (scalars still logged every epoch)
+vis_threshold: 0.05       # confidence threshold for the val/preds + test/preds image grids.
+                          #   Set low (0.05) to surface low-conf "extras" — boxes are color-coded
+                          #   by confidence (green=high, yellow=mid, red=low) with conf labels,
+                          #   so over-detections are visually obvious. Raise (e.g. 0.3) for cleaner
+                          #   "deployment-style" visualizations.
 
 model_config: bbox-s          # bundled preset name (bbox-n | bbox-s | bbox-m) or path to a YAML
 model:

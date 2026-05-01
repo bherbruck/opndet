@@ -25,6 +25,30 @@ def _draw(img: np.ndarray, boxes: np.ndarray, color: tuple[int, int, int], thick
     return out
 
 
+def _conf_color(conf: float) -> tuple[int, int, int]:
+    """Green at high conf, yellow at mid, red at low. RGB."""
+    if conf >= 0.7:
+        return (0, 255, 0)            # bright green — confident TP
+    if conf >= 0.5:
+        return (180, 255, 0)          # yellow-green
+    if conf >= 0.3:
+        return (255, 220, 0)          # yellow
+    if conf >= 0.15:
+        return (255, 130, 0)          # orange
+    return (255, 30, 30)               # red — low-conf extra
+
+
+def _draw_pred(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, conf: float) -> None:
+    color = _conf_color(conf)
+    thick = 2 if conf >= 0.5 else 1
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
+    label = f"{conf:.2f}"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
+    ty = y1 - 2 if y1 - 2 - th >= 0 else y1 + th + 2
+    cv2.rectangle(img, (x1, ty - th - 1), (x1 + tw + 2, ty + 1), color, -1)
+    cv2.putText(img, label, (x1 + 1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 0, 0), 1, cv2.LINE_AA)
+
+
 @torch.no_grad()
 def render_predictions(
     model: torch.nn.Module,
@@ -33,12 +57,14 @@ def render_predictions(
     img_h: int,
     img_w: int,
     stride: int,
-    threshold: float = 0.3,
+    threshold: float = 0.05,
     device: torch.device | str = "cpu",
 ) -> np.ndarray:
     """Run model on a batch of normalized images; return [N, 3, H, W] uint8 grid-ready array.
 
-    Each image overlays: green = predicted boxes, red = GT boxes.
+    Pred boxes are color-coded by confidence (green=high, red=low) with a numeric label so
+    you can visually identify "over-detection at low confidence" issues. GT boxes drawn in
+    bright red, thickness 2. Default threshold lowered to 0.05 to surface borderline preds.
     """
     model.eval()
     out = model(imgs.to(device))
@@ -49,11 +75,11 @@ def render_predictions(
     rendered = []
     for i in range(imgs.shape[0]):
         rgb = _denorm(imgs[i])
-        rgb = _draw(rgb, gt_boxes[i], color=(255, 0, 0), thick=2)
-        pred_arr = np.array(
-            [[d.x1, d.y1, d.x2, d.y2] for d in dets_per[i]],
-            dtype=np.float32,
-        ) if dets_per[i] else np.zeros((0, 4), dtype=np.float32)
-        rgb = _draw(rgb, pred_arr, color=(0, 255, 0), thick=1)
-        rendered.append(rgb.transpose(2, 0, 1))  # CHW for tensorboard
+        # GT in solid magenta — visually distinct from the colored pred gradient.
+        rgb = _draw(rgb, gt_boxes[i], color=(255, 0, 255), thick=2)
+        for d in dets_per[i]:
+            x1, y1 = int(round(d.x1)), int(round(d.y1))
+            x2, y2 = int(round(d.x2)), int(round(d.y2))
+            _draw_pred(rgb, x1, y1, x2, y2, float(d.score))
+        rendered.append(rgb.transpose(2, 0, 1))
     return np.stack(rendered, axis=0)

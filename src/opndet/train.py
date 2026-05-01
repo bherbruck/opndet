@@ -575,14 +575,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             if test_vis_batch is not None:
                 grid = render_predictions(
                     eval_model, test_vis_batch, test_vis_boxes, img_h, img_w, cfg_shim.stride,
-                    threshold=float(c.get("eval_threshold", 0.3)), device=device,
+                    threshold=float(c.get("vis_threshold", 0.05)), device=device,
                 )
                 writer.add_images("test/preds", grid, ep, dataformats="NCHW")
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs):
             grid = render_predictions(
                 model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
-                threshold=float(c.get("eval_threshold", 0.3)), device=device,
+                threshold=float(c.get("vis_threshold", 0.05)), device=device,
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
 
