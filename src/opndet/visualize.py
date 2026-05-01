@@ -42,7 +42,7 @@ def _draw_pred(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, conf: float)
     color = _conf_color(conf)
     thick = 2 if conf >= 0.5 else 1
     cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
-    label = f"{conf:.2f}"
+    label = f"{int(round(conf * 100))}%"
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
     ty = y1 - 2 if y1 - 2 - th >= 0 else y1 + th + 2
     cv2.rectangle(img, (x1, ty - th - 1), (x1 + tw + 2, ty + 1), color, -1)
