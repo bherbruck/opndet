@@ -18,7 +18,10 @@ epochs: 100
 # Common overrides users actually want to set. Uncomment any to override the per-preset defaults.
 #
 # patience: 30
-# patience_smart: true            # default true — won't stop while any tracked metric improves
+# patience_smart: true            # default true — won't stop while any tracked val metric improves
+# patience_include_test: false    # also count test metrics in the patience clock — slightly leaky
+                                  #   (test influences WHEN to stop, not WHAT to save). Useful when
+                                  #   test trajectory is still climbing while val plateaus.
 # metric_for_best: f1_opt_cal     # default — selects best.pt by calibrated F1 at auto-detected threshold
 #
 # batch_size: 64                  # default scales with size: f/p=256, s/n=128, m/l=64, x=32, h/g/t=16

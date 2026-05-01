@@ -474,9 +474,12 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     test_every = int(c.get("test_every", 0))
 
     patience_smart = bool(c.get("patience_smart", False))
+    patience_include_test = bool(c.get("patience_include_test", False))
     patience_min_delta = float(c.get("patience_min_delta", 0.003))
     # When patience_smart is True, patience fires only if NO tracked metric has improved
     # by patience_min_delta in `patience` epochs. Tracks both raw and calibrated f1/map.
+    # patience_include_test adds test metrics to the watch list — slightly leaky (test
+    # influences WHEN to stop, never WHAT to save), useful when test/val have noticeable lag.
     best_per_metric: dict[str, tuple[float, int]] = {}
 
     n_vis = int(c.get("vis_samples", 4))
@@ -630,6 +633,15 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             print(f"  test: P={mt['precision']:.3f} R={mt['recall']:.3f} F1={mt['f1']:.3f}  mAP@.5={mt['map50']:.3f} mAP@.5:.95={mt['map_50_95']:.3f}")
             for k, v in mt.items():
                 writer.add_scalar(f"test/{k}", v, ep)
+            # patience hook: when patience_smart and patience_include_test, count test improvements.
+            if patience_smart and patience_include_test:
+                for k in ("f1", "f1_opt", "map50", "map_50_95"):
+                    if k in mt:
+                        v = float(mt[k])
+                        tk = f"test_{k}"
+                        prev_v, _ = best_per_metric.get(tk, (-1e9, 0))
+                        if v > prev_v + patience_min_delta:
+                            best_per_metric[tk] = (v, ep)
             if test_vis_batch is not None:
                 grid = render_predictions(
                     eval_model, test_vis_batch, test_vis_boxes, img_h, img_w, cfg_shim.stride,
