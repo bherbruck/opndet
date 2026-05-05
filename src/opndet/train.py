@@ -636,6 +636,11 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             print(f"  cold (zero-prior): F1={m_cold['f1']:.3f}  F1_opt={m_cold['f1_opt']:.3f}@{m_cold['threshold_opt']:.2f}  mAP@.5={m_cold['map50']:.3f}")
             for k, v in m_cold.items():
                 writer.add_scalar(f"val_cold/{k}", v, ep)
+            lift_keys = ("f1", "f1_opt", "precision", "recall", "map50", "map_50_95")
+            lifts = {k: float(m[k]) - float(m_cold[k]) for k in lift_keys if k in m and k in m_cold}
+            for k, v in lifts.items():
+                writer.add_scalar(f"prior_lift/val/{k}", v, ep)
+            print(f"  prior lift (val): F1{'+' if lifts.get('f1', 0) >= 0 else ''}{lifts.get('f1', 0):+.3f}  F1_opt{lifts.get('f1_opt', 0):+.3f}  mAP{lifts.get('map50', 0):+.3f}/{lifts.get('map_50_95', 0):+.3f}")
         for k, v in m.items():
             writer.add_scalar(f"val/{k}", v, ep)
         writer.add_scalar("time/epoch_s", dt, ep)
@@ -709,6 +714,11 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 print(f"  test cold (zero-prior): F1={mt_cold['f1']:.3f}  F1_opt={mt_cold['f1_opt']:.3f}@{mt_cold['threshold_opt']:.2f}  mAP@.5={mt_cold['map50']:.3f}")
                 for k, v in mt_cold.items():
                     writer.add_scalar(f"test_cold/{k}", v, ep)
+                lift_keys = ("f1", "f1_opt", "precision", "recall", "map50", "map_50_95")
+                lifts = {k: float(mt[k]) - float(mt_cold[k]) for k in lift_keys if k in mt and k in mt_cold}
+                for k, v in lifts.items():
+                    writer.add_scalar(f"prior_lift/test/{k}", v, ep)
+                print(f"  prior lift (test): F1{lifts.get('f1', 0):+.3f}  F1_opt{lifts.get('f1_opt', 0):+.3f}  mAP{lifts.get('map50', 0):+.3f}/{lifts.get('map_50_95', 0):+.3f}")
             # patience hook: when patience_smart and patience_include_test, count test improvements.
             if patience_smart and patience_include_test:
                 for k in ("f1", "f1_opt", "map50", "map_50_95"):
