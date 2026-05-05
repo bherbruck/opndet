@@ -372,7 +372,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     train_s, val_s, test_s = split_samples(samples, ratios=ratios, seed=seed)
     print(f"split: train={len(train_s)} val={len(val_s)} test={len(test_s)}")
 
-    aug_cfg = AugConfig(**(c.get("augment") or {}))
+    aug_dict = dict(c.get("augment") or {})
+    tp_cfg = aug_dict.pop("temporal_prior", None)
+    aug_cfg = AugConfig(**aug_dict)
     aug_fn = make_augment(aug_cfg)
 
     model_path = _resolve_preset(c["model_config"])
@@ -380,19 +382,32 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     if resume_state is not None:
         model.load_state_dict(resume_state["model"])
     in_ch, img_h, img_w = model.input_shape
-    cfg_shim = _CfgShim(img_h, img_w, stride=int(c["model"].get("stride", 4)))
+    stride = int(c.get("model", {}).get("stride", 4))
+    cfg_shim = _CfgShim(img_h, img_w, stride=stride)
     n_params = sum(p.numel() for p in model.parameters())
     has_dist = "dist" in getattr(model, "aliases", {})
     print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}{'  (dist head)' if has_dist else ''}")
+
+    prior_synth = None
+    if in_ch == 4:
+        from opndet.augment_temporal_prior import TemporalPriorSynth
+        prior_synth = TemporalPriorSynth(tp_cfg or {})
+        print(f"  temporal prior synth ON (n_max={prior_synth.cfg['n_max']}, "
+              f"motion_speed={prior_synth.cfg['motion_speed_range']})")
+    elif tp_cfg is not None:
+        print(f"  warning: augment.temporal_prior set but model in_ch={in_ch}; ignoring")
 
     encode_fn = partial(encode_targets, cfg=cfg_shim, dist_head=has_dist)
     cache = bool(c.get("cache_images", False))
     mosaic_prob = float(aug_cfg.mosaic_prob if hasattr(aug_cfg, "mosaic_prob") else 0.0)
     min_vis = float(aug_cfg.min_visible_frac if hasattr(aug_cfg, "min_visible_frac") else 0.5)
     train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn, encode_fn=encode_fn,
-                             cache_images=cache, mosaic_prob=mosaic_prob, min_visible_frac=min_vis)
-    val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache)
-    test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache)
+                             cache_images=cache, mosaic_prob=mosaic_prob, min_visible_frac=min_vis,
+                             in_ch=in_ch, prior_synth=prior_synth, stride=stride)
+    val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache,
+                           in_ch=in_ch, prior_synth=None, stride=stride)
+    test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache,
+                            in_ch=in_ch, prior_synth=None, stride=stride)
     nw = int(c.get("num_workers", 2))
     pf = int(c.get("prefetch_factor", 4)) if nw > 0 else None
     train_kw = dict(num_workers=nw, collate_fn=collate, pin_memory=device.type == "cuda",

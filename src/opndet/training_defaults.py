@@ -92,6 +92,28 @@ _AUG_HEAVY = {**_AUG_BASE, "mosaic_prob": 0.3, "cutout_prob": 0.5}    # h, g, t
 # Slightly stronger KD weights when student is much smaller than teacher.
 _DISTILL_TIGHTER = {"hm_weight": 1.5, "reg_weight": 0.75, "conf_gate": 0.5}
 
+# Default per-sample synthesis distribution for the 4-ch temporal model. Tuned
+# to match what the deployment-side TailAccumulator emits at inference. Override
+# under augment.temporal_prior in user yaml.
+_TEMPORAL_PRIOR_DEFAULTS = {
+    "n_max": 8,
+    "stride": 4,
+    "motion_axis_aligned_prob": 0.70,
+    "motion_diagonal_prob": 0.25,
+    "motion_zero_prob": 0.05,
+    "motion_speed_range": [2.0, 15.0],
+    "motion_diagonal_jitter_deg": 10.0,
+    "confidence_range": [0.5, 0.95],
+    "object_drop_prob": 0.05,
+    "false_positive_prob": 0.10,
+    "false_positive_count_range": [1, 3],
+    "false_positive_amplitude_range": [0.3, 0.5],
+    "spawn_zone_prob": 0.10,
+    "spawn_zone_amplitude_range": [0.3, 0.5],
+    "zero_prior_prob": 0.05,
+    "gaussian_sigma_factor": 4.0,
+}
+
 
 # ----------------------------------------------------------------------
 # Per-preset overrides. Scaling rule: roughly halve LR per ~4x param jump.
@@ -99,6 +121,12 @@ _DISTILL_TIGHTER = {"hm_weight": 1.5, "reg_weight": 0.75, "conf_gate": 0.5}
 PER_SIZE: dict[str, dict[str, Any]] = {
     # tiny tier — light aug, full LR, big batches (cheap compute), tight KD.
     "bbox-f": {"lr": 3.0e-3, "batch_size": 256, "augment": _AUG_LIGHT, "distill": _DISTILL_TIGHTER},
+    "bbox-f-tp": {
+        "lr": 3.0e-3,
+        "batch_size": 256,
+        "augment": {**_AUG_LIGHT, "temporal_prior": _TEMPORAL_PRIOR_DEFAULTS},
+        "distill": _DISTILL_TIGHTER,
+    },
     "bbox-p": {"lr": 3.0e-3, "batch_size": 256, "augment": _AUG_LIGHT, "distill": _DISTILL_TIGHTER},
     "bbox-n": {"lr": 3.0e-3, "batch_size": 128, "augment": _AUG_MEDIUM, "distill": _DISTILL_TIGHTER},
 

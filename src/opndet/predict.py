@@ -27,7 +27,19 @@ def load_model(model_config: str, ckpt: str | None, device: str = "cpu") -> torc
     return m
 
 
-def preprocess(img_bgr: np.ndarray, h: int, w: int) -> tuple[torch.Tensor, dict]:
+def preprocess(
+    img_bgr: np.ndarray,
+    h: int,
+    w: int,
+    in_ch: int = 3,
+    prior: np.ndarray | None = None,
+    stride: int = 4,
+) -> tuple[torch.Tensor, dict]:
+    """RGB letterbox + ImageNet normalize. For 4-ch (temporal) models, the
+    `prior` arg is a stride-coords float32 (Hs, Ws) heatmap in [0,1]; it gets
+    upsampled to (h,w) via nearest and concatenated as channel 3 unnormalized.
+    If in_ch==4 and prior is None, a zero prior (cold-start) is used.
+    """
     img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     img_lb, _ = letterbox(img, np.zeros((0, 4), dtype=np.float32), h, w)
     f = img_lb.astype(np.float32) / 255.0
@@ -35,6 +47,12 @@ def preprocess(img_bgr: np.ndarray, h: int, w: int) -> tuple[torch.Tensor, dict]
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
     f = (f - mean) / std
     t = torch.from_numpy(f.transpose(2, 0, 1)).unsqueeze(0).contiguous()
+    if in_ch == 4:
+        if prior is None:
+            prior = np.zeros((h // stride, w // stride), dtype=np.float32)
+        prior_full = cv2.resize(prior.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+        prior_t = torch.from_numpy(prior_full).unsqueeze(0).unsqueeze(0).contiguous()
+        t = torch.cat([t, prior_t], dim=1)
     orig_h, orig_w = img.shape[:2]
     scale = min(w / orig_w, h / orig_h)
     pad_x = (w - int(round(orig_w * scale))) // 2
@@ -103,6 +121,10 @@ def predict_video(
     stride: int = 4,
     max_frames: int | None = None,
     print_every: int = 30,
+    temporal_n_frames: int = 8,
+    temporal_stamp_threshold: float = 0.4,
+    temporal_spawn_mask: np.ndarray | None = None,
+    temporal_spawn_amplitude: float = 0.4,
 ) -> dict:
     """Run inference on a video (local path or URL). Writes an annotated mp4.
     Returns a stats dict (frame count, mean dets, det std, total time).
@@ -116,7 +138,19 @@ def predict_video(
             raise FileNotFoundError(video_path)
 
     m = load_model(model_config, ckpt, device=device)
-    _, h, w = m.input_shape
+    in_ch, h, w = m.input_shape
+
+    acc = None
+    if in_ch == 4:
+        from opndet.temporal import TailAccumulator
+        acc = TailAccumulator((h // stride, w // stride),
+                              n_frames=temporal_n_frames,
+                              stamp_threshold=temporal_stamp_threshold,
+                              spawn_mask=temporal_spawn_mask,
+                              spawn_amplitude=temporal_spawn_amplitude,
+                              stride=stride)
+        print(f"  temporal mode: TailAccumulator(n_frames={temporal_n_frames}, "
+              f"stamp_threshold={temporal_stamp_threshold})")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -178,12 +212,15 @@ def predict_video(
             ok, frame_bgr = cap.read()
             if not ok:
                 break
-            t, info = preprocess(frame_bgr, h, w)
+            prior_in = acc.acc if acc is not None else None
+            t, info = preprocess(frame_bgr, h, w, in_ch=in_ch, prior=prior_in, stride=stride)
             with torch.no_grad():
                 out = m(t.to(device))
             out_t = out["output"] if isinstance(out, dict) else out
             out_np = out_t.cpu().numpy()
             dets = decode(out_np[0], h, w, stride, threshold=threshold)
+            if acc is not None:
+                acc.update([((d.x1, d.y1, d.x2, d.y2), d.score) for d in dets])
 
             # render on the letterboxed frame so the output canvas matches model input dims
             canvas = np.full((h, w, 3), 114, dtype=np.uint8)
@@ -247,11 +284,11 @@ def predict_image(
     stride: int = 4,
 ) -> list[dict]:
     m = load_model(model_config, ckpt, device=device)
-    _, h, w = m.input_shape
+    in_ch, h, w = m.input_shape
     img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise FileNotFoundError(image_path)
-    t, info = preprocess(img_bgr, h, w)
+    t, info = preprocess(img_bgr, h, w, in_ch=in_ch, prior=None, stride=stride)
     with torch.no_grad():
         out = m(t.to(device))
     out_t = out["output"] if isinstance(out, dict) else out

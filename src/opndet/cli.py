@@ -34,6 +34,11 @@ def _cmd_export(args: argparse.Namespace) -> int:
         import torch
         c, h, w = m.input_shape
         if args.bake_input_norm:
+            if c != 3:
+                print(f"FAIL: --bake-input-norm only supports 3-ch models; this model has in_ch={c} "
+                      "(temporal-prior variants take a 4th channel that is not photometric)",
+                      file=sys.stderr)
+                return 2
             m = _InputNormalizer(m).eval()
             dummy = torch.rand(1, c, h, w) * 255.0
         else:
@@ -166,7 +171,7 @@ def _cmd_info(args: argparse.Namespace) -> int:
     m = build_model_from_yaml(path)
     n = sum(p.numel() for p in m.parameters())
     print(f"resolved:     {path}")
-    print(f"input shape:  (3, {m.input_shape[1]}, {m.input_shape[2]})")
+    print(f"input shape:  ({m.input_shape[0]}, {m.input_shape[1]}, {m.input_shape[2]})")
     print(f"params:       {n:,}  ({n/1e6:.2f}M)")
     print(f"layers:       {len(m.layers)}")
     named = sorted(m.aliases.keys())

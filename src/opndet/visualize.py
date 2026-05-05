@@ -11,7 +11,10 @@ _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def _denorm(img_t: torch.Tensor) -> np.ndarray:
-    """[3,H,W] normalized tensor -> [H,W,3] uint8 RGB."""
+    """[C,H,W] normalized tensor -> [H,W,3] uint8 RGB. Slices to first 3
+    channels so 4-ch (temporal) tensors render their RGB only."""
+    if img_t.shape[0] > 3:
+        img_t = img_t[:3]
     arr = img_t.detach().cpu().numpy().transpose(1, 2, 0)
     arr = arr * _IMAGENET_STD + _IMAGENET_MEAN
     return (np.clip(arr, 0, 1) * 255).astype(np.uint8)

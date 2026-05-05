@@ -68,10 +68,11 @@ def load_datasets(sources: list[dict] | list[tuple[str, str]]) -> list[Sample]:
 def letterbox(img: np.ndarray, boxes: np.ndarray, target_h: int, target_w: int, pad_value: int = 114) -> tuple[np.ndarray, np.ndarray]:
     """Resize keeping aspect ratio, pad to target. Update boxes (xyxy)."""
     h, w = img.shape[:2]
+    c = img.shape[2] if img.ndim == 3 else 1
     scale = min(target_w / w, target_h / h)
     new_w, new_h = int(round(w * scale)), int(round(h * scale))
     resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((target_h, target_w, 3), pad_value, dtype=img.dtype)
+    canvas = np.full((target_h, target_w, c), pad_value, dtype=img.dtype) if img.ndim == 3 else np.full((target_h, target_w), pad_value, dtype=img.dtype)
     pad_x = (target_w - new_w) // 2
     pad_y = (target_h - new_h) // 2
     canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
@@ -83,7 +84,13 @@ def letterbox(img: np.ndarray, boxes: np.ndarray, target_h: int, target_w: int, 
 
 
 class OpndetDataset(Dataset):
-    """Returns (image_tensor [3,H,W], boxes_xyxy, encoded_targets_dict).
+    """Returns (image_tensor [C,H,W], boxes_xyxy, encoded_targets_dict).
+
+    C=3 for snapshot models. C=4 when in_ch=4 (temporal-prior variants):
+    channels 0:3 are normalized RGB and channel 3 is the prior heatmap
+    upsampled from stride-4 to (H,W) via nearest. Prior is unnormalized,
+    in [0,1]. If prior_synth is None and in_ch=4, prior channel is zeros
+    (cold-start eval).
 
     GT encoding runs inside the worker so the main training loop just stacks
     pre-encoded tensors — no CPU work between batches blocks the GPU.
@@ -105,6 +112,9 @@ class OpndetDataset(Dataset):
         min_visible_frac: float = 0.5,
         mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: tuple[float, float, float] = (0.229, 0.224, 0.225),
+        in_ch: int = 3,
+        prior_synth=None,
+        stride: int = 4,
     ):
         self.samples = list(samples)
         self.img_h = img_h
@@ -117,6 +127,11 @@ class OpndetDataset(Dataset):
         self._cache: dict[int, np.ndarray] = {}
         self.mosaic_prob = mosaic_prob
         self.min_visible_frac = min_visible_frac
+        self.in_ch = int(in_ch)
+        self.prior_synth = prior_synth
+        self.stride = int(stride)
+        if self.in_ch not in (3, 4):
+            raise ValueError(f"OpndetDataset supports in_ch in (3, 4); got {self.in_ch}")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -203,6 +218,15 @@ class OpndetDataset(Dataset):
         img_f = img.astype(np.float32) / 255.0
         img_f = (img_f - self.mean) / self.std
         img_t = torch.from_numpy(img_f.transpose(2, 0, 1)).contiguous()
+
+        if self.in_ch == 4:
+            if self.prior_synth is not None:
+                prior = self.prior_synth(boxes, self.img_h, self.img_w)
+            else:
+                prior = np.zeros((self.img_h // self.stride, self.img_w // self.stride), dtype=np.float32)
+            prior_full = cv2.resize(prior, (self.img_w, self.img_h), interpolation=cv2.INTER_NEAREST)
+            prior_t = torch.from_numpy(prior_full).unsqueeze(0).contiguous()
+            img_t = torch.cat([img_t, prior_t], dim=0)
 
         targets = self.encode(boxes) if self.encode is not None else None
         return img_t, boxes, targets

@@ -113,6 +113,13 @@ def build_model_from_yaml(path: str | Path) -> YamlModel:
     layer_specs: list[dict] = spec["layers"]
     output_cfg: list[dict] = spec["outputs"]
 
+    stem_args = (layer_specs[0].get("args") or {}) if layer_specs else {}
+    stem_in = stem_args.get("in_ch")
+    if stem_in is not None and int(stem_in) != int(in_ch):
+        raise ValueError(
+            f"YAML stem in_ch ({stem_in}) does not match model.in_ch ({in_ch}) in {path}"
+        )
+
     aliases: dict[str, int] = {}
     modules: list[nn.Module] = []
     graph: list = []
