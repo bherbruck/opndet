@@ -11,6 +11,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+# Single-threaded cv2 inside DataLoader workers. Without this, cv2's internal
+# OpenMP/TBB pools fork-explode when num_workers is large, causing intermittent
+# hangs between epochs (workers stuck inside cv2 internal mutexes).
+cv2.setNumThreads(0)
+
 
 @dataclass
 class Sample:
