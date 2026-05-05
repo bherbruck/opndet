@@ -431,13 +431,13 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     val_loader = InfiniteDataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
     # test_loader runs once at end of training; no benefit to keeping it alive.
     test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
-    # Cold loaders run once per epoch, no need for 16 workers each. With 5 loaders
-    # at the user's default num_workers=16 we'd be at 80 worker processes, which
-    # spends a lot of startup time importing torch/cv2/opndet × 80 and contending
-    # over IPC pipes. Cap cold loaders at 4 workers; they're sequential single-pass
-    # eval and that's plenty.
-    cold_kw = {**eval_kw, "num_workers": min(4, nw)}
-    cold_kw = {k: v for k, v in cold_kw.items() if v is not None}
+    # Cold loaders: num_workers=0 (main-process data loading). They run once per
+    # epoch on the small val/test split; spawning workers here adds fork+import
+    # overhead and creates a multi-minute freeze on the first iteration when
+    # paired with the existing 3 InfiniteDataLoaders that already hold workers
+    # alive. Single-threaded numpy/cv2 in main is fast enough for a sequential
+    # pass over 846 val samples (~10-15s).
+    cold_kw = {"collate_fn": collate, "num_workers": 0, "pin_memory": False}
     cold_val_loader = (
         DataLoader(cold_val_ds, batch_size=int(c["batch_size"]), shuffle=False, **cold_kw)
         if cold_val_ds is not None else None
