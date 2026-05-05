@@ -703,6 +703,12 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             print(f"  test: P={mt['precision']:.3f} R={mt['recall']:.3f} F1={mt['f1']:.3f}  mAP@.5={mt['map50']:.3f} mAP@.5:.95={mt['map_50_95']:.3f}")
             for k, v in mt.items():
                 writer.add_scalar(f"test/{k}", v, ep)
+            if cold_test_loader is not None:
+                mt_cold = evaluate(eval_model, cold_test_loader, cfg_shim, device,
+                                   score_thresh=float(c.get("eval_threshold", 0.3)))
+                print(f"  test cold (zero-prior): F1={mt_cold['f1']:.3f}  F1_opt={mt_cold['f1_opt']:.3f}@{mt_cold['threshold_opt']:.2f}  mAP@.5={mt_cold['map50']:.3f}")
+                for k, v in mt_cold.items():
+                    writer.add_scalar(f"test_cold/{k}", v, ep)
             # patience hook: when patience_smart and patience_include_test, count test improvements.
             if patience_smart and patience_include_test:
                 for k in ("f1", "f1_opt", "map50", "map_50_95"):
