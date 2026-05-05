@@ -20,6 +20,24 @@ def _denorm(img_t: torch.Tensor) -> np.ndarray:
     return (np.clip(arr, 0, 1) * 255).astype(np.uint8)
 
 
+def _prior_overlay(rgb: np.ndarray, prior_full: np.ndarray, max_alpha: float = 0.5) -> np.ndarray:
+    """Blend a JET-colormapped prior heatmap onto the RGB image.
+
+    Per-pixel alpha = clip(prior, 0, 1) * max_alpha. Zero-prior pixels keep
+    the original RGB unchanged; hot pixels get up to max_alpha colored tint.
+    Boxes are drawn AFTER this so they always sit on top of the overlay.
+    """
+    p = np.clip(prior_full.astype(np.float32), 0.0, 1.0)
+    if p.max() <= 0.0:
+        return rgb
+    h = (p * 255).astype(np.uint8)
+    color_bgr = cv2.applyColorMap(h, cv2.COLORMAP_JET)
+    color = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+    alpha = (p * max_alpha)[..., None]
+    out = rgb.astype(np.float32) * (1.0 - alpha) + color.astype(np.float32) * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def _draw(img: np.ndarray, boxes: np.ndarray, color: tuple[int, int, int], thick: int = 1) -> np.ndarray:
     out = img.copy()
     for b in boxes:
@@ -75,9 +93,13 @@ def render_predictions(
     out_np = out_t.cpu().numpy()
     dets_per = decode_batch(out_np, img_h, img_w, stride, threshold=threshold)
 
+    has_prior = imgs.shape[1] >= 4
     rendered = []
     for i in range(imgs.shape[0]):
         rgb = _denorm(imgs[i])
+        if has_prior:
+            prior_full = imgs[i, 3].detach().cpu().numpy()
+            rgb = _prior_overlay(rgb, prior_full, max_alpha=0.5)
         # GT in solid magenta — visually distinct from the colored pred gradient.
         rgb = _draw(rgb, gt_boxes[i], color=(255, 0, 255), thick=2)
         for d in dets_per[i]:
