@@ -154,3 +154,77 @@ def test_invalid_motion_probs_raises():
             "motion_diagonal_prob": 0.3,
             "motion_zero_prob": 0.3,
         })
+
+
+def test_top_margin_excludes_box_intersecting_top_edge():
+    """Margin test is intersection-based: any box touching the margin band
+    is excluded. With margin_top=0.10 (38.4 px on H=384), a box with y1=10
+    is excluded even though its center (cy=50) is below the margin band."""
+    synth = TemporalPriorSynth({
+        "margin_top": 0.10,
+        "zero_prior_prob": 0.0,
+        "false_positive_prob": 0.0,
+        "spawn_zone_prob": 0.0,
+        "object_drop_prob": 0.0,
+        "n_max": 6,
+    }, seed=10)
+    H, W = 384, 512
+    intersecting = _box(256, 50, w=40, h=80)  # y1=10, intersects margin band
+    fully_inside = _box(256, 20)              # y1=0, fully in margin
+    away = _box(256, 200)                      # well clear
+
+    p_inter = sum((synth(intersecting, H, W, force_motion=(0.0, 8.0)).max() > 0)
+                  for _ in range(20))
+    p_fully = sum((synth(fully_inside, H, W, force_motion=(0.0, 8.0)).max() > 0)
+                  for _ in range(20))
+    p_away = sum((synth(away, H, W, force_motion=(0.0, 8.0)).max() > 0)
+                 for _ in range(20))
+    assert p_inter == 0, "expected no prior for box that touches top margin"
+    assert p_fully == 0, "expected no prior for box fully in top margin"
+    assert p_away >= 15
+
+
+def test_margin_bottom_intersection_excludes_near_bottom():
+    synth = TemporalPriorSynth({
+        "margin_bottom": 0.10,             # 38.4 px band at bottom of H=384
+        "zero_prior_prob": 0.0,
+        "false_positive_prob": 0.0,
+        "spawn_zone_prob": 0.0,
+        "object_drop_prob": 0.0,
+        "n_max": 6,
+    }, seed=11)
+    H, W = 384, 512
+    touching = _box(256, 320, w=40, h=80)  # y2=360, 384-360=24 < 38.4 -> intersects
+    nonzero = sum((synth(touching, H, W, force_motion=(0.0, -8.0)).max() > 0)
+                  for _ in range(20))
+    assert nonzero == 0
+
+
+def test_object_skip_prob_one_excludes_all():
+    """skip_prob=1.0 -> never any stamps from objects (only FP/spawn could fire)."""
+    synth = TemporalPriorSynth({
+        "object_skip_prob": 1.0,
+        "zero_prior_prob": 0.0,
+        "false_positive_prob": 0.0,
+        "spawn_zone_prob": 0.0,
+        "n_max": 6,
+    }, seed=12)
+    boxes = _box(256, 192)
+    for _ in range(20):
+        p = synth(boxes, 384, 512, force_motion=(8.0, 0.0))
+        assert p.max() == 0.0
+
+
+def test_default_margins_off_preserves_old_behavior():
+    """With all margins=0 and skip=0 (defaults), behavior unchanged from baseline."""
+    synth = TemporalPriorSynth({
+        "zero_prior_prob": 0.0,
+        "false_positive_prob": 0.0,
+        "spawn_zone_prob": 0.0,
+        "object_drop_prob": 0.0,
+        "n_max": 4,
+    }, seed=13)
+    near_top = _box(256, 20)
+    nonzero = sum((synth(near_top, 384, 512, force_motion=(0.0, 8.0)).max() > 0)
+                  for _ in range(20))
+    assert nonzero >= 15

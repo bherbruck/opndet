@@ -27,7 +27,15 @@ _DEFAULTS = {
     "motion_speed_range": (2.0, 15.0),
     "motion_diagonal_jitter_deg": 10.0,
     "confidence_range": (0.5, 0.95),
-    "object_drop_prob": 0.05,
+    "object_drop_prob": 0.05,        # per-frame-per-object miss
+    "object_skip_prob": 0.0,         # per-object total exclusion (brand-new object)
+    # Edge-margin exclusions (as fraction of input H or W). A box whose center
+    # falls within `H*margin_top` of the top edge gets NO prior stamps — models
+    # "just appeared from off-frame" objects. Set to 0.0 to disable.
+    "margin_top": 0.0,
+    "margin_bottom": 0.0,
+    "margin_left": 0.0,
+    "margin_right": 0.0,
     "false_positive_prob": 0.10,
     "false_positive_count_range": (1, 3),
     "false_positive_amplitude_range": (0.3, 0.5),
@@ -85,8 +93,10 @@ class TemporalPriorSynth:
         motion = force_motion if force_motion is not None else self._sample_motion()
         fade_step = 1.0 / N
 
+        eligible = self._filter_eligible(boxes, H, W)
+
         for k in range(N, 0, -1):
-            for box in boxes:
+            for box in eligible:
                 if self.rng.random() < self.cfg["object_drop_prob"]:
                     continue
                 offset = self._shift_box(box, dx=-k * motion[0], dy=-k * motion[1])
@@ -125,6 +135,36 @@ class TemporalPriorSynth:
             rad = math.radians(angle)
             return (math.cos(rad) * speed, math.sin(rad) * speed)
         return (0.0, 0.0)
+
+    def _filter_eligible(self, boxes: np.ndarray, H: int, W: int) -> list[np.ndarray]:
+        """Drop boxes that should get no prior at all: edge-margin exclusions
+        (just-appeared / about-to-disappear) and per-object skip (brand-new
+        objects mixed in with established ones).
+
+        Margin test is intersection-based (permissive): a box is excluded if
+        ANY part of it overlaps the margin band. E.g. margin_top=0.05 on a
+        384px input excludes any box with y1 < 19.2.
+        """
+        m_top = float(self.cfg["margin_top"]) * H
+        m_bot = float(self.cfg["margin_bottom"]) * H
+        m_left = float(self.cfg["margin_left"]) * W
+        m_right = float(self.cfg["margin_right"]) * W
+        skip_p = float(self.cfg["object_skip_prob"])
+        out = []
+        for box in boxes:
+            x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+            if m_top > 0 and y1 < m_top:
+                continue
+            if m_bot > 0 and y2 > H - m_bot:
+                continue
+            if m_left > 0 and x1 < m_left:
+                continue
+            if m_right > 0 and x2 > W - m_right:
+                continue
+            if skip_p > 0 and self.rng.random() < skip_p:
+                continue
+            out.append(box)
+        return out
 
     @staticmethod
     def _shift_box(box: np.ndarray, dx: float, dy: float) -> np.ndarray:
