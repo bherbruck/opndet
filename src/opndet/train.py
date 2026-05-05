@@ -499,21 +499,35 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
+    # For 4-ch (temporal) models, val/test datasets carry zero priors during
+    # eval (cold-start semantics). For VISUALIZATION purposes, pull samples
+    # through a synth-attached dataset so the overlay is meaningful.
+    vis_synth = prior_synth if in_ch == 4 else None
+    vis_src = (
+        OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn,
+                      cache_images=cache, in_ch=in_ch, prior_synth=vis_synth, stride=stride)
+        if vis_synth is not None else val_ds
+    )
     vis_imgs = []
     vis_boxes = []
     if n_vis > 0 and vis_every > 0:
-        for i in range(min(n_vis, len(val_ds))):
-            img_t, boxes, _ = val_ds[i]
+        for i in range(min(n_vis, len(vis_src))):
+            img_t, boxes, _ = vis_src[i]
             vis_imgs.append(img_t)
             vis_boxes.append(boxes)
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
 
     n_test_vis = int(c.get("test_samples", n_vis))
+    test_vis_src = (
+        OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn,
+                      cache_images=cache, in_ch=in_ch, prior_synth=vis_synth, stride=stride)
+        if vis_synth is not None else test_ds
+    )
     test_vis_imgs = []
     test_vis_boxes = []
     if n_test_vis > 0 and test_every > 0 and len(test_ds) > 0:
-        for i in range(min(n_test_vis, len(test_ds))):
-            img_t, boxes, _ = test_ds[i]
+        for i in range(min(n_test_vis, len(test_vis_src))):
+            img_t, boxes, _ = test_vis_src[i]
             test_vis_imgs.append(img_t)
             test_vis_boxes.append(boxes)
     test_vis_batch = torch.stack(test_vis_imgs, dim=0) if test_vis_imgs else None
