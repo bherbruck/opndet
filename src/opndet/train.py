@@ -401,13 +401,25 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     cache = bool(c.get("cache_images", False))
     mosaic_prob = float(aug_cfg.mosaic_prob if hasattr(aug_cfg, "mosaic_prob") else 0.0)
     min_vis = float(aug_cfg.min_visible_frac if hasattr(aug_cfg, "min_visible_frac") else 0.5)
+    # 4-ch eval policy: val/test datasets carry the prior synth too — eval
+    # F1/mAP then reflect deployed (warm-prior) conditions, not RGB-only
+    # cold-start. Selection on f1_opt_cal then picks the checkpoint that's
+    # best AT DEPLOYMENT, and we get a real signal that the model is using
+    # the prior. Set eval_cold_start: true to ALSO run a zero-prior pass
+    # logged as val_cold/* and test_cold/*.
     train_ds = OpndetDataset(train_s, img_h, img_w, augment_fn=aug_fn, encode_fn=encode_fn,
                              cache_images=cache, mosaic_prob=mosaic_prob, min_visible_frac=min_vis,
                              in_ch=in_ch, prior_synth=prior_synth, stride=stride)
     val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache,
-                           in_ch=in_ch, prior_synth=None, stride=stride)
+                           in_ch=in_ch, prior_synth=prior_synth, stride=stride)
     test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn, cache_images=cache,
-                            in_ch=in_ch, prior_synth=None, stride=stride)
+                            in_ch=in_ch, prior_synth=prior_synth, stride=stride)
+    cold_val_ds = cold_test_ds = None
+    if in_ch == 4 and bool(c.get("eval_cold_start", False)):
+        cold_val_ds = OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn,
+                                    cache_images=cache, in_ch=in_ch, prior_synth=None, stride=stride)
+        cold_test_ds = OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn,
+                                     cache_images=cache, in_ch=in_ch, prior_synth=None, stride=stride)
     nw = int(c.get("num_workers", 2))
     pf = int(c.get("prefetch_factor", 4)) if nw > 0 else None
     train_kw = dict(num_workers=nw, collate_fn=collate, pin_memory=device.type == "cuda",
@@ -419,6 +431,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     val_loader = InfiniteDataLoader(val_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
     # test_loader runs once at end of training; no benefit to keeping it alive.
     test_loader = DataLoader(test_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
+    cold_val_loader = (
+        InfiniteDataLoader(cold_val_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
+        if cold_val_ds is not None else None
+    )
+    cold_test_loader = (
+        DataLoader(cold_test_ds, batch_size=int(c["batch_size"]), shuffle=False, **eval_kw)
+        if cold_test_ds is not None else None
+    )
 
     loss_kw = c.get("loss") or {}
     loss_kw.setdefault("img_h", img_h)
@@ -499,35 +519,21 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
-    # For 4-ch (temporal) models, val/test datasets carry zero priors during
-    # eval (cold-start semantics). For VISUALIZATION purposes, pull samples
-    # through a synth-attached dataset so the overlay is meaningful.
-    vis_synth = prior_synth if in_ch == 4 else None
-    vis_src = (
-        OpndetDataset(val_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn,
-                      cache_images=cache, in_ch=in_ch, prior_synth=vis_synth, stride=stride)
-        if vis_synth is not None else val_ds
-    )
     vis_imgs = []
     vis_boxes = []
     if n_vis > 0 and vis_every > 0:
-        for i in range(min(n_vis, len(vis_src))):
-            img_t, boxes, _ = vis_src[i]
+        for i in range(min(n_vis, len(val_ds))):
+            img_t, boxes, _ = val_ds[i]
             vis_imgs.append(img_t)
             vis_boxes.append(boxes)
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
 
     n_test_vis = int(c.get("test_samples", n_vis))
-    test_vis_src = (
-        OpndetDataset(test_s, img_h, img_w, augment_fn=None, encode_fn=encode_fn,
-                      cache_images=cache, in_ch=in_ch, prior_synth=vis_synth, stride=stride)
-        if vis_synth is not None else test_ds
-    )
     test_vis_imgs = []
     test_vis_boxes = []
     if n_test_vis > 0 and test_every > 0 and len(test_ds) > 0:
-        for i in range(min(n_test_vis, len(test_vis_src))):
-            img_t, boxes, _ = test_vis_src[i]
+        for i in range(min(n_test_vis, len(test_ds))):
+            img_t, boxes, _ = test_ds[i]
             test_vis_imgs.append(img_t)
             test_vis_boxes.append(boxes)
     test_vis_batch = torch.stack(test_vis_imgs, dim=0) if test_vis_imgs else None
@@ -621,6 +627,15 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         writer.add_scalar("lr", cur_lr, ep)
         for k, v in avg.items():
             writer.add_scalar(f"train/{k}", v, ep)
+
+        # Cold-start diagnostic: same val with zero priors. Quantifies how
+        # much the prior is helping. Selection metric still uses warm `m`.
+        if cold_val_loader is not None:
+            m_cold = evaluate(eval_model, cold_val_loader, cfg_shim, device,
+                              score_thresh=float(c.get("eval_threshold", 0.3)))
+            print(f"  cold (zero-prior): F1={m_cold['f1']:.3f}  F1_opt={m_cold['f1_opt']:.3f}@{m_cold['threshold_opt']:.2f}  mAP@.5={m_cold['map50']:.3f}")
+            for k, v in m_cold.items():
+                writer.add_scalar(f"val_cold/{k}", v, ep)
         for k, v in m.items():
             writer.add_scalar(f"val/{k}", v, ep)
         writer.add_scalar("time/epoch_s", dt, ep)

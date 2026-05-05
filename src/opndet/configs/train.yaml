@@ -28,6 +28,12 @@ epochs: 100
 # lr: 3.0e-3                      # default scales: bbox-m=3e-3, halves per ~4x params (bbox-x=1.5e-3, bbox-t=5e-4)
 # warmup_steps: 200               # default 200, bigger sizes get longer
 #
+# eval_cold_start: false          # 4-ch only. When true, runs a SECOND val (and
+#                                 #   test) pass with zero priors, logged as
+#                                 #   val_cold/* and test_cold/*. Useful diagnostic
+#                                 #   for "how much is the prior actually helping?"
+#                                 #   Selection metric still uses the warm pass.
+#
 # viz_only_on_improvement: true   # default true — skip val/preds + test/* on
 #                                 #   plateaued epochs (best.pt didn't move since
 #                                 #   last fire). Boundary epochs (1, epochs) and
