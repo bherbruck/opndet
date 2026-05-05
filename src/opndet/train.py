@@ -543,6 +543,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             scaler.load_state_dict(resume_state["scaler"])
         print(f"resuming from epoch {start_epoch + 1}, best_{metric_for_best}={best_metric:.3f} @ epoch {best_epoch}, step={step}")
 
+    # Skip vis/test on plateaued epochs. Fires only when best.pt has moved
+    # since the last fire (or this epoch is the new best, or it's a boundary
+    # epoch ep==1 / ep==epochs). Saves test-eval cost on flat plateaus and
+    # keeps TB image logs sparse-but-meaningful.
+    viz_only_on_improvement = bool(c.get("viz_only_on_improvement", True))
+    last_vis_epoch = 0
+    last_test_epoch = 0
+
     for epoch in range(start_epoch, epochs):
         model.train()
         t0 = time.time()
@@ -643,7 +651,25 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         else:
             vis_thresh_now = float(c.get("eval_threshold", 0.3))
 
-        if test_every > 0 and ep % test_every == 0 and len(test_ds) > 0:
+        # Selection metric (computed up here so we can gate test/vis on
+        # is_new_best): calibrated value if metric_for_best ends in _cal AND
+        # we got m_cal this epoch. Falls back to raw otherwise.
+        if metric_is_cal and m_cal is not None:
+            cur = float(m_cal[metric_base])
+        else:
+            cur = float(m[metric_base if metric_is_cal else metric_for_best])
+        is_new_best = cur > best_metric
+        is_boundary = (ep == 1) or (ep == epochs)
+
+        def _should_fire(last_fire_epoch: int) -> bool:
+            if not viz_only_on_improvement:
+                return True
+            if is_boundary or is_new_best:
+                return True
+            # best.pt was updated at some point since our last fire
+            return best_epoch > last_fire_epoch
+
+        if test_every > 0 and ep % test_every == 0 and len(test_ds) > 0 and _should_fire(last_test_epoch):
             mt = evaluate(eval_model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
             print(f"  test: P={mt['precision']:.3f} R={mt['recall']:.3f} F1={mt['f1']:.3f}  mAP@.5={mt['map50']:.3f} mAP@.5:.95={mt['map_50_95']:.3f}")
             for k, v in mt.items():
@@ -663,20 +689,15 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                     threshold=vis_thresh_now, device=device,
                 )
                 writer.add_images("test/preds", grid, ep, dataformats="NCHW")
+            last_test_epoch = ep
 
-        if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs):
+        if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs) and _should_fire(last_vis_epoch):
             grid = render_predictions(
                 model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
                 threshold=vis_thresh_now, device=device,
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
-
-        # Selection metric: calibrated value if metric_for_best ends in _cal AND we got m_cal this epoch.
-        # Falls back to raw if calibration didn't fire (e.g. calibrate_every step skipped).
-        if metric_is_cal and m_cal is not None:
-            cur = float(m_cal[metric_base])
-        else:
-            cur = float(m[metric_base if metric_is_cal else metric_for_best])
+            last_vis_epoch = ep
         # If EMA is on, save EMA weights as the deployed model — they're the eval-quality ones.
         deployed_state = ema.shadow.state_dict() if ema is not None else model.state_dict()
         ckpt = {
