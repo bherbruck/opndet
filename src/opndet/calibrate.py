@@ -71,11 +71,15 @@ def collect_calibration_data(
     device: torch.device,
     iou_thresh: float = 0.5,
     decode_threshold: float = 0.05,
+    max_dets_per_image: int = 1000,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run the model over the loader, decode peaks, Hungarian-match to GT, return (logits, labels).
 
     Important: model.SigmoidPeakSuppress.temperature should be 1.0 during data collection so
     we recover raw-logit/score pairs. Caller is responsible for that.
+
+    max_dets_per_image: top-K cap to avoid Hungarian-matching huge det pools
+    on untrained models (warm 4-ch input + low threshold = thousands of dets).
     """
     model.eval()
     all_logits: list[np.ndarray] = []
@@ -89,6 +93,8 @@ def collect_calibration_data(
         for dets, gt in zip(dets_per, boxes_list):
             if not dets:
                 continue
+            if len(dets) > max_dets_per_image:
+                dets = sorted(dets, key=lambda d: -d.score)[:max_dets_per_image]
             scores = np.array([d.score for d in dets], dtype=np.float32)
             pb = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32)
             m = hungarian_match(pb, gt.astype(np.float32), iou_thresh=iou_thresh)

@@ -40,8 +40,15 @@ def collect_predictions(
     cfg_shim: _CfgShim,
     device: torch.device,
     decode_threshold: float = 0.05,
+    max_dets_per_image: int = 1000,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Forward pass over loader. Returns list of (scores, pred_boxes_xyxy, gt_boxes_xyxy) per image."""
+    """Forward pass over loader. Returns list of (scores, pred_boxes_xyxy, gt_boxes_xyxy) per image.
+
+    max_dets_per_image: caps the per-image det pool BEFORE metric compute to avoid
+    pathological cold-start explosions (untrained 4-ch models can produce ~1000+
+    dets per image at the 0.05 threshold; mAP sweep × Hungarian on that pool
+    becomes 100M+ ops). Top-K by score. No-op for trained models.
+    """
     model.eval()
     out: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     for imgs, boxes_list, _ in tqdm(loader, desc="eval", leave=False):
@@ -52,6 +59,8 @@ def collect_predictions(
         dets_per = decode_batch(pred_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=decode_threshold)
         for dets, gt in zip(dets_per, boxes_list):
             if dets:
+                if len(dets) > max_dets_per_image:
+                    dets = sorted(dets, key=lambda d: -d.score)[:max_dets_per_image]
                 scores = np.array([d.score for d in dets], dtype=np.float32)
                 pb = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32)
             else:
