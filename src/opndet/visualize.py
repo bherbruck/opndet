@@ -38,6 +38,42 @@ def _prior_overlay(rgb: np.ndarray, prior_full: np.ndarray, max_alpha: float = 0
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _draw_prior_trails(
+    rgb: np.ndarray,
+    prior_full: np.ndarray,
+    color: tuple[int, int, int] = (255, 255, 255),
+    thickness: int = 1,
+    min_amp: float = 0.10,
+    max_link_dist: int = 40,
+) -> np.ndarray:
+    """Detect local maxima of the prior, mark each with a 1-pixel dot, and
+    connect each to its nearest neighbor within max_link_dist with a thin
+    antialiased line. Visualizes the temporal trail through the stamps.
+    Multi-object scenes naturally cluster: stamps on the same trail are
+    closer than stamps on different trails.
+    """
+    p = prior_full.astype(np.float32)
+    if p.max() <= min_amp:
+        return rgb
+    dilated = cv2.dilate(p, np.ones((5, 5), np.float32))
+    is_max = (p >= dilated - 1e-6) & (p > min_amp)
+    ys, xs = np.where(is_max)
+    n = len(xs)
+    if n == 0:
+        return rgb
+    out = rgb.copy()
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+    for i in range(n):
+        d = np.sqrt(((pts - pts[i]) ** 2).sum(axis=1))
+        d[i] = np.inf
+        j = int(np.argmin(d))
+        if d[j] <= max_link_dist:
+            cv2.line(out, (int(xs[i]), int(ys[i])), (int(xs[j]), int(ys[j])),
+                     color, thickness, lineType=cv2.LINE_AA)
+        cv2.circle(out, (int(xs[i]), int(ys[i])), 1, color, -1)
+    return out
+
+
 def _draw(img: np.ndarray, boxes: np.ndarray, color: tuple[int, int, int], thick: int = 1) -> np.ndarray:
     out = img.copy()
     for b in boxes:
@@ -100,6 +136,7 @@ def render_predictions(
         if has_prior:
             prior_full = imgs[i, 3].detach().cpu().numpy()
             rgb = _prior_overlay(rgb, prior_full, max_alpha=0.5)
+            rgb = _draw_prior_trails(rgb, prior_full)
         # GT in solid magenta — visually distinct from the colored pred gradient.
         rgb = _draw(rgb, gt_boxes[i], color=(255, 0, 255), thick=2)
         for d in dets_per[i]:
