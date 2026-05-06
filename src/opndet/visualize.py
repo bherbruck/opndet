@@ -128,6 +128,14 @@ def render_predictions(
     out_t = out["output"] if isinstance(out, dict) else out
     out_np = out_t.cpu().numpy()
     dets_per = decode_batch(out_np, img_h, img_w, stride, threshold=threshold)
+    # Cap dets per image — same rationale as eval.py's max_dets_per_image: an
+    # untrained model (esp 4-ch with warm priors) can decode hundreds of cells
+    # per image at low thresholds, and rendering thousands of cv2.rectangle +
+    # putText calls is dominant cost on cold-start vis. Top-K by score.
+    max_dets = 200
+    for i in range(len(dets_per)):
+        if len(dets_per[i]) > max_dets:
+            dets_per[i] = sorted(dets_per[i], key=lambda d: -d.score)[:max_dets]
 
     has_prior = imgs.shape[1] >= 4
     rendered = []

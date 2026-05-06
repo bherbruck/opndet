@@ -626,9 +626,11 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         avg = {k: v / n_iter for k, v in running.items()}
         dt = time.time() - t0
         eval_model = ema.shadow if ema is not None else model
+        _t_phase = time.time()
         m = evaluate(eval_model, val_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+        _t_val = time.time() - _t_phase
         cur_lr = opt.param_groups[0]["lr"]
-        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  ({dt:.1f}s)")
+        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  (train {dt:.1f}s val {_t_val:.1f}s)")
 
         ep = epoch + 1
         writer.add_scalar("lr", cur_lr, ep)
@@ -638,8 +640,10 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         # Cold-start diagnostic: same val with zero priors. Quantifies how
         # much the prior is helping. Selection metric still uses warm `m`.
         if cold_val_loader is not None:
+            _t_phase = time.time()
             m_cold = evaluate(eval_model, cold_val_loader, cfg_shim, device,
                               score_thresh=float(c.get("eval_threshold", 0.3)))
+            _t_cold = time.time() - _t_phase
             print(f"  cold (zero-prior): F1={m_cold['f1']:.3f}  F1_opt={m_cold['f1_opt']:.3f}@{m_cold['threshold_opt']:.2f}  mAP@.5={m_cold['map50']:.3f}")
             for k, v in m_cold.items():
                 writer.add_scalar(f"val_cold/{k}", v, ep)
@@ -647,7 +651,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             lifts = {k: float(m[k]) - float(m_cold[k]) for k in lift_keys if k in m and k in m_cold}
             for k, v in lifts.items():
                 writer.add_scalar(f"prior_lift/val/{k}", v, ep)
-            print(f"  prior lift (val): F1{'+' if lifts.get('f1', 0) >= 0 else ''}{lifts.get('f1', 0):+.3f}  F1_opt{lifts.get('f1_opt', 0):+.3f}  mAP{lifts.get('map50', 0):+.3f}/{lifts.get('map_50_95', 0):+.3f}")
+            print(f"  prior lift (val): F1{'+' if lifts.get('f1', 0) >= 0 else ''}{lifts.get('f1', 0):+.3f}  F1_opt{lifts.get('f1_opt', 0):+.3f}  mAP{lifts.get('map50', 0):+.3f}/{lifts.get('map_50_95', 0):+.3f}  (cold {_t_cold:.1f}s)")
         for k, v in m.items():
             writer.add_scalar(f"val/{k}", v, ep)
         writer.add_scalar("time/epoch_s", dt, ep)
@@ -658,6 +662,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             from opndet.calibrate import (apply_temperature, collect_calibration_data,
                                             fit_temperature)
             from opndet.metrics import calibration_bins
+            _t_phase = time.time()
             apply_temperature(eval_model, 1.0)
             _logits, _labels = collect_calibration_data(eval_model, val_loader, cfg_shim, device)
             if _logits.shape[0] > 0:
@@ -676,8 +681,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                                  score_thresh=float(c.get("eval_threshold", 0.3)))
                 for k, v in m_cal.items():
                     writer.add_scalar(f"val_cal/{k}", v, ep)
+                _t_calib = time.time() - _t_phase
                 print(f"  calib: T={cur_T:.3f}  ECE {_ece_pre:.3f} -> {_ece_post:.3f}  "
-                      f"F1_cal={m_cal['f1']:.3f}  mAP_cal={m_cal['map50']:.3f}/{m_cal['map_50_95']:.3f}")
+                      f"F1_cal={m_cal['f1']:.3f}  mAP_cal={m_cal['map50']:.3f}/{m_cal['map_50_95']:.3f}  ({_t_calib:.1f}s)")
                 # Restore T=1.0 so subsequent epochs' raw eval starts clean.
                 apply_temperature(eval_model, 1.0)
 
@@ -744,12 +750,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             last_test_epoch = ep
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs) and _should_fire(last_vis_epoch):
+            _t_phase = time.time()
             grid = render_predictions(
                 model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
                 threshold=vis_thresh_now, device=device,
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
             last_vis_epoch = ep
+            print(f"  vis: val/preds rendered ({time.time() - _t_phase:.1f}s)")
         # If EMA is on, save EMA weights as the deployed model — they're the eval-quality ones.
         deployed_state = ema.shadow.state_dict() if ema is not None else model.state_dict()
         ckpt = {
@@ -768,12 +776,13 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             "temperature": float(cur_T),
             "config": c,
         }
+        _t_phase = time.time()
         torch.save(ckpt, out_dir / "last.pt")
         if cur > best_metric:
             best_metric = cur
             best_epoch = ep
             torch.save(ckpt, out_dir / "best.pt")
-            print(f"  -> saved best ({metric_for_best}={best_metric:.3f}, T={cur_T:.3f})")
+            print(f"  -> saved best ({metric_for_best}={best_metric:.3f}, T={cur_T:.3f})  (save {time.time() - _t_phase:.1f}s)")
 
         if patience > 0:
             if patience_smart:
