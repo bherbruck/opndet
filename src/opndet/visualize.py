@@ -44,6 +44,7 @@ def _draw_prior_trails(
     color: tuple[int, int, int] = (255, 255, 255),
     thickness: int = 1,
     min_amp: float = 0.10,
+    max_link_dist: int = 30,
 ) -> np.ndarray:
     """For each connected blob of prior > min_amp, draw a single AA line from
     the trail's TAIL (oldest visible position, farthest from peak) to its
@@ -62,6 +63,7 @@ def _draw_prior_trails(
     if n_labels <= 1:
         return rgb
     out = rgb.copy()
+    heads: list[tuple[int, int]] = []
     for label_id in range(1, n_labels):
         ys, xs = np.where(labels == label_id)
         if len(xs) == 0:
@@ -69,15 +71,13 @@ def _draw_prior_trails(
         amps = p[ys, xs]
         # Head = geometric center of pixels at the blob's max amplitude.
         # Plateaus from upsampling + Gaussian flat-tops mean argmax picks the
-        # raster-first tied pixel (leftmost edge of the bright zone, not its
-        # center). Averaging tied-max positions puts the dot on the visual
-        # peak of the JET overlay.
+        # raster-first tied pixel (leftmost edge), not its center. Averaging
+        # tied-max positions puts the dot on the visual peak of the overlay.
         max_val = amps.max()
         head_mask = amps >= max_val - 1e-6
         head_x = float(xs[head_mask].mean())
         head_y = float(ys[head_mask].mean())
         # Tail = geometric center of pixels farthest from head within the blob.
-        # Same averaging avoids landing on the raster-first edge pixel.
         d2 = (xs.astype(np.float64) - head_x) ** 2 + (ys.astype(np.float64) - head_y) ** 2
         d2_max = d2.max()
         tail_mask = d2 >= d2_max - 1.0
@@ -86,9 +86,25 @@ def _draw_prior_trails(
         head_pt = (int(round(head_x)), int(round(head_y)))
         tail_pt = (int(round(tail_x)), int(round(tail_y)))
         if tail_pt != head_pt:
+            # Within-blob trail line (covers the merged-Gaussian case where
+            # one elongated blob represents N overlapping stamps).
             cv2.line(out, tail_pt, head_pt, color, thickness, lineType=cv2.LINE_AA)
             cv2.circle(out, tail_pt, 1, color, -1)
         cv2.circle(out, head_pt, 2, color, -1)
+        heads.append(head_pt)
+    # Inter-blob streamer: when stamps are separated (high-speed motion +
+    # tight sigma) each stamp is its own blob; connect each blob's head to
+    # the nearest other head within max_link_dist so the trail shows as a
+    # visible chain. max_link_dist must be small enough to not link across
+    # different objects' trails.
+    if len(heads) > 1 and max_link_dist > 0:
+        h_arr = np.array(heads, dtype=np.float32)
+        for i in range(len(heads)):
+            d = np.sqrt(((h_arr - h_arr[i]) ** 2).sum(axis=1))
+            d[i] = np.inf
+            j = int(np.argmin(d))
+            if d[j] <= max_link_dist:
+                cv2.line(out, heads[i], heads[j], color, thickness, lineType=cv2.LINE_AA)
     return out
 
 
