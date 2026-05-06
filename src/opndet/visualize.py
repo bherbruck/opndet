@@ -66,18 +66,29 @@ def _draw_prior_trails(
         ys, xs = np.where(labels == label_id)
         if len(xs) == 0:
             continue
-        # Head = argmax of prior amplitude within this blob
         amps = p[ys, xs]
-        head_i = int(np.argmax(amps))
-        head_x, head_y = int(xs[head_i]), int(ys[head_i])
-        # Tail = pixel in blob farthest from head
-        d2 = (xs.astype(np.int64) - head_x) ** 2 + (ys.astype(np.int64) - head_y) ** 2
-        tail_i = int(np.argmax(d2))
-        tail_x, tail_y = int(xs[tail_i]), int(ys[tail_i])
-        if (tail_x, tail_y) != (head_x, head_y):
-            cv2.line(out, (tail_x, tail_y), (head_x, head_y), color, thickness, lineType=cv2.LINE_AA)
-            cv2.circle(out, (tail_x, tail_y), 1, color, -1)
-        cv2.circle(out, (head_x, head_y), 2, color, -1)
+        # Head = geometric center of pixels at the blob's max amplitude.
+        # Plateaus from upsampling + Gaussian flat-tops mean argmax picks the
+        # raster-first tied pixel (leftmost edge of the bright zone, not its
+        # center). Averaging tied-max positions puts the dot on the visual
+        # peak of the JET overlay.
+        max_val = amps.max()
+        head_mask = amps >= max_val - 1e-6
+        head_x = float(xs[head_mask].mean())
+        head_y = float(ys[head_mask].mean())
+        # Tail = geometric center of pixels farthest from head within the blob.
+        # Same averaging avoids landing on the raster-first edge pixel.
+        d2 = (xs.astype(np.float64) - head_x) ** 2 + (ys.astype(np.float64) - head_y) ** 2
+        d2_max = d2.max()
+        tail_mask = d2 >= d2_max - 1.0
+        tail_x = float(xs[tail_mask].mean())
+        tail_y = float(ys[tail_mask].mean())
+        head_pt = (int(round(head_x)), int(round(head_y)))
+        tail_pt = (int(round(tail_x)), int(round(tail_y)))
+        if tail_pt != head_pt:
+            cv2.line(out, tail_pt, head_pt, color, thickness, lineType=cv2.LINE_AA)
+            cv2.circle(out, tail_pt, 1, color, -1)
+        cv2.circle(out, head_pt, 2, color, -1)
     return out
 
 
