@@ -24,7 +24,13 @@ _DEFAULTS = {
     "motion_axis_aligned_prob": 0.70,
     "motion_diagonal_prob": 0.25,
     "motion_zero_prob": 0.05,
+    # Per-frame motion in input pixels.
     "motion_speed_range": (2.0, 15.0),
+    # Optional override: per-frame motion as FRACTION of input width. When set
+    # (any value > 0 in either bound), this overrides motion_speed_range.
+    # E.g. [0.005, 0.03] = 0.5%-3% of frame width per frame. At W=512, that's
+    # 2.6-15.4 px/frame, matching the pixel default.
+    "motion_speed_frac_range": (0.0, 0.0),
     "motion_diagonal_jitter_deg": 10.0,
     "confidence_range": (0.5, 0.95),
     "object_drop_prob": 0.05,        # per-frame-per-object miss
@@ -70,33 +76,41 @@ class TemporalPriorSynth:
         H: int,
         W: int,
         force_motion: tuple[float, float] | None = None,
-    ) -> np.ndarray:
+        return_trails: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, list[list[tuple[float, float]]]]:
         """Return prior heatmap of shape (H//stride, W//stride), float32 in [0,1].
 
         boxes: (N,4) xyxy in input pixel coords (post-letterbox). Pass the
         same box list that will become GT for the current frame — the synth
         will OFFSET them per-tail-frame so they never land on current GT.
+
+        return_trails: if True, also return a list[list[(cx, cy)]] of stamp
+        center positions per eligible object in INPUT pixel coords, ordered
+        from oldest (k=N) to newest (k=1). Used for visualization to draw
+        the trail line directly instead of reconstructing from heatmap.
         """
         Hs, Ws = H // self.stride, W // self.stride
         prior = np.zeros((Hs, Ws), dtype=np.float32)
+        trails: list[list[tuple[float, float]]] = []
 
         if self.rng.random() < self.cfg["zero_prior_prob"]:
-            return prior
+            return (prior, trails) if return_trails else prior
 
         N = int(self.rng.integers(0, self.cfg["n_max"] + 1))
 
         if N == 0:
             if self.rng.random() < self.cfg["spawn_zone_prob"]:
                 self._overlay_spawn_zone(prior)
-            return prior
+            return (prior, trails) if return_trails else prior
 
-        motion = force_motion if force_motion is not None else self._sample_motion()
+        motion = force_motion if force_motion is not None else self._sample_motion(W)
         fade_step = 1.0 / N
 
         eligible = self._filter_eligible(boxes, H, W)
+        per_obj_trails: list[list[tuple[float, float]]] = [[] for _ in eligible]
 
         for k in range(N, 0, -1):
-            for box in eligible:
+            for obj_i, box in enumerate(eligible):
                 if self.rng.random() < self.cfg["object_drop_prob"]:
                     continue
                 offset = self._shift_box(box, dx=-k * motion[0], dy=-k * motion[1])
@@ -107,6 +121,9 @@ class TemporalPriorSynth:
                 if amp <= 0.0:
                     continue
                 self._stamp_gaussian(prior, self._to_stride_coords(offset), amp)
+                cx_in = (float(offset[0]) + float(offset[2])) * 0.5
+                cy_in = (float(offset[1]) + float(offset[3])) * 0.5
+                per_obj_trails[obj_i].append((cx_in, cy_in))
 
         if self.rng.random() < self.cfg["false_positive_prob"]:
             lo, hi = self.cfg["false_positive_count_range"]
@@ -120,11 +137,21 @@ class TemporalPriorSynth:
             self._overlay_spawn_zone(prior)
 
         np.clip(prior, 0.0, 1.0, out=prior)
+        if return_trails:
+            trails = [t for t in per_obj_trails if len(t) > 0]
+            return prior, trails
         return prior
 
-    def _sample_motion(self) -> tuple[float, float]:
+    def _sample_motion(self, W: int = 512) -> tuple[float, float]:
         r = self.rng.random()
-        speed = float(self.rng.uniform(*self.cfg["motion_speed_range"]))
+        # Use frac_range (relative to W) when explicitly set; otherwise fall
+        # back to the absolute pixel range. Any nonzero value in frac_range
+        # turns it on.
+        frac_lo, frac_hi = self.cfg["motion_speed_frac_range"]
+        if frac_hi > 0.0:
+            speed = float(self.rng.uniform(frac_lo, frac_hi)) * W
+        else:
+            speed = float(self.rng.uniform(*self.cfg["motion_speed_range"]))
         if r < self.cfg["motion_axis_aligned_prob"]:
             d = self.rng.choice(4)
             dx, dy = [(1, 0), (-1, 0), (0, 1), (0, -1)][d]

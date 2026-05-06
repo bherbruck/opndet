@@ -102,6 +102,7 @@ _TEMPORAL_PRIOR_DEFAULTS = {
     "motion_diagonal_prob": 0.25,
     "motion_zero_prob": 0.05,
     "motion_speed_range": [2.0, 15.0],
+    "motion_speed_frac_range": [0.0, 0.0],
     "motion_diagonal_jitter_deg": 10.0,
     "confidence_range": [0.5, 0.95],
     "object_drop_prob": 0.05,

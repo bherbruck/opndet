@@ -528,21 +528,31 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     vis_every = int(c.get("vis_every", 5))
     vis_imgs = []
     vis_boxes = []
+    vis_trails: list[list] = []
     if n_vis > 0 and vis_every > 0:
+        val_ds._return_trails = (in_ch == 4)
         for i in range(min(n_vis, len(val_ds))):
-            img_t, boxes, _ = val_ds[i]
+            r = val_ds[i]
+            img_t, boxes = r[0], r[1]
             vis_imgs.append(img_t)
             vis_boxes.append(boxes)
+            vis_trails.append(r[3] if len(r) == 4 else [])
+        val_ds._return_trails = False
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
 
     n_test_vis = int(c.get("test_samples", n_vis))
     test_vis_imgs = []
     test_vis_boxes = []
+    test_vis_trails: list[list] = []
     if n_test_vis > 0 and test_every > 0 and len(test_ds) > 0:
+        test_ds._return_trails = (in_ch == 4)
         for i in range(min(n_test_vis, len(test_ds))):
-            img_t, boxes, _ = test_ds[i]
+            r = test_ds[i]
+            img_t, boxes = r[0], r[1]
             test_vis_imgs.append(img_t)
             test_vis_boxes.append(boxes)
+            test_vis_trails.append(r[3] if len(r) == 4 else [])
+        test_ds._return_trails = False
     test_vis_batch = torch.stack(test_vis_imgs, dim=0) if test_vis_imgs else None
 
     metric_for_best = str(c.get("metric_for_best", "f1"))
@@ -744,7 +754,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             if test_vis_batch is not None:
                 grid = render_predictions(
                     eval_model, test_vis_batch, test_vis_boxes, img_h, img_w, cfg_shim.stride,
-                    threshold=vis_thresh_now, device=device,
+                    threshold=vis_thresh_now, device=device, trails_per=test_vis_trails,
                 )
                 writer.add_images("test/preds", grid, ep, dataformats="NCHW")
             last_test_epoch = ep
@@ -753,7 +763,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             _t_phase = time.time()
             grid = render_predictions(
                 model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
-                threshold=vis_thresh_now, device=device,
+                threshold=vis_thresh_now, device=device, trails_per=vis_trails,
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
             last_vis_epoch = ep

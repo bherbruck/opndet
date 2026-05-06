@@ -135,6 +135,11 @@ class OpndetDataset(Dataset):
         self.in_ch = int(in_ch)
         self.prior_synth = prior_synth
         self.stride = int(stride)
+        # Set True (only on the main thread, NOT inside dataloader workers) to
+        # have __getitem__ return a 4th element: synth trails for the prior.
+        # Used by the vis path so trail lines can be drawn from the actual
+        # stamp positions instead of reconstructed from the heatmap.
+        self._return_trails = False
         if self.in_ch not in (3, 4):
             raise ValueError(f"OpndetDataset supports in_ch in (3, 4); got {self.in_ch}")
 
@@ -224,16 +229,23 @@ class OpndetDataset(Dataset):
         img_f = (img_f - self.mean) / self.std
         img_t = torch.from_numpy(img_f.transpose(2, 0, 1)).contiguous()
 
+        trails = None
         if self.in_ch == 4:
             if self.prior_synth is not None:
-                prior = self.prior_synth(boxes, self.img_h, self.img_w)
+                if self._return_trails:
+                    prior, trails = self.prior_synth(boxes, self.img_h, self.img_w, return_trails=True)
+                else:
+                    prior = self.prior_synth(boxes, self.img_h, self.img_w)
             else:
                 prior = np.zeros((self.img_h // self.stride, self.img_w // self.stride), dtype=np.float32)
+                trails = []
             prior_full = cv2.resize(prior, (self.img_w, self.img_h), interpolation=cv2.INTER_NEAREST)
             prior_t = torch.from_numpy(prior_full).unsqueeze(0).contiguous()
             img_t = torch.cat([img_t, prior_t], dim=0)
 
         targets = self.encode(boxes) if self.encode is not None else None
+        if self._return_trails:
+            return img_t, boxes, targets, trails or []
         return img_t, boxes, targets
 
     def __getitem__(self, idx: int):

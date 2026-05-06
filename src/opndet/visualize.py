@@ -38,73 +38,36 @@ def _prior_overlay(rgb: np.ndarray, prior_full: np.ndarray, max_alpha: float = 0
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _draw_prior_trails(
+def _draw_prior_trails_from_trails(
     rgb: np.ndarray,
-    prior_full: np.ndarray,
+    trails: list,
     color: tuple[int, int, int] = (255, 255, 255),
     thickness: int = 1,
-    min_amp: float = 0.10,
-    max_link_dist: int = 30,
 ) -> np.ndarray:
-    """For each connected blob of prior > min_amp, draw a single AA line from
-    the trail's TAIL (oldest visible position, farthest from peak) to its
-    HEAD (current position, brightest pixel). One line per trail; head gets
-    a slightly larger dot than the tail to show motion direction.
+    """Draw stamp dots + connecting polyline per object directly from synth-
+    reported stamp positions. trails is list[list[(cx, cy)]] in input pixel
+    coords — outer list is per-object, inner list is the sequence of stamps
+    for that object's trail (ordered oldest→newest).
 
-    No attempt to recover individual stamp positions — overlapping Gaussians
-    merge into one elongated blob, and the head→tail vector along that blob
-    is what conveys the actual motion.
+    No heatmap reconstruction, no nearest-neighbor heuristics — the synth
+    knows exactly which stamps belong to which trail. One line per stamp
+    pair within a trail (N stamps → N-1 line segments). Head dot (newest)
+    larger than tail dots.
     """
-    p = prior_full.astype(np.float32)
-    if p.max() <= min_amp:
-        return rgb
-    blob_mask = (p > min_amp).astype(np.uint8)
-    n_labels, labels, _stats, _centroids = cv2.connectedComponentsWithStats(blob_mask, connectivity=8)
-    if n_labels <= 1:
+    if not trails:
         return rgb
     out = rgb.copy()
-    heads: list[tuple[int, int]] = []
-    for label_id in range(1, n_labels):
-        ys, xs = np.where(labels == label_id)
-        if len(xs) == 0:
+    for trail in trails:
+        if len(trail) == 0:
             continue
-        amps = p[ys, xs]
-        # Head = geometric center of pixels at the blob's max amplitude.
-        # Plateaus from upsampling + Gaussian flat-tops mean argmax picks the
-        # raster-first tied pixel (leftmost edge), not its center. Averaging
-        # tied-max positions puts the dot on the visual peak of the overlay.
-        max_val = amps.max()
-        head_mask = amps >= max_val - 1e-6
-        head_x = float(xs[head_mask].mean())
-        head_y = float(ys[head_mask].mean())
-        # Tail = geometric center of pixels farthest from head within the blob.
-        d2 = (xs.astype(np.float64) - head_x) ** 2 + (ys.astype(np.float64) - head_y) ** 2
-        d2_max = d2.max()
-        tail_mask = d2 >= d2_max - 1.0
-        tail_x = float(xs[tail_mask].mean())
-        tail_y = float(ys[tail_mask].mean())
-        head_pt = (int(round(head_x)), int(round(head_y)))
-        tail_pt = (int(round(tail_x)), int(round(tail_y)))
-        if tail_pt != head_pt:
-            # Within-blob trail line (covers the merged-Gaussian case where
-            # one elongated blob represents N overlapping stamps).
-            cv2.line(out, tail_pt, head_pt, color, thickness, lineType=cv2.LINE_AA)
-            cv2.circle(out, tail_pt, 1, color, -1)
-        cv2.circle(out, head_pt, 2, color, -1)
-        heads.append(head_pt)
-    # Inter-blob streamer: when stamps are separated (high-speed motion +
-    # tight sigma) each stamp is its own blob; connect each blob's head to
-    # the nearest other head within max_link_dist so the trail shows as a
-    # visible chain. max_link_dist must be small enough to not link across
-    # different objects' trails.
-    if len(heads) > 1 and max_link_dist > 0:
-        h_arr = np.array(heads, dtype=np.float32)
-        for i in range(len(heads)):
-            d = np.sqrt(((h_arr - h_arr[i]) ** 2).sum(axis=1))
-            d[i] = np.inf
-            j = int(np.argmin(d))
-            if d[j] <= max_link_dist:
-                cv2.line(out, heads[i], heads[j], color, thickness, lineType=cv2.LINE_AA)
+        pts = [(int(round(cx)), int(round(cy))) for (cx, cy) in trail]
+        # Lines connecting sequential stamps within this trail
+        for i in range(len(pts) - 1):
+            cv2.line(out, pts[i], pts[i + 1], color, thickness, lineType=cv2.LINE_AA)
+        # Dots: small for older stamps, larger for the head (last in list = k=1 = newest)
+        for pt in pts[:-1]:
+            cv2.circle(out, pt, 1, color, -1)
+        cv2.circle(out, pts[-1], 2, color, -1)
     return out
 
 
@@ -150,6 +113,7 @@ def render_predictions(
     stride: int,
     threshold: float = 0.05,
     device: torch.device | str = "cpu",
+    trails_per: list | None = None,
 ) -> np.ndarray:
     """Run model on a batch of normalized images; return [N, 3, H, W] uint8 grid-ready array.
 
@@ -178,7 +142,8 @@ def render_predictions(
         if has_prior:
             prior_full = imgs[i, 3].detach().cpu().numpy()
             rgb = _prior_overlay(rgb, prior_full, max_alpha=0.5)
-            rgb = _draw_prior_trails(rgb, prior_full)
+            if trails_per is not None and i < len(trails_per):
+                rgb = _draw_prior_trails_from_trails(rgb, trails_per[i])
         # GT in solid magenta — visually distinct from the colored pred gradient.
         rgb = _draw(rgb, gt_boxes[i], color=(255, 0, 255), thick=2)
         for d in dets_per[i]:
