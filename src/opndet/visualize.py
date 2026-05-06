@@ -44,38 +44,40 @@ def _draw_prior_trails(
     color: tuple[int, int, int] = (255, 255, 255),
     thickness: int = 1,
     min_amp: float = 0.10,
-    max_link_dist: int = 40,
 ) -> np.ndarray:
-    """Detect prior centroids, mark each with a 1-pixel dot, and connect each
-    to its nearest neighbor within max_link_dist with a thin antialiased
-    line. Visualizes the temporal trail through the stamps.
+    """For each connected blob of prior > min_amp, draw a single AA line from
+    the trail's TAIL (oldest visible position, farthest from peak) to its
+    HEAD (current position, brightest pixel). One line per trail; head gets
+    a slightly larger dot than the tail to show motion direction.
 
-    Plateau handling: when overlapping Gaussian stamps merge via np.maximum
-    they produce flat-top regions where many pixels tie for the local max.
-    A naive `p == dilated` test marks every plateau pixel as a "maximum",
-    producing thousands of false maxima that cover the image as a white
-    grid. We collapse each plateau into one centroid via 8-connected
-    component labeling.
+    No attempt to recover individual stamp positions — overlapping Gaussians
+    merge into one elongated blob, and the head→tail vector along that blob
+    is what conveys the actual motion.
     """
     p = prior_full.astype(np.float32)
     if p.max() <= min_amp:
         return rgb
-    dilated = cv2.dilate(p, np.ones((5, 5), np.float32))
-    is_max = (p >= dilated - 1e-6) & (p > min_amp)
-    mask = is_max.astype(np.uint8)
-    n_labels, _labels, _stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    blob_mask = (p > min_amp).astype(np.uint8)
+    n_labels, labels, _stats, _centroids = cv2.connectedComponentsWithStats(blob_mask, connectivity=8)
     if n_labels <= 1:
         return rgb
-    pts = centroids[1:].astype(np.int32)  # skip background label 0
-    n = len(pts)
     out = rgb.copy()
-    for i in range(n):
-        d = np.sqrt(((pts - pts[i]) ** 2).sum(axis=1))
-        d[i] = np.inf
-        j = int(np.argmin(d))
-        if d[j] <= max_link_dist:
-            cv2.line(out, tuple(pts[i]), tuple(pts[j]), color, thickness, lineType=cv2.LINE_AA)
-        cv2.circle(out, tuple(pts[i]), 1, color, -1)
+    for label_id in range(1, n_labels):
+        ys, xs = np.where(labels == label_id)
+        if len(xs) == 0:
+            continue
+        # Head = argmax of prior amplitude within this blob
+        amps = p[ys, xs]
+        head_i = int(np.argmax(amps))
+        head_x, head_y = int(xs[head_i]), int(ys[head_i])
+        # Tail = pixel in blob farthest from head
+        d2 = (xs.astype(np.int64) - head_x) ** 2 + (ys.astype(np.int64) - head_y) ** 2
+        tail_i = int(np.argmax(d2))
+        tail_x, tail_y = int(xs[tail_i]), int(ys[tail_i])
+        if (tail_x, tail_y) != (head_x, head_y):
+            cv2.line(out, (tail_x, tail_y), (head_x, head_y), color, thickness, lineType=cv2.LINE_AA)
+            cv2.circle(out, (tail_x, tail_y), 1, color, -1)
+        cv2.circle(out, (head_x, head_y), 2, color, -1)
     return out
 
 
