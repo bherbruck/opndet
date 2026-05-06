@@ -71,7 +71,7 @@ def collect_calibration_data(
     device: torch.device,
     iou_thresh: float = 0.5,
     decode_threshold: float = 0.05,
-    max_dets_per_image: int = 1000,
+    max_dets_per_image: int = 100,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run the model over the loader, decode peaks, Hungarian-match to GT, return (logits, labels).
 

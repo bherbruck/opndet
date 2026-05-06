@@ -40,14 +40,16 @@ def collect_predictions(
     cfg_shim: _CfgShim,
     device: torch.device,
     decode_threshold: float = 0.05,
-    max_dets_per_image: int = 1000,
+    max_dets_per_image: int = 100,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Forward pass over loader. Returns list of (scores, pred_boxes_xyxy, gt_boxes_xyxy) per image.
 
-    max_dets_per_image: caps the per-image det pool BEFORE metric compute to avoid
-    pathological cold-start explosions (untrained 4-ch models can produce ~1000+
-    dets per image at the 0.05 threshold; mAP sweep × Hungarian on that pool
-    becomes 100M+ ops). Top-K by score. No-op for trained models.
+    max_dets_per_image: caps the per-image det pool BEFORE metric compute to
+    avoid pathological cold-start explosions. COCO eval default. Untrained
+    4-ch models can produce 1000+ dets per image at the 0.05 decode threshold,
+    and mAP@.5:.95's per-IoU-threshold Hungarian × per-IoU AP sweep over that
+    pool is dominant cost on cold-start epochs. Top-K by score; no-op for
+    trained models (which produce <100 dets/image after peak suppression).
     """
     model.eval()
     out: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
