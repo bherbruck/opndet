@@ -282,6 +282,7 @@ _INDEX_HTML = """<!doctype html>
       <label><input type="checkbox" id="show-tp"> tp</label>
       <label><input type="checkbox" id="show-fp"> fp</label>
       <label><input type="checkbox" id="show-fn"> fn</label>
+      <label><input type="checkbox" id="show-trail" checked> trail</label>
       <label><input type="checkbox" id="show-prior" checked> prior heat</label>
       <label>α <input id="overlay-alpha" type="range" min="0" max="1" step="0.05" value="0.5"></label>
     </div>
@@ -450,17 +451,34 @@ function drawBoxes(canvas, boxes) {
     tp:   document.getElementById('show-tp').checked,
     fp:   document.getElementById('show-fp').checked,
     fn:   document.getElementById('show-fn').checked,
+    trail: document.getElementById('show-trail')?.checked ?? true,
   };
   const colorByKind = {
     pred: '#39c860', gt: '#ff5edb', tp: '#39c860', fp: '#ff6b35', fn: '#3aa6ff',
+    trail: '#ffffff',
   };
   for (const b of boxes) {
+    if (b.kind === 'trail') {
+      if (!showByKind.trail) continue;
+      // meta is unavailable on the box object yet; trail is encoded as
+      // box=(tail_x,tail_y,head_x,head_y). Draw a thin line + dots.
+      ctx.strokeStyle = colorByKind.trail;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(b.x1, b.y1);
+      ctx.lineTo(b.x2, b.y2);
+      ctx.stroke();
+      ctx.fillStyle = colorByKind.trail;
+      ctx.beginPath(); ctx.arc(b.x1, b.y1, 1.5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(b.x2, b.y2, 2.5, 0, Math.PI * 2); ctx.fill();
+      continue;
+    }
     if (!showByKind[b.kind]) continue;
     if (b.kind === 'pred' && b.score != null && b.score < thresh) continue;
     ctx.strokeStyle = colorByKind[b.kind] || '#fff';
     ctx.lineWidth = 2;
     ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
-    if (b.score != null) {
+    if (b.kind === 'pred' && b.score != null) {
       ctx.fillStyle = colorByKind[b.kind];
       ctx.font = '12px monospace';
       ctx.fillText(b.score.toFixed(2), b.x1 + 2, b.y1 + 12);
@@ -504,7 +522,7 @@ document.getElementById('score-thresh').addEventListener('input', e => {
   document.getElementById('score-val').textContent = parseFloat(e.target.value).toFixed(2);
   rerenderBoxes();
 });
-['show-pred','show-gt','show-tp','show-fp','show-fn'].forEach(id => {
+['show-pred','show-gt','show-tp','show-fp','show-fn','show-trail'].forEach(id => {
   document.getElementById(id).addEventListener('change', rerenderBoxes);
 });
 document.getElementById('show-prior').addEventListener('change', rerenderOverlays);

@@ -309,32 +309,9 @@ def _resolve_out_dir(base: Path, auto_increment: bool = True) -> Path:
     return parent / f"{stem}_{n}"
 
 
-def _save_vis_to_db(db, run_dir, tag: str, ep: int, grid_nchw: np.ndarray,
-                    boxes_per_sample: list) -> None:
-    """Save each rendered vis sample as a PNG and add an image+gt-boxes row
-    to the metrics DB. Pred boxes are baked into the rendered image for now;
-    the dashboard shows the rendered frames as-is. Future: split overlays
-    + JSON pred boxes for client-side score-threshold filtering.
-    """
-    if db is None:
-        return
-    import cv2
+def _save_layered_vis_path(run_dir, tag: str, ep: int):
     from pathlib import Path as _P
-    safe_tag = tag.replace("/", "_")
-    out_sub = _P(run_dir) / "vis" / safe_tag / f"ep_{ep:03d}"
-    out_sub.mkdir(parents=True, exist_ok=True)
-    for i in range(grid_nchw.shape[0]):
-        rgb = grid_nchw[i].transpose(1, 2, 0)  # (H, W, 3) uint8 RGB
-        path = out_sub / f"sample_{i}.png"
-        cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        try:
-            db.add_image(ep, tag, i, path)
-            if i < len(boxes_per_sample):
-                gt = boxes_per_sample[i]
-                if hasattr(gt, "shape") and gt.shape[0] > 0:
-                    db.add_boxes(ep, tag, i, "gt", gt)
-        except Exception:
-            pass
+    return _P(run_dir) / "vis" / tag.replace("/", "_") / f"ep_{ep:03d}"
 
 
 def cosine_lr(step: int, total: int, base: float, warmup: int = 200, min_factor: float = 0.05) -> float:
@@ -820,7 +797,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                     threshold=vis_thresh_now, device=device, trails_per=test_vis_trails,
                 )
                 writer.add_images("test/preds", grid, ep, dataformats="NCHW")
-                _save_vis_to_db(db, out_dir, "test/preds", ep, grid, test_vis_boxes)
+                if db is not None:
+                    from opndet.visualize import save_layered_vis
+                    save_layered_vis(eval_model, test_vis_batch, test_vis_boxes,
+                                     img_h, img_w, cfg_shim.stride,
+                                     _save_layered_vis_path(out_dir, "test/preds", ep),
+                                     db, "test/preds", ep,
+                                     threshold=vis_thresh_now, device=device,
+                                     trails_per=test_vis_trails)
             last_test_epoch = ep
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs) and _should_fire(last_vis_epoch):
@@ -830,7 +814,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 threshold=vis_thresh_now, device=device, trails_per=vis_trails,
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
-            _save_vis_to_db(db, out_dir, "val/preds", ep, grid, vis_boxes)
+            if db is not None:
+                from opndet.visualize import save_layered_vis
+                save_layered_vis(model, vis_batch, vis_boxes,
+                                 img_h, img_w, cfg_shim.stride,
+                                 _save_layered_vis_path(out_dir, "val/preds", ep),
+                                 db, "val/preds", ep,
+                                 threshold=vis_thresh_now, device=device,
+                                 trails_per=vis_trails)
             last_vis_epoch = ep
             print(f"  vis: val/preds rendered ({time.time() - _t_phase:.1f}s)")
         # If EMA is on, save EMA weights as the deployed model — they're the eval-quality ones.
