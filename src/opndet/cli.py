@@ -128,6 +128,12 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    from opndet.dashboard import serve
+    serve(run_dir=args.run, host=args.host, port=args.port)
+    return 0
+
+
 def _cmd_quantize(args: argparse.Namespace) -> int:
     from opndet.quantize import parity_check, quantize_onnx
     info = quantize_onnx(args.onnx, args.out, args.calib, n_calib=args.n_calib, quant_format=args.format)
@@ -254,6 +260,12 @@ def main(argv: list[str] | None = None) -> int:
                      help="After the first pass, snap score_thresh to the F1-optimal value from the PR sweep "
                           "and recompute fixed-threshold metrics. Honest reporting when the chosen threshold is off the knee.")
     pev.set_defaults(func=_cmd_eval)
+
+    pd = sub.add_parser("dashboard", help="Open the run-metrics web viewer (DuckDB-backed)")
+    pd.add_argument("--run", required=True, help="Path to a run directory containing metrics.duckdb")
+    pd.add_argument("--host", default="127.0.0.1", help="Bind host")
+    pd.add_argument("--port", type=int, default=5000, help="Bind port")
+    pd.set_defaults(func=_cmd_dashboard)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
     pq.add_argument("--onnx", required=True, help="Input fp32 ONNX")

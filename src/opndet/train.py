@@ -309,6 +309,34 @@ def _resolve_out_dir(base: Path, auto_increment: bool = True) -> Path:
     return parent / f"{stem}_{n}"
 
 
+def _save_vis_to_db(db, run_dir, tag: str, ep: int, grid_nchw: np.ndarray,
+                    boxes_per_sample: list) -> None:
+    """Save each rendered vis sample as a PNG and add an image+gt-boxes row
+    to the metrics DB. Pred boxes are baked into the rendered image for now;
+    the dashboard shows the rendered frames as-is. Future: split overlays
+    + JSON pred boxes for client-side score-threshold filtering.
+    """
+    if db is None:
+        return
+    import cv2
+    from pathlib import Path as _P
+    safe_tag = tag.replace("/", "_")
+    out_sub = _P(run_dir) / "vis" / safe_tag / f"ep_{ep:03d}"
+    out_sub.mkdir(parents=True, exist_ok=True)
+    for i in range(grid_nchw.shape[0]):
+        rgb = grid_nchw[i].transpose(1, 2, 0)  # (H, W, 3) uint8 RGB
+        path = out_sub / f"sample_{i}.png"
+        cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        try:
+            db.add_image(ep, tag, i, path)
+            if i < len(boxes_per_sample):
+                gt = boxes_per_sample[i]
+                if hasattr(gt, "shape") and gt.shape[0] > 0:
+                    db.add_boxes(ep, tag, i, "gt", gt)
+        except Exception:
+            pass
+
+
 def cosine_lr(step: int, total: int, base: float, warmup: int = 200, min_factor: float = 0.05) -> float:
     if step < warmup:
         return base * (step + 1) / max(1, warmup)
@@ -361,6 +389,41 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(log_dir=str(tb_dir))
     print(f"tensorboard: {tb_dir}")
+
+    # DuckDB metrics store (queryable companion to TB). Writes alongside TB —
+    # both stay in the run dir. Default on; opt out with `metrics_db: false`.
+    db = None
+    if bool(c.get("metrics_db", True)):
+        try:
+            from opndet.metrics_db import MetricsDB
+            db = MetricsDB(out_dir)
+            db.set_config(c)
+            print(f"metrics_db: {db.path}")
+        except Exception as e:
+            print(f"metrics_db disabled ({e})")
+            db = None
+
+    # Wrap writer.add_scalar so every TB scalar also lands in the DB.
+    _orig_add_scalar = writer.add_scalar
+    def _add_scalar(tag, value, step):
+        _orig_add_scalar(tag, value, step)
+        if db is not None:
+            db.add_scalar(int(step), str(tag), float(value))
+    writer.add_scalar = _add_scalar
+
+    # Auto-spawn the dashboard subprocess when `dashboard: true` (or the env
+    # var OPNDET_DASHBOARD=1). In Colab, the dashboard auto-embeds as an
+    # iframe in the calling cell. Killed at training exit via atexit.
+    dashboard_proc = None
+    if bool(c.get("dashboard", False)) or os.environ.get("OPNDET_DASHBOARD") == "1":
+        try:
+            from opndet.dashboard import spawn_background
+            port = int(c.get("dashboard_port", 5000))
+            dashboard_proc = spawn_background(out_dir, port=port)
+            import atexit
+            atexit.register(lambda: dashboard_proc.terminate() if dashboard_proc and dashboard_proc.poll() is None else None)
+        except Exception as e:
+            print(f"dashboard auto-spawn failed: {e}")
 
     device = torch.device("cuda" if torch.cuda.is_available() and c.get("device", "auto") != "cpu" else "cpu")
     print(f"device: {device}")
@@ -757,6 +820,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                     threshold=vis_thresh_now, device=device, trails_per=test_vis_trails,
                 )
                 writer.add_images("test/preds", grid, ep, dataformats="NCHW")
+                _save_vis_to_db(db, out_dir, "test/preds", ep, grid, test_vis_boxes)
             last_test_epoch = ep
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs) and _should_fire(last_vis_epoch):
@@ -766,6 +830,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 threshold=vis_thresh_now, device=device, trails_per=vis_trails,
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
+            _save_vis_to_db(db, out_dir, "val/preds", ep, grid, vis_boxes)
             last_vis_epoch = ep
             print(f"  vis: val/preds rendered ({time.time() - _t_phase:.1f}s)")
         # If EMA is on, save EMA weights as the deployed model — they're the eval-quality ones.
@@ -831,6 +896,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     print(f"TEST: P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  n_pred={m['n_pred']:.0f}/n_gt={m['n_gt']:.0f}")
     for k, v in m.items():
         writer.add_scalar(f"test/{k}", v, epochs)
+
+    if db is not None:
+        db.close()
 
     if auto_calibrate:
         print("auto-calibrating best.pt on val ...")

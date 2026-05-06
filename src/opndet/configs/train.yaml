@@ -54,6 +54,14 @@ epochs: 100
 #                                 #   also triggers files.download() automatically.
 # bundle_include_tb: false        # default false — set true to include tfevents in the zip (big)
 #
+# metrics_db: true                # default true — write a queryable DuckDB store at
+#                                 #   <out_dir>/metrics.duckdb alongside TB. Backs the
+#                                 #   `opndet dashboard` viewer.
+# dashboard: false                # set true to auto-spawn the dashboard FastAPI server
+#                                 #   on training start. In Colab it embeds as an iframe
+#                                 #   in the calling cell. Subprocess gets cleaned up at exit.
+# dashboard_port: 5000            # bind port for the auto-spawned dashboard
+#
 # loss:
 #   wh_loss: ciou                 # default
 #   cls_loss: vfl                 # default — bimodal confidence
