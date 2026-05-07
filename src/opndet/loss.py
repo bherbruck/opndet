@@ -326,6 +326,11 @@ def _repulsion_loss(pred_xyxy: torch.Tensor, tgt: dict, pos: torch.Tensor, img_h
     """RepGT-style: penalize predictions overlapping non-target neighbor GT cells.
     Approximation: at each positive cell, find the nearest other positive cell in the same image
     and penalize IoU between this prediction and that neighbor's GT box.
+
+    Baseline-subtracted: only the EXCESS overlap beyond what the GTs already share is
+    penalized. Without this, two overlapping GTs (e.g. partially-stacked eggs) push the
+    regression toward shrunken boxes — a perfect prediction would still take a penalty
+    just because GT_self overlaps GT_neighbor by construction.
     """
     B = pred_xyxy.shape[0]
     total = pred_xyxy.new_zeros(())
@@ -346,11 +351,19 @@ def _repulsion_loss(pred_xyxy: torch.Tensor, tgt: dict, pos: torch.Tensor, img_h
         nn_idx = d2.argmin(dim=1)
         neighbor_gt = gt_box[nn_idx]
         my_pred = pred_xyxy[b, :, ys, xs].t()  # [N,4]
+        # IoA(pred, neighbor_gt): how much of neighbor's footprint my pred bleeds into
         ix1 = torch.max(my_pred[:, 0], neighbor_gt[:, 0]); iy1 = torch.max(my_pred[:, 1], neighbor_gt[:, 1])
         ix2 = torch.min(my_pred[:, 2], neighbor_gt[:, 2]); iy2 = torch.min(my_pred[:, 3], neighbor_gt[:, 3])
         inter = (ix2 - ix1).clamp(min=0) * (iy2 - iy1).clamp(min=0)
         nb_area = (neighbor_gt[:, 2] - neighbor_gt[:, 0]).clamp(min=0) * (neighbor_gt[:, 3] - neighbor_gt[:, 1]).clamp(min=0) + 1e-7
-        ioa = inter / nb_area  # IoU-of-Area = how much of neighbor is hit by my prediction
-        total = total + ioa.mean()
+        ioa = inter / nb_area
+        # Baseline IoA(GT_self, GT_neighbor): how much of neighbor my OWN GT already covers.
+        # A perfect prediction (my_pred == gt_box) hits exactly this. Subtract it so the
+        # penalty is only for excess bleed.
+        bx1 = torch.max(gt_box[:, 0], neighbor_gt[:, 0]); by1 = torch.max(gt_box[:, 1], neighbor_gt[:, 1])
+        bx2 = torch.min(gt_box[:, 2], neighbor_gt[:, 2]); by2 = torch.min(gt_box[:, 3], neighbor_gt[:, 3])
+        baseline = (bx2 - bx1).clamp(min=0) * (by2 - by1).clamp(min=0) / nb_area
+        ioa_excess = (ioa - baseline).clamp(min=0)
+        total = total + ioa_excess.mean()
         count += 1
     return total / max(1, count)
