@@ -151,6 +151,7 @@ def save_layered_vis(
     dets_per = decode_batch(out_np, img_h, img_w, stride, threshold=threshold)
 
     has_prior = imgs.shape[1] >= 4
+    H, W = imgs.shape[2], imgs.shape[3]
     for i in range(imgs.shape[0]):
         rgb = _denorm(imgs[i])  # clean RGB, no annotations
         rgb_path = out_sub / f"sample_{i}_rgb.png"
@@ -162,6 +163,15 @@ def save_layered_vis(
             prior_path = out_sub / f"sample_{i}_prior.png"
             save_prior_overlay_png(prior_full, str(prior_path))
 
+        # Model output heatmap: channel 0 is the post-peak-suppression obj
+        # probability at stride-4. Upsample to input H/W and save with the
+        # same JET+alpha treatment as the prior so the dashboard can blend
+        # it in as another overlay layer.
+        obj_stride = out_np[i, 0]
+        obj_full = cv2.resize(obj_stride, (W, H), interpolation=cv2.INTER_LINEAR)
+        obj_path = out_sub / f"sample_{i}_obj_heat.png"
+        save_prior_overlay_png(obj_full, str(obj_path))
+
         if db is None:
             continue
 
@@ -169,6 +179,7 @@ def save_layered_vis(
             db.add_image(ep, tag, i, rgb_path)
             if prior_path is not None:
                 db.add_overlay(ep, tag, i, "prior_heat", prior_path)
+            db.add_overlay(ep, tag, i, "obj_heat", obj_path)
             if i < len(gt_boxes) and gt_boxes[i].shape[0] > 0:
                 db.add_boxes(ep, tag, i, "gt", gt_boxes[i])
             if dets_per[i]:

@@ -598,11 +598,16 @@ _INDEX_HTML = """<!doctype html>
         <label><input type="checkbox" id="show-fp"> fp</label>
         <label><input type="checkbox" id="show-fn"> fn</label>
         <label><input type="checkbox" id="show-trail" checked> trail</label>
-        <label><input type="checkbox" id="show-prior" checked> prior heat</label>
+        <span id="overlay-toggles" style="display:inline-flex;gap:8px"></span>
         <label>α <input id="overlay-alpha" type="range" min="0" max="1" step="0.05" value="0.5"></label>
       </div>
       <div id="image-grid" class="image-grid"></div>
     </div>
+  </div>
+
+  <div id="lightbox" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:9999;cursor:zoom-out;align-items:center;justify-content:center;flex-direction:column;gap:12px;padding:20px">
+    <div id="lightbox-stage" style="position:relative;max-width:96vw;max-height:90vh"></div>
+    <div id="lightbox-caption" style="color:#7d8590;font-size:11px"></div>
   </div>
 </div>
 
@@ -1055,58 +1060,112 @@ async function loadImageEpochs() {
   }
 }
 
+// Track existing cards by sampleKey so epoch switches can update in place.
+let _imageCardIndex = new Map();    // sampleKey -> card element
+let _imageGridSig = '';             // cache of (tag|runs) for which the grid is built
+
 async function loadImages() {
   const tag = document.getElementById('img-tag').value;
   const ep = document.getElementById('img-ep').value;
   const root = document.getElementById('image-grid');
-  root.innerHTML = '';
   if (!tag || !ep) {
     root.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">no tag/epoch selected</div>`;
+    _imageCardIndex.clear(); _imageGridSig = '';
     return;
   }
   if (selectedRuns.length === 0) {
     root.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">no runs selected</div>`;
+    _imageCardIndex.clear(); _imageGridSig = '';
     return;
   }
-  // One section per selected run, color-tagged. Skip runs that don't have
-  // a sample at this (tag, ep) — they may not have hit vis_every yet.
+  // Decide whether we can update in place. The grid layout (which runs
+  // are sectioned, which sample slots exist) is identical when only the
+  // epoch changes — so reuse cards rather than rebuild.
+  const sig = `${tag}|${selectedRuns.join(',')}`;
+  const sameLayout = sig === _imageGridSig && root.firstElementChild;
+
+  if (!sameLayout) {
+    root.innerHTML = '';
+    _imageCardIndex.clear();
+  }
+
   let total = 0;
+  const observedKinds = new Set();
   for (const run of selectedRuns) {
     const samples = await api(`/api/samples?tag=${encodeURIComponent(tag)}&ep=${ep}&run=${encodeURIComponent(run)}`) || [];
     if (samples.length === 0) continue;
-    const sec = document.createElement('div');
-    const color = colorFor(run);
-    sec.innerHTML = `<div style="margin:14px 0 6px;font-size:13px;color:#c9d1d9;font-weight:600;display:flex;align-items:center;gap:6px"><span class="swatch" style="background:${color}"></span>${run} <span style="color:#7d8590;font-size:11px;font-weight:400">${samples.length} samples</span></div>`;
-    const sub = document.createElement('div');
-    sub.className = 'image-grid';
-    sec.appendChild(sub);
-    root.appendChild(sec);
-    for (const s of samples) renderSample(sub, s);
+    samples.forEach(s => s.overlays.forEach(o => observedKinds.add(o.kind)));
+
+    let sub;
+    if (sameLayout) {
+      // find existing run-section's grid div
+      const existing = root.querySelector(`[data-run-section="${CSS.escape(run)}"] .image-grid`);
+      if (existing) sub = existing;
+    }
+    if (!sub) {
+      const sec = document.createElement('div');
+      sec.dataset.runSection = run;
+      const color = colorFor(run);
+      sec.innerHTML = `<div style="margin:14px 0 6px;font-size:13px;color:#c9d1d9;font-weight:600;display:flex;align-items:center;gap:6px"><span class="swatch" style="background:${color}"></span>${run} <span class="run-sample-count" style="color:#7d8590;font-size:11px;font-weight:400">${samples.length} samples</span></div>`;
+      sub = document.createElement('div');
+      sub.className = 'image-grid';
+      sec.appendChild(sub);
+      root.appendChild(sec);
+    } else {
+      const cnt = root.querySelector(`[data-run-section="${CSS.escape(run)}"] .run-sample-count`);
+      if (cnt) cnt.textContent = `${samples.length} samples`;
+    }
+
+    for (const s of samples) {
+      const key = `${run}::${s.sample_idx}`;
+      const existing = _imageCardIndex.get(key);
+      if (existing) {
+        updateSampleInPlace(existing, s);
+      } else {
+        renderSample(sub, s, run);
+        _imageCardIndex.set(key, sub.lastElementChild);
+      }
+    }
     total += samples.length;
   }
+  _imageGridSig = sig;
+
   if (total === 0) {
     root.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">no selected run has samples for ${tag} @ epoch ${ep}</div>`;
+    _imageCardIndex.clear(); _imageGridSig = '';
   }
+
+  // Rebuild per-kind overlay toggles for the kinds we observed across all
+  // displayed samples. Each new kind defaults to "on".
+  rebuildOverlayToggles([...observedKinds]);
 }
 
-function renderSample(grid, s) {
+function renderSample(grid, s, runName) {
   const card = document.createElement('div');
   card.className = 'img-card';
+  card._sample = s;
+  card._runName = runName;
+  card.dataset.sampleKey = `${runName}::${s.sample_idx}`;
+
   const stage = document.createElement('div');
   stage.className = 'stage';
+  stage.style.cursor = 'zoom-in';
+  stage.addEventListener('click', () => openLightbox(card));
   card.appendChild(stage);
+
   const baseImg = document.createElement('img');
   baseImg.className = 'base';
-  baseImg.loading = 'lazy';   // browser-managed lazy fetch on scroll
+  baseImg.loading = 'lazy';
   baseImg.src = s.rgb_url;
   stage.appendChild(baseImg);
+
   for (const ov of s.overlays) {
     const img = document.createElement('img');
     img.className = 'overlay';
     img.loading = 'lazy';
     img.src = ov.url;
     img.dataset.kind = ov.kind;
-    img.style.opacity = (document.getElementById('show-prior').checked ? document.getElementById('overlay-alpha').value : 0);
+    img.style.opacity = overlayOpacityFor(ov.kind);
     stage.appendChild(img);
   }
   const cv = document.createElement('canvas');
@@ -1122,7 +1181,40 @@ function renderSample(grid, s) {
     cv.height = baseImg.naturalHeight;
     drawBoxes(cv, s.boxes);
   };
+}
+
+// Update an existing card with new boxes + new overlay URLs. Keeps the
+// same <img class="base"> element (browser cached, no flicker) and just
+// swaps overlay srcs + redraws boxes. Used when the user only changes
+// epoch — RGB content is identical across epochs anyway.
+function updateSampleInPlace(card, s) {
   card._sample = s;
+  const stage = card.querySelector('.stage');
+  // re-point overlay imgs by kind
+  const haveKinds = new Set();
+  for (const ov of s.overlays) {
+    haveKinds.add(ov.kind);
+    let img = stage.querySelector(`img.overlay[data-kind="${ov.kind}"]`);
+    if (!img) {
+      img = document.createElement('img');
+      img.className = 'overlay';
+      img.loading = 'lazy';
+      img.dataset.kind = ov.kind;
+      stage.appendChild(img);
+    }
+    if (img.src !== ov.url) img.src = ov.url;
+    img.style.opacity = overlayOpacityFor(ov.kind);
+  }
+  // remove overlay imgs whose kind isn't in the new sample
+  stage.querySelectorAll('img.overlay').forEach(img => {
+    if (!haveKinds.has(img.dataset.kind)) img.remove();
+  });
+  // ensure canvas is on top
+  const cv = stage.querySelector('canvas.boxes');
+  stage.appendChild(cv);
+  drawBoxes(cv, s.boxes);
+  card.querySelector('.layer-toggles').textContent =
+    `boxes: ${s.boxes.length}  overlays: ${s.overlays.map(o => o.kind).join(', ') || 'none'}`;
 }
 
 function drawBoxes(canvas, boxes) {
@@ -1166,13 +1258,90 @@ function rerenderBoxes() {
     drawBoxes(card.querySelector('canvas.boxes'), card._sample.boxes);
   });
 }
+// Map of overlay kind -> visible boolean. Persisted in localStorage so the
+// user's toggle choices survive reloads.
+let overlayKindVisible = {};
+try {
+  overlayKindVisible = JSON.parse(localStorage.getItem('opndet:overlayKinds') || '{}') || {};
+} catch { overlayKindVisible = {}; }
+
+function overlayOpacityFor(kind) {
+  const a = parseFloat(document.getElementById('overlay-alpha').value);
+  const on = overlayKindVisible[kind] !== false;   // default-on for new kinds
+  return on ? a : 0;
+}
+
+function rebuildOverlayToggles(kinds) {
+  const wrap = document.getElementById('overlay-toggles');
+  if (!wrap) return;
+  // sort and stable-render so we don't churn on every refresh
+  const sorted = [...kinds].sort();
+  const want = sorted.join('|');
+  if (wrap.dataset.kinds === want) return;
+  wrap.dataset.kinds = want;
+  wrap.innerHTML = '';
+  for (const k of sorted) {
+    const id = 'show-overlay-' + k.replace(/[^a-z0-9]/gi, '_');
+    const lbl = document.createElement('label');
+    const checked = overlayKindVisible[k] !== false;
+    lbl.innerHTML = `<input type="checkbox" id="${id}" data-kind="${k}"${checked ? ' checked' : ''}> ${k}`;
+    wrap.appendChild(lbl);
+    lbl.querySelector('input').addEventListener('change', e => {
+      overlayKindVisible[k] = e.target.checked;
+      try { localStorage.setItem('opndet:overlayKinds', JSON.stringify(overlayKindVisible)); } catch {}
+      rerenderOverlays();
+    });
+  }
+}
+
 function rerenderOverlays() {
-  const showPrior = document.getElementById('show-prior').checked;
-  const a = document.getElementById('overlay-alpha').value;
   document.querySelectorAll('.img-card .overlay').forEach(img => {
-    img.style.opacity = showPrior ? a : 0;
+    img.style.opacity = overlayOpacityFor(img.dataset.kind);
   });
 }
+
+// Lightbox: clone the clicked card into a fixed-position fullscreen modal.
+function openLightbox(card) {
+  const lb = document.getElementById('lightbox');
+  const stage = document.getElementById('lightbox-stage');
+  const cap = document.getElementById('lightbox-caption');
+  stage.innerHTML = '';
+  // Clone the stage so any layer toggles stay in sync with the grid copy.
+  const orig = card.querySelector('.stage');
+  const clone = orig.cloneNode(true);
+  clone.style.cursor = 'default';
+  // Re-bind canvas: cloned canvas is empty — we need to re-draw at full res.
+  const cv = clone.querySelector('canvas.boxes');
+  const baseImg = clone.querySelector('img.base');
+  // Make the clone fill the lightbox stage
+  clone.style.maxWidth = '96vw';
+  clone.style.maxHeight = '90vh';
+  clone.style.width = 'auto';
+  clone.style.height = 'auto';
+  baseImg.style.maxWidth = '96vw';
+  baseImg.style.maxHeight = '90vh';
+  baseImg.style.width = 'auto';
+  baseImg.style.height = 'auto';
+  baseImg.style.display = 'block';
+  stage.appendChild(clone);
+  cap.textContent = `${card._runName || ''} sample ${card._sample.sample_idx}`;
+  baseImg.onload = () => {
+    cv.width = baseImg.naturalWidth;
+    cv.height = baseImg.naturalHeight;
+    drawBoxes(cv, card._sample.boxes);
+  };
+  if (baseImg.complete) baseImg.onload();
+  lb.style.display = 'flex';
+}
+
+document.getElementById('lightbox').addEventListener('click', e => {
+  if (e.target.id === 'lightbox' || e.target.id === 'lightbox-caption') {
+    e.currentTarget.style.display = 'none';
+  }
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.getElementById('lightbox').style.display = 'none';
+});
 
 async function runSQL() {
   const q = document.getElementById('sql-input').value;
@@ -1214,7 +1383,6 @@ document.getElementById('score-thresh').addEventListener('input', e => {
 ['show-pred','show-gt','show-tp','show-fp','show-fn','show-trail'].forEach(id => {
   document.getElementById(id).addEventListener('change', rerenderBoxes);
 });
-document.getElementById('show-prior').addEventListener('change', rerenderOverlays);
 document.getElementById('overlay-alpha').addEventListener('input', rerenderOverlays);
 document.getElementById('smooth-slider').addEventListener('input', () => {
   document.getElementById('smooth-val').textContent = currentSmoothing().toFixed(2);
