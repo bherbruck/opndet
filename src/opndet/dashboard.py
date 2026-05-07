@@ -423,6 +423,16 @@ _INDEX_HTML = """<!doctype html>
   <div class="title">opndet · __ROOT_NAME__</div>
   <div style="flex:1"></div>
   <span id="empty-banner" style="color:#ff6b35;font-size:12px;display:none">no runs yet — waiting…</span>
+  <label style="font-size:11px;color:#7d8590;display:flex;gap:6px;align-items:center">
+    <input type="checkbox" id="autorefresh-toggle" checked> auto
+    <select id="autorefresh-interval" style="background:#0e1116;color:#d6dee6;border:1px solid #30363d;border-radius:3px;padding:2px 6px;font-family:inherit;font-size:11px">
+      <option value="5000">5s</option>
+      <option value="10000" selected>10s</option>
+      <option value="30000">30s</option>
+      <option value="60000">60s</option>
+      <option value="300000">5m</option>
+    </select>
+  </label>
   <button onclick="pollUpdate(true)">refresh</button>
 </header>
 
@@ -1074,7 +1084,36 @@ async function pollUpdate(force = false) {
     chart.update('none');
   }
 }
-setInterval(() => pollUpdate(false), 10000);
+// Auto-refresh: configurable interval + toggle, persisted in hash/localStorage.
+let _pollTimer = null;
+function applyAutorefresh() {
+  if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+  const on = document.getElementById('autorefresh-toggle').checked;
+  const ms = parseInt(document.getElementById('autorefresh-interval').value, 10);
+  // persist
+  const params = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+  params.set('autorefresh', on ? '1' : '0');
+  params.set('refreshMs', String(ms));
+  history.replaceState(null, '', location.pathname + location.search + '#' + params.toString());
+  try {
+    localStorage.setItem('opndet:autorefresh', on ? '1' : '0');
+    localStorage.setItem('opndet:refreshMs', String(ms));
+  } catch {}
+  if (on) _pollTimer = setInterval(() => pollUpdate(false), ms);
+}
+// Restore prior settings
+{
+  const params = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+  let on = params.get('autorefresh');
+  let ms = params.get('refreshMs');
+  if (on === null) { try { on = localStorage.getItem('opndet:autorefresh'); } catch {} }
+  if (ms === null) { try { ms = localStorage.getItem('opndet:refreshMs'); } catch {} }
+  if (on !== null) document.getElementById('autorefresh-toggle').checked = (on === '1');
+  if (ms !== null) document.getElementById('autorefresh-interval').value = ms;
+}
+document.getElementById('autorefresh-toggle').addEventListener('change', applyAutorefresh);
+document.getElementById('autorefresh-interval').addEventListener('change', applyAutorefresh);
+applyAutorefresh();
 </script>
 </body>
 </html>
