@@ -72,3 +72,6 @@ datasets/
 *.zip
 *.tar
 *.tar.gz
+
+# local scratch / notebook recipes
+scratch/
