@@ -99,6 +99,35 @@ def _cmd_predict(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    from opndet.analyze import run as analyze_run
+    from opndet.presets import resolve
+    from pathlib import Path
+    import torch
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        print("cuda not available; falling back to cpu", file=sys.stderr)
+        device = "cpu"
+    out = args.out
+    if out is None:
+        ckpt_p = Path(args.ckpt)
+        out = str(ckpt_p.parent / f"analyze_{ckpt_p.stem}")
+    if not args.image and not args.video:
+        print("FAIL: pass --image PATH (repeatable) or --video PATH", file=sys.stderr)
+        return 2
+    analyze_run(
+        ckpt=args.ckpt,
+        model_yaml=resolve(args.model),
+        out_dir=Path(out),
+        device=device,
+        threshold=args.threshold,
+        video=args.video,
+        n_frames=args.frames,
+        images=args.image,
+    )
+    return 0
+
+
 def _cmd_calibrate(args: argparse.Namespace) -> int:
     from opndet.calibrate import calibrate_ckpt
     out = calibrate_ckpt(args.ckpt, args.config, split=args.split, save=not args.dry_run)
@@ -264,6 +293,22 @@ def main(argv: list[str] | None = None) -> int:
                      help="After the first pass, snap score_thresh to the F1-optimal value from the PR sweep "
                           "and recompute fixed-threshold metrics. Honest reporting when the chosen threshold is off the knee.")
     pev.set_defaults(func=_cmd_eval)
+
+    pa = sub.add_parser("analyze", help="Postmortem on a saved checkpoint: per-layer activation "
+                                          "slider + Grad-CAM per detection, rendered as standalone HTML.")
+    pa.add_argument("--ckpt", required=True, help="Trained checkpoint .pt")
+    pa.add_argument("--model", required=True, help="Preset name (bbox-x|s|m|...) or YAML path")
+    pa.add_argument("--image", action="append", default=None,
+                    help="Path to a single image (repeatable: --image a.jpg --image b.jpg)")
+    pa.add_argument("--video", default=None, help="Path to a video file; samples N evenly-spaced frames")
+    pa.add_argument("--frames", type=int, default=6, help="Number of frames to sample (video mode)")
+    pa.add_argument("--out", default=None,
+                    help="Output dir (default: <ckpt-dir>/analyze_<ckpt-stem>)")
+    pa.add_argument("--device", default="cuda",
+                    help="cuda or cpu; falls back to cpu if cuda not available")
+    pa.add_argument("--threshold", type=float, default=0.5,
+                    help="Detection score threshold for which detections get Grad-CAM")
+    pa.set_defaults(func=_cmd_analyze)
 
     pd = sub.add_parser("dashboard", help="Run-metrics web viewer (DuckDB-backed). "
                                             "Pass a single run dir or a runs parent — "
