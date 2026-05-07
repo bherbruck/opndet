@@ -143,6 +143,8 @@ def center_match(
     gt_boxes: np.ndarray,
     dist_frac: float = 0.5,
     min_dist_px: float = 8.0,
+    cell_window: int = 4,
+    stride: int = 4,
 ) -> dict:
     """IoU-free matcher: pair preds to GTs by center distance only.
 
@@ -178,27 +180,27 @@ def center_match(
     gcy = (gt_boxes[:, 1] + gt_boxes[:, 3]) * 0.5
     gw = np.clip(gt_boxes[:, 2] - gt_boxes[:, 0], 1.0, None)
     gh = np.clip(gt_boxes[:, 3] - gt_boxes[:, 1], 1.0, None)
-    radii = np.maximum(min_dist_px, dist_frac * np.minimum(gw, gh)).astype(np.float32)
+    # Match radius. Pure distance-based; ignores pred bbox size on purpose
+    # (huge random init bboxes used to false-match every GT via containment).
+    # Three components:
+    #   1. cell_window * stride / 2 — half of the user's "4x4 cell box". At
+    #      stride=4, cell_window=4 -> ±8 px ≈ 2 cells from GT center.
+    #   2. dist_frac * min(gw, gh) — GT-size-relative; lets big objects
+    #      tolerate larger center error.
+    #   3. min_dist_px — absolute floor for tiny objects.
+    # Take the MAX so any of the three can rescue a pair from "too far."
+    cell_radius_px = float(cell_window * stride * 0.5)
+    radii = np.maximum.reduce([
+        np.full(gw.shape, min_dist_px, dtype=np.float32),
+        np.full(gw.shape, cell_radius_px, dtype=np.float32),
+        (dist_frac * np.minimum(gw, gh)).astype(np.float32),
+    ])
     dx = pcx[:, None] - gcx[None, :]
     dy = pcy[:, None] - gcy[None, :]
     dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
 
-    # Containment: does the predicted bbox enclose the GT center?
-    # If yes, count as a match even if pred and GT centers are far apart
-    # (e.g. pred is loose but covers the right egg). Per user: "if the GT
-    # center is enclosed in our heatmap peak, we should claim 100%
-    # precision for that."
-    gt_inside_pred = (
-        (pred_boxes[:, 0:1] <= gcx[None, :]) &
-        (pred_boxes[:, 2:3] >= gcx[None, :]) &
-        (pred_boxes[:, 1:2] <= gcy[None, :]) &
-        (pred_boxes[:, 3:4] >= gcy[None, :])
-    )
-
     cost = dist.copy()
-    # Forbid a pair only if it's BOTH out of center radius AND not containing
-    # the GT center. Either condition alone keeps it eligible.
-    forbidden = (dist > radii[None, :]) & ~gt_inside_pred
+    forbidden = dist > radii[None, :]
     cost[forbidden] = 1e9
     from scipy.optimize import linear_sum_assignment
     row, col = linear_sum_assignment(cost)
@@ -221,17 +223,13 @@ def center_match(
     n_dup = n_ghost = 0
     if unmatched_pred_mask.any():
         u_dist = dist[unmatched_pred_mask]                       # (n_unmatched, n_gt)
-        u_in_pred = gt_inside_pred[unmatched_pred_mask]          # (n_unmatched, n_gt)
         nearest_gt = np.argmin(u_dist, axis=1)
         nearest_d = u_dist[np.arange(u_dist.shape[0]), nearest_gt]
         nearest_r = radii[nearest_gt]
-        near_match = nearest_d <= nearest_r
-        has_gt_inside = u_in_pred.any(axis=1)
-        # Duplicate: pred lands near a real egg (within radius OR encloses
-        # a GT center) — same target detected twice. Real ghost: far from
-        # any GT center AND no GT inside the pred bbox — phantom detection
-        # in empty frame space.
-        is_dup = near_match | has_gt_inside
+        # Duplicate: another pred landed inside SOME GT's match radius (same
+        # object, picked up twice). Ghost: far from every GT — phantom in
+        # empty frame space. Pure distance-based; no bbox-size leniency.
+        is_dup = nearest_d <= nearest_r
         n_dup = int(is_dup.sum())
         n_ghost = int((~is_dup).sum())
 
