@@ -757,10 +757,16 @@ function groupSort(a, b) {
   return a.localeCompare(b);
 }
 
+// Generation counter — every renderAllCharts() bumps it. Any in-flight
+// render whose gen no longer matches the latest bails before mutating
+// the DOM. Prevents two concurrent renders from interleaving sections
+// (the "6 of each category" bug).
+let _renderGen = 0;
 async function renderAllCharts() {
-  // tear down any existing charts; we rebuild from the current scalarTags
+  const gen = ++_renderGen;
   for (const tag of Object.keys(charts)) removeChart(tag);
   const root = document.getElementById('chart-groups');
+  if (gen !== _renderGen) return;
   root.innerHTML = '';
 
   if (scalarTags.length === 0 || selectedRuns.length === 0) return;
@@ -777,6 +783,7 @@ async function renderAllCharts() {
   const openSet = new Set(persistedGet('openGroups').length ? persistedGet('openGroups') : sortedGroups.filter(g => GROUP_OPEN_DEFAULT.has(g)));
 
   for (const g of sortedGroups) {
+    if (gen !== _renderGen) return;
     const det = document.createElement('details');
     det.className = 'chart-group';
     det.dataset.group = g;
@@ -787,12 +794,14 @@ async function renderAllCharts() {
     const charts_div = document.createElement('div');
     charts_div.className = 'charts';
     det.appendChild(charts_div);
+    if (gen !== _renderGen) return;
     root.appendChild(det);
-    // only render charts when the group is open (saves bandwidth/rerender)
     if (det.open) {
-      for (const tag of groups[g]) await addChart(tag, charts_div);
+      for (const tag of groups[g]) {
+        if (gen !== _renderGen) return;
+        await addChart(tag, charts_div);
+      }
     }
-    // lazy-load on first expand
     det.addEventListener('toggle', async () => {
       saveOpenGroups();
       if (det.open && charts_div.childElementCount === 0) {
@@ -1179,7 +1188,17 @@ refreshAll();
 // show up. If `force` is true (manual refresh), always rebuild tag union
 // + chart groups but keep existing chart data slot until renderAllCharts
 // fills them so the area never goes empty.
+let _pollInFlight = false;
 async function pollUpdate(force = false) {
+  if (_pollInFlight && !force) return;
+  _pollInFlight = true;
+  try {
+    return await _pollUpdateImpl(force);
+  } finally {
+    _pollInFlight = false;
+  }
+}
+async function _pollUpdateImpl(force) {
   const autoAdded = await refreshRuns();
 
   // Re-fetch the tag union — handles new scalar tags emerging mid-training
