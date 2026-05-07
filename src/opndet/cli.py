@@ -130,7 +130,11 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     from opndet.dashboard import serve
-    serve(run_dir=args.run, host=args.host, port=args.port)
+    root = args.root or args.run
+    if root is None:
+        print("FAIL: pass --root <runs_parent_or_single_run_dir>", file=sys.stderr)
+        return 2
+    serve(root_dir=root, host=args.host, port=args.port)
     return 0
 
 
@@ -261,8 +265,14 @@ def main(argv: list[str] | None = None) -> int:
                           "and recompute fixed-threshold metrics. Honest reporting when the chosen threshold is off the knee.")
     pev.set_defaults(func=_cmd_eval)
 
-    pd = sub.add_parser("dashboard", help="Open the run-metrics web viewer (DuckDB-backed)")
-    pd.add_argument("--run", required=True, help="Path to a run directory containing metrics.duckdb")
+    pd = sub.add_parser("dashboard", help="Run-metrics web viewer (DuckDB-backed). "
+                                            "Pass a single run dir or a runs parent — "
+                                            "auto-discovers every metrics.duckdb under it.")
+    pd.add_argument("--root", default=None,
+                    help="Runs parent OR a single run dir. Auto-scans for metrics.duckdb. "
+                         "Tolerant of missing/empty paths — picks up new runs as they appear.")
+    pd.add_argument("--run", default=None,
+                    help="(legacy alias for --root; either flag works)")
     pd.add_argument("--host", default="127.0.0.1", help="Bind host")
     pd.add_argument("--port", type=int, default=5000, help="Bind port")
     pd.set_defaults(func=_cmd_dashboard)

@@ -396,7 +396,10 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         try:
             from opndet.dashboard import spawn_background
             port = int(c.get("dashboard_port", 5000))
-            dashboard_proc = spawn_background(out_dir, port=port)
+            # Point at the RUNS PARENT so the dashboard auto-discovers every
+            # run (this run + any siblings/historical) and can compare them
+            # in multi-run charts. Following TB's --logdir behavior.
+            dashboard_proc = spawn_background(out_dir.parent, port=port)
             import atexit
             atexit.register(lambda: dashboard_proc.terminate() if dashboard_proc and dashboard_proc.poll() is None else None)
         except Exception as e:
