@@ -1219,7 +1219,16 @@ function updateSampleInPlace(card, s) {
 
 function drawBoxes(canvas, boxes) {
   const ctx = canvas.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // boxes are in NATURAL pixel coords (the original image dims used by
+  // model output). If the canvas is sized to a different pixel space
+  // (e.g. lightbox draws at displayed-res×DPR for crisp box lines + text),
+  // _natW/_natH stash those originals and we scale the context here so
+  // drawing code below stays in natural coords.
+  if (canvas._natW && canvas._natW !== canvas.width) {
+    ctx.scale(canvas.width / canvas._natW, canvas.height / canvas._natH);
+  }
   const thresh = parseFloat(document.getElementById('score-thresh').value);
   const showByKind = {
     pred: document.getElementById('show-pred').checked,
@@ -1325,15 +1334,15 @@ function showLightboxCard(card) {
 
   const s = card._sample;
 
-  // CSS grid with one cell — every child gets grid-area: 1/1 and stacks.
+  // Wrap is sized after image load so it scales UP to fill the viewport
+  // (capped at 96vw × 90vh) maintaining aspect ratio. CSS grid stacks the
+  // image, overlays, and canvas in a single cell.
   const wrap = document.createElement('div');
-  wrap.style.cssText = 'display:grid;grid-template-columns:auto;grid-template-rows:auto;line-height:0';
+  wrap.style.cssText = 'display:grid;grid-template-columns:1fr;grid-template-rows:1fr;line-height:0';
 
   const baseImg = document.createElement('img');
   baseImg.src = s.rgb_url;
-  // Base image controls the cell size via max-w / max-h. width:auto / height:auto
-  // preserves aspect ratio.
-  baseImg.style.cssText = 'grid-area:1/1;display:block;max-width:96vw;max-height:88vh;width:auto;height:auto';
+  baseImg.style.cssText = 'grid-area:1/1;display:block;width:100%;height:100%;object-fit:contain';
   wrap.appendChild(baseImg);
 
   for (const ov of s.overlays) {
@@ -1341,9 +1350,7 @@ function showLightboxCard(card) {
     img.src = ov.url;
     img.dataset.kind = ov.kind;
     img.className = 'overlay';
-    // Same grid cell as base; width/height:100% snaps the overlay to the
-    // base image's actual rendered size.
-    img.style.cssText = `grid-area:1/1;width:100%;height:100%;opacity:${overlayOpacityFor(ov.kind)};pointer-events:none`;
+    img.style.cssText = `grid-area:1/1;width:100%;height:100%;object-fit:contain;opacity:${overlayOpacityFor(ov.kind)};pointer-events:none`;
     wrap.appendChild(img);
   }
 
@@ -1354,13 +1361,36 @@ function showLightboxCard(card) {
   stage.appendChild(wrap);
   cap.textContent = `${card._runName || ''} sample ${s.sample_idx}  ·  ${_lightboxCardIndex + 1}/${_lightboxCards.length}  ·  ←/→ navigate · esc close`;
 
-  const draw = () => {
-    cv.width = baseImg.naturalWidth;
-    cv.height = baseImg.naturalHeight;
+  const fit = () => {
+    if (!baseImg.naturalWidth) return;
+    const ar = baseImg.naturalWidth / baseImg.naturalHeight;
+    const maxW = window.innerWidth * 0.96;
+    const maxH = window.innerHeight * 0.90;
+    let w, h;
+    if (maxW / maxH > ar) {
+      h = maxH; w = maxH * ar;
+    } else {
+      w = maxW; h = maxW / ar;
+    }
+    wrap.style.width = w + 'px';
+    wrap.style.height = h + 'px';
+    // Canvas at DISPLAYED-res × DPR so box lines + text stay crisp under
+    // arbitrary scale-up. Original image stays at natural res; CSS scales
+    // the <img> via object-fit:contain (bilinear is fine for photos +
+    // heatmaps). Box coords stored in natural-pixel space; drawBoxes
+    // applies the natW->canvas.width scale internally.
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+    cv._natW = baseImg.naturalWidth;
+    cv._natH = baseImg.naturalHeight;
     drawBoxes(cv, s.boxes);
   };
-  baseImg.onload = draw;
-  if (baseImg.complete && baseImg.naturalWidth) draw();
+  baseImg.onload = fit;
+  if (baseImg.complete && baseImg.naturalWidth) fit();
+
+  // Re-fit on window resize while open
+  window._opndetLightboxFit = fit;
 
   lb.style.display = 'flex';
 }
@@ -1382,6 +1412,10 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') lb.style.display = 'none';
   else if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); lightboxStep(1); }
   else if (e.key === 'ArrowLeft') { e.preventDefault(); lightboxStep(-1); }
+});
+window.addEventListener('resize', () => {
+  const lb = document.getElementById('lightbox');
+  if (lb.style.display === 'flex' && window._opndetLightboxFit) window._opndetLightboxFit();
 });
 
 async function runSQL() {
