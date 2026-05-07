@@ -804,18 +804,27 @@ function rerenderOverlays() {
 
 async function runSQL() {
   const q = document.getElementById('sql-input').value;
+  const root = document.getElementById('sql-result');
   try {
-    const r = await api('/api/sql' + (currentRun ? '?run=' + encodeURIComponent(currentRun) : ''), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q })
+    const run = primaryRun();
+    const url = '/api/sql' + (run ? '?run=' + encodeURIComponent(run) : '');
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: q }),
     });
-    const root = document.getElementById('sql-result');
+    const r = await resp.json().catch(() => ({error: 'bad response'}));
+    if (r.error) {
+      root.innerHTML = `<div style="color:#ff6b35;font-size:12px">error: ${r.error}</div>`;
+      return;
+    }
     let html = `<div style="color:#7d8590;font-size:11px;margin-bottom:4px">${r.rows.length} rows${r.truncated ? ' (truncated to 1000)' : ''}</div>`;
-    html += '<table><thead><tr>' + r.columns.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
-    for (const row of r.rows) html += '<tr>' + row.map(v => `<td>${v}</td>`).join('') + '</tr>';
+    html += '<table><thead><tr>' + (r.columns || []).map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
+    for (const row of (r.rows || [])) html += '<tr>' + row.map(v => `<td>${v}</td>`).join('') + '</tr>';
     html += '</tbody></table>';
     root.innerHTML = html;
   } catch (e) {
-    document.getElementById('sql-result').textContent = 'error: ' + e.message;
+    root.textContent = 'error: ' + (e.message || e);
   }
 }
 
