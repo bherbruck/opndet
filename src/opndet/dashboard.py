@@ -328,9 +328,7 @@ _INDEX_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <div class="title">opndet</div>
-  <select id="run-select" multiple size="1" style="min-width:280px;height:30px"></select>
-  <div style="font-size:11px;color:#7d8590">ctrl/cmd-click to compare runs</div>
+  <div class="title">opndet · __ROOT_NAME__</div>
   <div style="flex:1"></div>
   <span id="empty-banner" style="color:#ff6b35;font-size:12px;display:none">no runs yet — waiting…</span>
   <button onclick="refreshAll()">refresh</button>
@@ -338,6 +336,16 @@ _INDEX_HTML = """<!doctype html>
 
 <div class="grid">
   <div class="pane">
+    <h3 style="display:flex;justify-content:space-between;align-items:center">
+      <span>runs</span>
+      <span id="runs-count" style="color:#39c860;font-size:11px">0 selected</span>
+    </h3>
+    <div id="run-list" class="tag-list" style="max-height:220px;overflow:auto;border:1px solid #21262d;border-radius:3px;padding:4px;margin-bottom:6px"></div>
+    <div style="display:flex;gap:6px;margin-bottom:14px">
+      <button onclick="toggleAllRuns(true)" style="flex:1">select all</button>
+      <button onclick="toggleAllRuns(false)" style="flex:1">deselect all</button>
+    </div>
+
     <h3>scalars</h3>
     <div id="scalar-tags" class="tag-list"></div>
     <h3 style="margin-top:14px">image tags</h3>
@@ -395,27 +403,40 @@ async function api(path, opts) {
 
 async function refreshRuns() {
   const runs = await api('/api/runs') || [];
-  const sel = document.getElementById('run-select');
+  const list = document.getElementById('run-list');
   const prev = new Set(selectedRuns);
-  sel.innerHTML = '';
-  sel.size = Math.min(Math.max(runs.length, 1), 6);
+  list.innerHTML = '';
   for (const r of runs) {
-    const opt = document.createElement('option');
-    opt.value = r.name;
-    const dt = new Date(r.mtime * 1000).toISOString().slice(0, 19).replace('T', ' ');
-    opt.textContent = `${r.name}  (${dt})`;
-    if (prev.has(r.name)) opt.selected = true;
-    sel.appendChild(opt);
+    const dt = new Date(r.mtime * 1000).toISOString().slice(5, 16).replace('T', ' ');
+    const id = 'run_' + r.name.replace(/[^a-z0-9]/gi, '_');
+    const lbl = document.createElement('label');
+    lbl.title = r.path;
+    lbl.innerHTML = `<input type="checkbox" data-run="${r.name}" id="${id}"${prev.has(r.name) ? ' checked' : ''}> <span style="font-weight:500">${r.name}</span> <span style="color:#7d8590;font-size:11px">${dt}</span>`;
+    list.appendChild(lbl);
   }
   if (runs.length === 0) {
     document.getElementById('empty-banner').style.display = 'inline';
     selectedRuns = [];
+    document.getElementById('runs-count').textContent = '0 selected';
     return;
   }
   document.getElementById('empty-banner').style.display = 'none';
   // auto-select most recent if nothing currently selected
-  if (![...sel.options].some(o => o.selected)) sel.options[0].selected = true;
-  selectedRuns = [...sel.selectedOptions].map(o => o.value);
+  if (selectedRuns.length === 0 || !runs.some(r => prev.has(r.name))) {
+    list.querySelector('input[data-run]').checked = true;
+  }
+  syncSelectedRuns();
+}
+
+function syncSelectedRuns() {
+  selectedRuns = [...document.querySelectorAll('#run-list input[data-run]:checked')].map(el => el.dataset.run);
+  document.getElementById('runs-count').textContent = `${selectedRuns.length} selected`;
+}
+
+function toggleAllRuns(on) {
+  document.querySelectorAll('#run-list input[data-run]').forEach(el => el.checked = on);
+  syncSelectedRuns();
+  refreshAll();
 }
 
 async function refreshAll() {
@@ -652,8 +673,9 @@ async function runSQL() {
   }
 }
 
-document.getElementById('run-select').addEventListener('change', async e => {
-  selectedRuns = [...e.target.selectedOptions].map(o => o.value);
+document.getElementById('run-list').addEventListener('change', async e => {
+  if (!e.target.matches('input[data-run]')) return;
+  syncSelectedRuns();
   await refreshAll();
 });
 document.getElementById('img-tag').addEventListener('change', loadImageEpochs);
