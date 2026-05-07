@@ -626,6 +626,16 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         if curriculum_schedule:
             print(f"curriculum: custom schedule — {sorted(curriculum_schedule.keys())}")
 
+    # Curriculum keys -> loss_fn attribute names. Constructor uses the long
+    # names but stores into short attrs (e.g. repulsion_weight -> self.rep_w),
+    # so hasattr() on the long name is False and the curriculum was a silent
+    # no-op for these. Map them.
+    _curriculum_attr_aliases = {
+        "repulsion_weight":  "rep_w",
+        "count_weight":      "count_w",
+        "convexity_weight":  "convex_w",
+        "dist_weight":       "dist_w",
+    }
     def _apply_curriculum(epoch_1based: int) -> None:
         for name, spec in curriculum_schedule.items():
             s_ep = float(spec.get("start_epoch", 0))
@@ -635,8 +645,15 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             t = (epoch_1based - 1 - s_ep) / max(1e-9, e_ep - s_ep)
             t = max(0.0, min(1.0, t))
             v = s_v + (e_v - s_v) * t
-            if hasattr(loss_fn, name):
-                setattr(loss_fn, name, v)
+            attr = _curriculum_attr_aliases.get(name, name)
+            if hasattr(loss_fn, attr):
+                setattr(loss_fn, attr, v)
+            else:
+                # Fail loud — silent no-op was the bug for repulsion/count/convex.
+                if epoch_1based == 1:
+                    print(f"  WARN: curriculum key '{name}' has no loss_fn attribute "
+                          f"(tried '{attr}'); skipping. Available: w_hm w_cxy w_wh "
+                          f"rep_w count_w convex_w dist_w")
     opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
