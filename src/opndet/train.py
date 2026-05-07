@@ -434,13 +434,17 @@ def _bundle_run(out_dir: Path, include_tb: bool = False) -> Path | None:
         print(f"bundle failed: {e}")
         return None
 
-    # Auto-download from a subprocess (`!opndet train ...`) doesn't work — the
-    # subprocess has no IPython kernel context, so files.download() fails with
-    # 'NoneType' object has no attribute 'kernel'. Detect Colab env and print a
-    # one-liner the user runs in a separate cell instead.
-    if Path("/content").exists() or "COLAB_GPU" in os.environ:
-        print(f"colab: download from a new cell with:")
-        print(f"    from google.colab import files; files.download('{bundle}')")
+    # Auto-download — works when training is invoked in-process from a notebook
+    # cell (`from opndet.train import train; train('cfg.yaml')`) because the
+    # IPython kernel context is available. Fails silently for subprocess
+    # invocations (`!opndet train ...`) since `files.download` needs the kernel.
+    try:
+        from google.colab import files  # type: ignore
+        files.download(str(bundle))
+    except ImportError:
+        pass  # not on Colab
+    except Exception:
+        pass  # subprocess without kernel; bundle is still on disk at `bundle`
     return bundle
 
 
