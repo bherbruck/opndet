@@ -103,18 +103,29 @@ def _draw_pred(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, conf: float)
     cv2.putText(img, label, (x1 + 1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 0, 0), 1, cv2.LINE_AA)
 
 
-def save_prior_overlay_png(prior_full: np.ndarray, path: str) -> None:
-    """Save the prior heatmap as a JET-colored PNG with per-pixel alpha
-    proportional to the prior amplitude. Dashboard's CSS opacity slider then
-    composites this on top of the RGB base — fully transparent where
-    prior=0, full opacity where prior=1.
+def save_heatmap_overlay_png(
+    value: np.ndarray,
+    path: str,
+    colormap: int = cv2.COLORMAP_JET,
+    gamma: float = 1.0,
+) -> None:
+    """Heatmap → BGRA PNG. Per-pixel alpha = value^gamma. gamma < 1 boosts
+    low values' visibility without dilating the actual signal — useful for
+    sparse fields like the post-peak-suppression obj heatmap where most
+    cells are 0 and the genuine peaks are single pixels.
     """
-    p = np.clip(prior_full.astype(np.float32), 0.0, 1.0)
+    p = np.clip(value.astype(np.float32), 0.0, 1.0)
     h = (p * 255).astype(np.uint8)
-    color_bgr = cv2.applyColorMap(h, cv2.COLORMAP_JET)  # BGR
-    alpha = (p * 255).astype(np.uint8)
+    color_bgr = cv2.applyColorMap(h, colormap)
+    alpha_p = np.power(p, gamma) if gamma != 1.0 else p
+    alpha = (np.clip(alpha_p, 0.0, 1.0) * 255).astype(np.uint8)
     bgra = np.dstack([color_bgr, alpha])
     cv2.imwrite(str(path), bgra)
+
+
+def save_prior_overlay_png(prior_full: np.ndarray, path: str) -> None:
+    """Smooth prior — JET, linear alpha."""
+    save_heatmap_overlay_png(prior_full, path, colormap=cv2.COLORMAP_JET, gamma=1.0)
 
 
 @torch.no_grad()
@@ -164,13 +175,15 @@ def save_layered_vis(
             save_prior_overlay_png(prior_full, str(prior_path))
 
         # Model output heatmap: channel 0 is the post-peak-suppression obj
-        # probability at stride-4. Upsample to input H/W and save with the
-        # same JET+alpha treatment as the prior so the dashboard can blend
-        # it in as another overlay layer.
+        # probability at stride-4. Upsample to input H/W. Use TURBO (more
+        # vivid than JET on dark backgrounds) and gamma=0.4 alpha-boost so
+        # the genuine sub-1-pixel peaks are actually visible — no dilate,
+        # so size of each peak stays accurate.
         obj_stride = out_np[i, 0]
-        obj_full = cv2.resize(obj_stride, (W, H), interpolation=cv2.INTER_LINEAR)
+        obj_full = cv2.resize(obj_stride, (W, H), interpolation=cv2.INTER_NEAREST)
         obj_path = out_sub / f"sample_{i}_obj_heat.png"
-        save_prior_overlay_png(obj_full, str(obj_path))
+        save_heatmap_overlay_png(obj_full, str(obj_path),
+                                  colormap=cv2.COLORMAP_TURBO, gamma=0.4)
 
         if db is None:
             continue

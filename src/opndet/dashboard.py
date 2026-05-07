@@ -1300,11 +1300,24 @@ function rerenderOverlays() {
   });
 }
 
-// Lightbox: build fresh stage with explicit sizing so the canvas + overlays
-// scale exactly with the base img (cloning the grid card lost the .img-card
-// CSS rules, leaving the canvas at its natural-pixel size while the img was
-// scaled — boxes drew off the image).
+// Lightbox: render layers stacked on top of each other (NOT tiled). CSS
+// grid with all children sharing one named area is the most reliable way
+// to overlay images + canvas — every child fills the same grid cell, and
+// the cell sizes itself to the base image because that's the largest /
+// only auto-sized child.
+let _lightboxCardIndex = 0;
+let _lightboxCards = [];
+
 function openLightbox(card) {
+  // Compute the navigable card list and remember our position in it for
+  // arrow-key paging.
+  _lightboxCards = [...document.querySelectorAll('.img-card')];
+  _lightboxCardIndex = _lightboxCards.indexOf(card);
+  if (_lightboxCardIndex < 0) _lightboxCardIndex = 0;
+  showLightboxCard(card);
+}
+
+function showLightboxCard(card) {
   const lb = document.getElementById('lightbox');
   const stage = document.getElementById('lightbox-stage');
   const cap = document.getElementById('lightbox-caption');
@@ -1312,17 +1325,15 @@ function openLightbox(card) {
 
   const s = card._sample;
 
-  // Wrapper sizes itself to the loaded image's natural aspect ratio. Setting
-  // max-w/max-h on the BASE image is what determines the displayed size;
-  // the wrapper inherits it via inline-block layout. Overlays + canvas use
-  // width/height: 100% so they always match the base image's display box,
-  // regardless of zoom/window size.
+  // CSS grid with one cell — every child gets grid-area: 1/1 and stacks.
   const wrap = document.createElement('div');
-  wrap.style.cssText = 'position:relative;display:inline-block;line-height:0';
+  wrap.style.cssText = 'display:grid;grid-template-columns:auto;grid-template-rows:auto;line-height:0';
 
   const baseImg = document.createElement('img');
   baseImg.src = s.rgb_url;
-  baseImg.style.cssText = 'display:block;max-width:98vw;max-height:92vh;width:auto;height:auto';
+  // Base image controls the cell size via max-w / max-h. width:auto / height:auto
+  // preserves aspect ratio.
+  baseImg.style.cssText = 'grid-area:1/1;display:block;max-width:96vw;max-height:88vh;width:auto;height:auto';
   wrap.appendChild(baseImg);
 
   for (const ov of s.overlays) {
@@ -1330,16 +1341,18 @@ function openLightbox(card) {
     img.src = ov.url;
     img.dataset.kind = ov.kind;
     img.className = 'overlay';
-    img.style.cssText = `position:absolute;inset:0;width:100%;height:100%;opacity:${overlayOpacityFor(ov.kind)};pointer-events:none`;
+    // Same grid cell as base; width/height:100% snaps the overlay to the
+    // base image's actual rendered size.
+    img.style.cssText = `grid-area:1/1;width:100%;height:100%;opacity:${overlayOpacityFor(ov.kind)};pointer-events:none`;
     wrap.appendChild(img);
   }
 
   const cv = document.createElement('canvas');
-  cv.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:auto';
+  cv.style.cssText = 'grid-area:1/1;width:100%;height:100%;pointer-events:auto';
   wrap.appendChild(cv);
 
   stage.appendChild(wrap);
-  cap.textContent = `${card._runName || ''} sample ${s.sample_idx} — esc / click outside to close`;
+  cap.textContent = `${card._runName || ''} sample ${s.sample_idx}  ·  ${_lightboxCardIndex + 1}/${_lightboxCards.length}  ·  ←/→ navigate · esc close`;
 
   const draw = () => {
     cv.width = baseImg.naturalWidth;
@@ -1352,13 +1365,23 @@ function openLightbox(card) {
   lb.style.display = 'flex';
 }
 
+function lightboxStep(delta) {
+  if (_lightboxCards.length === 0) return;
+  _lightboxCardIndex = (_lightboxCardIndex + delta + _lightboxCards.length) % _lightboxCards.length;
+  showLightboxCard(_lightboxCards[_lightboxCardIndex]);
+}
+
 document.getElementById('lightbox').addEventListener('click', e => {
   if (e.target.id === 'lightbox' || e.target.id === 'lightbox-caption') {
     e.currentTarget.style.display = 'none';
   }
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') document.getElementById('lightbox').style.display = 'none';
+  const lb = document.getElementById('lightbox');
+  if (lb.style.display !== 'flex') return;
+  if (e.key === 'Escape') lb.style.display = 'none';
+  else if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); lightboxStep(1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); lightboxStep(-1); }
 });
 
 async function runSQL() {
