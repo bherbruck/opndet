@@ -561,8 +561,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     # end_epoch = end_value.
     curriculum_cfg = c.get("curriculum")
     curriculum_schedule: dict[str, dict] = {}
+    _curriculum_epochs = int(c.get("epochs", 100))   # `epochs` not yet bound here
     if curriculum_cfg == "warmup_wh":
-        warmup_end = max(1, int(epochs * 0.20))
+        warmup_end = max(1, int(_curriculum_epochs * 0.20))
         curriculum_schedule = {
             "w_wh":  {"start_epoch": 0, "end_epoch": warmup_end,
                       "start_value": 0.0, "end_value": float(loss_fn.w_wh)},
