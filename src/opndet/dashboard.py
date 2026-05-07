@@ -52,11 +52,41 @@ def _discover_runs(root: Path) -> dict[str, Path]:
 
 
 def _open_db(run_dir: Path):
+    """Open the run's metrics.duckdb for read.
+
+    DuckDB takes a process-level file lock even in read_only=True mode, and
+    the writer (training process) holds it for the entire run. So we read
+    from a shadow copy in /tmp keyed by mtime — refreshed lazily when the
+    source file changes. Tradeoff: dashboard sees a snapshot from up to
+    one request ago, never blocks on the writer.
+    """
     import duckdb
-    db = run_dir / "metrics.duckdb"
-    if not db.exists():
+    import shutil
+    src = run_dir / "metrics.duckdb"
+    if not src.exists():
         raise HTTPException(404, f"metrics.duckdb missing in {run_dir}")
-    return duckdb.connect(str(db), read_only=True)
+    shadow_root = Path("/tmp") / "opndet_dash_shadow"
+    shadow_root.mkdir(parents=True, exist_ok=True)
+    # one shadow file per run dir; encode the resolved path so different
+    # runs (or the same name in different roots) don't collide.
+    import hashlib
+    key = hashlib.sha1(str(run_dir.resolve()).encode()).hexdigest()[:16]
+    shadow = shadow_root / f"{run_dir.name}_{key}.duckdb"
+    # Always copy: DuckDB uses a WAL whose updates don't always bump the
+    # main file's mtime, so an mtime-based cache misses recent commits.
+    # Files are small (KB–few MB); copy is sub-ms.
+    try:
+        shutil.copy2(src, shadow)
+        wal = src.with_suffix(".duckdb.wal")
+        wal_shadow = shadow.with_suffix(".duckdb.wal")
+        if wal.exists():
+            shutil.copy2(wal, wal_shadow)
+        elif wal_shadow.exists():
+            wal_shadow.unlink()  # stale WAL after writer checkpointed
+    except Exception as e:
+        if not shadow.exists():
+            raise HTTPException(503, f"metrics.duckdb temporarily unavailable: {e}")
+    return duckdb.connect(str(shadow), read_only=True)
 
 
 def build_app(root_dir: Path) -> FastAPI:
