@@ -232,6 +232,7 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
     #   count_off_by_le1: fraction of images where |n_pred - n_gt| <= 1
     from opndet.metrics import center_match
     cm_match_total = cm_pred_total = cm_gt_total = 0
+    cm_dup_total = cm_ghost_total = 0
     cm_dists_px: list[np.ndarray] = []
     cm_dists_frac: list[np.ndarray] = []
     cnt_off_le1 = 0
@@ -245,12 +246,23 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
         cm_match_total += m["n_match"]
         cm_pred_total += m["n_pred"]
         cm_gt_total   += m["n_gt"]
+        cm_dup_total  += m.get("n_dup", 0)
+        cm_ghost_total += m.get("n_ghost", 0)
         if m["distances_px"].size > 0:
             cm_dists_px.append(m["distances_px"])
             cm_dists_frac.append(m["distances_frac"])
     center_recall    = cm_match_total / max(1, cm_gt_total)
     center_precision = cm_match_total / max(1, cm_pred_total)
     center_f1 = 2 * center_recall * center_precision / max(1e-9, center_recall + center_precision)
+    # Lenient flavor: duplicates (pred near or enclosing a real GT) are
+    # treated as not-FPs. Only ghost detections (phantoms in empty frame
+    # space) count against precision. This matches the deployment KPI:
+    # "no false positives where there's nothing there" — duplicates are
+    # ugly but not wrong.
+    center_precision_lenient = (cm_match_total + cm_dup_total) / max(1, cm_pred_total)
+    center_f1_lenient = 2 * center_recall * center_precision_lenient / max(1e-9, center_recall + center_precision_lenient)
+    center_ghost_rate = cm_ghost_total / max(1, cm_pred_total)
+    center_dup_rate   = cm_dup_total / max(1, cm_pred_total)
     # Noise-floor-aware tier rates. The model can only place a center at a
     # stride-cell, with sub-cell offset regression — so anything within
     # stride/2 px of GT center IS already "perfectly on cell" given the
@@ -314,6 +326,10 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
             "center_recall": float(center_recall),
             "center_precision": float(center_precision),
             "center_f1": float(center_f1),
+            "center_precision_lenient": float(center_precision_lenient),
+            "center_f1_lenient": float(center_f1_lenient),
+            "center_ghost_rate": float(center_ghost_rate),
+            "center_dup_rate": float(center_dup_rate),
             # Bbox-relative distances (primary — survive image-size changes).
             # Units: fraction of min(gt_w, gt_h). 0.0 = on center, 0.5 = on
             # smaller-side edge, >1.0 = outside the bbox.
@@ -719,7 +735,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     metric_for_best = str(c.get("metric_for_best", "f1"))
     valid_metrics = ("f1", "map50", "map_50_95", "f1_opt",
                      "f1_cal", "map50_cal", "map_50_95_cal", "f1_opt_cal",
-                     "center_f1", "center_recall")
+                     "center_f1", "center_f1_lenient", "center_recall")
     if metric_for_best not in valid_metrics:
         raise ValueError(f"metric_for_best must be one of {valid_metrics}, got {metric_for_best}")
     metric_is_cal = metric_for_best.endswith("_cal")
@@ -804,7 +820,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         _t_val = time.time() - _t_phase
         cur_lr = opt.param_groups[0]["lr"]
         print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  (train {dt:.1f}s val {_t_val:.1f}s)")
-        print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} F1={m['center_f1']:.3f}  hit-rate(perfect/1cell/2cell)={m['center_perfect_rate']:.1%}/{m['center_within_1cell']:.1%}/{m['center_within_2cell']:.1%}  dist(frac p50={m['center_dist_p50']:.3f} p95={m['center_dist_p95']:.3f})  count±1={m['count_off_le1_frac']:.1%}")
+        print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} (lenient {m['center_precision_lenient']:.3f}) F1={m['center_f1']:.3f} (lenient {m['center_f1_lenient']:.3f})  ghost={m['center_ghost_rate']:.1%} dup={m['center_dup_rate']:.1%}  hit(perf/1c/2c)={m['center_perfect_rate']:.1%}/{m['center_within_1cell']:.1%}/{m['center_within_2cell']:.1%}  count±1={m['count_off_le1_frac']:.1%}")
 
         ep = epoch + 1
         writer.add_scalar("lr", cur_lr, ep)

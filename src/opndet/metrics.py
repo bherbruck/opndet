@@ -182,24 +182,76 @@ def center_match(
     dx = pcx[:, None] - gcx[None, :]
     dy = pcy[:, None] - gcy[None, :]
     dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+
+    # Containment: does the predicted bbox enclose the GT center?
+    # If yes, count as a match even if pred and GT centers are far apart
+    # (e.g. pred is loose but covers the right egg). Per user: "if the GT
+    # center is enclosed in our heatmap peak, we should claim 100%
+    # precision for that."
+    gt_inside_pred = (
+        (pred_boxes[:, 0:1] <= gcx[None, :]) &
+        (pred_boxes[:, 2:3] >= gcx[None, :]) &
+        (pred_boxes[:, 1:2] <= gcy[None, :]) &
+        (pred_boxes[:, 3:4] >= gcy[None, :])
+    )
+
     cost = dist.copy()
-    forbidden = dist > radii[None, :]
+    # Forbid a pair only if it's BOTH out of center radius AND not containing
+    # the GT center. Either condition alone keeps it eligible.
+    forbidden = (dist > radii[None, :]) & ~gt_inside_pred
     cost[forbidden] = 1e9
     from scipy.optimize import linear_sum_assignment
     row, col = linear_sum_assignment(cost)
     valid = cost[row, col] < 1e8
     n_match = int(valid.sum())
     matched_d_px = dist[row[valid], col[valid]]
-    # Bbox-relative distance: dist_px / min(gt_w, gt_h). 0 = exactly on
-    # center, 0.5 = on the edge of the smaller bbox side, >1 = outside.
-    # Survives changes in image size — the pixel version doesn't.
     matched_min_side = np.minimum(gw[col[valid]], gh[col[valid]])
     matched_d_frac = matched_d_px / np.maximum(matched_min_side, 1.0)
-    p = n_match / max(1, n_pred)
-    r = n_match / max(1, n_gt)
-    f1 = 2 * p * r / max(1e-9, p + r)
-    return {"recall": float(r), "precision": float(p), "f1": float(f1),
-            "n_match": n_match, "n_pred": n_pred, "n_gt": n_gt,
+
+    # Ghost vs duplicate split for unmatched preds.
+    #   Hungarian assigns each GT to at most one pred. The other preds
+    #   landing on the SAME object's stride cluster get tagged as FPs in
+    #   strict precision — but they're "duplicate detections of a real
+    #   thing", not ghosts. Real ghosts are unmatched preds whose nearest
+    #   GT center is FAR from any GT (outside its match radius).
+    matched_pred = set(int(r) for r, v in zip(row, valid) if v)
+    unmatched_pred_mask = np.ones(n_pred, dtype=bool)
+    for i in matched_pred:
+        unmatched_pred_mask[i] = False
+    n_dup = n_ghost = 0
+    if unmatched_pred_mask.any():
+        u_dist = dist[unmatched_pred_mask]                       # (n_unmatched, n_gt)
+        u_in_pred = gt_inside_pred[unmatched_pred_mask]          # (n_unmatched, n_gt)
+        nearest_gt = np.argmin(u_dist, axis=1)
+        nearest_d = u_dist[np.arange(u_dist.shape[0]), nearest_gt]
+        nearest_r = radii[nearest_gt]
+        near_match = nearest_d <= nearest_r
+        has_gt_inside = u_in_pred.any(axis=1)
+        # Duplicate: pred lands near a real egg (within radius OR encloses
+        # a GT center) — same target detected twice. Real ghost: far from
+        # any GT center AND no GT inside the pred bbox — phantom detection
+        # in empty frame space.
+        is_dup = near_match | has_gt_inside
+        n_dup = int(is_dup.sum())
+        n_ghost = int((~is_dup).sum())
+
+    p_strict  = n_match / max(1, n_pred)
+    p_lenient = (n_match + n_dup) / max(1, n_pred)        # treat dups as not-ghosts
+    r_metric  = n_match / max(1, n_gt)
+    f1_strict  = 2 * p_strict  * r_metric / max(1e-9, p_strict + r_metric)
+    f1_lenient = 2 * p_lenient * r_metric / max(1e-9, p_lenient + r_metric)
+    ghost_rate = n_ghost / max(1, n_pred)
+    duplicate_rate = n_dup / max(1, n_pred)
+
+    return {"recall": float(r_metric),
+            "precision": float(p_strict),
+            "f1": float(f1_strict),
+            "precision_lenient": float(p_lenient),
+            "f1_lenient": float(f1_lenient),
+            "ghost_rate": float(ghost_rate),
+            "duplicate_rate": float(duplicate_rate),
+            "n_match": n_match, "n_dup": n_dup, "n_ghost": n_ghost,
+            "n_pred": n_pred, "n_gt": n_gt,
             "distances_px": matched_d_px,
             "distances_frac": matched_d_frac.astype(np.float32),
             "radii_px": radii}
