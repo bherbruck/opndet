@@ -817,21 +817,33 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs) and _should_fire(last_vis_epoch):
             _t_phase = time.time()
+            # Vis through the EMA shadow + current T applied → what the
+            # deployed (calibrated) model actually outputs. Without this,
+            # peaks land at raw-sigmoid values (~0.5–0.85) and the obj
+            # heatmap looks dim. With T applied (typically ~0.3–0.5 for
+            # this dataset) peaks saturate near 1.0 like the bbox-x
+            # teacher checkpoint shows.
+            from opndet.calibrate import apply_temperature as _apply_T
+            vis_T = float(cur_T) if cur_T and cur_T != 1.0 else 1.0
+            if vis_T != 1.0:
+                _apply_T(eval_model, vis_T)
             grid = render_predictions(
-                model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
+                eval_model, vis_batch, vis_boxes, img_h, img_w, cfg_shim.stride,
                 threshold=vis_thresh_now, device=device, trails_per=vis_trails,
             )
             writer.add_images("val/preds", grid, ep, dataformats="NCHW")
             if db is not None:
                 from opndet.visualize import save_layered_vis
-                save_layered_vis(model, vis_batch, vis_boxes,
+                save_layered_vis(eval_model, vis_batch, vis_boxes,
                                  img_h, img_w, cfg_shim.stride,
                                  _save_layered_vis_path(out_dir, "val/preds", ep),
                                  db, "val/preds", ep,
                                  threshold=vis_thresh_now, device=device,
                                  trails_per=vis_trails)
+            if vis_T != 1.0:
+                _apply_T(eval_model, 1.0)
             last_vis_epoch = ep
-            print(f"  vis: val/preds rendered ({time.time() - _t_phase:.1f}s)")
+            print(f"  vis: val/preds rendered (T={vis_T:.3f}) ({time.time() - _t_phase:.1f}s)")
         # If EMA is on, save EMA weights as the deployed model — they're the eval-quality ones.
         deployed_state = ema.shadow.state_dict() if ema is not None else model.state_dict()
         ckpt = {

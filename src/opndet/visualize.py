@@ -108,16 +108,35 @@ def save_heatmap_overlay_png(
     path: str,
     colormap: int = cv2.COLORMAP_JET,
     gamma: float = 1.0,
+    normalize: bool = False,
 ) -> None:
-    """Heatmap → BGRA PNG. Per-pixel alpha = value^gamma. gamma < 1 boosts
-    low values' visibility without dilating the actual signal — useful for
-    sparse fields like the post-peak-suppression obj heatmap where most
-    cells are 0 and the genuine peaks are single pixels.
+    """Heatmap → BGRA PNG.
+
+    Per-pixel alpha = value^gamma. gamma < 1 boosts low values' visibility
+    without dilating signal.
+
+    normalize=True: rescale by per-frame max BEFORE the colormap. Forces
+    the strongest cell to map to red regardless of absolute value. Useful
+    for the model's pre-calibration obj heatmap where peaks live at
+    0.2–0.4 (not 0.9+) so the JET/TURBO lookup keeps everything blue/green.
+    Loses absolute-magnitude info but makes "where is the model looking"
+    visually obvious.
+
+    normalize=False: linear 0..1 → colormap. Use for the synth prior or
+    other heatmaps where absolute amplitude is meaningful.
     """
     p = np.clip(value.astype(np.float32), 0.0, 1.0)
-    h = (p * 255).astype(np.uint8)
+    if normalize:
+        m = float(p.max())
+        if m > 1e-6:
+            p_color = p / m
+        else:
+            p_color = p
+    else:
+        p_color = p
+    h = (p_color * 255).astype(np.uint8)
     color_bgr = cv2.applyColorMap(h, colormap)
-    alpha_p = np.power(p, gamma) if gamma != 1.0 else p
+    alpha_p = np.power(p_color, gamma) if gamma != 1.0 else p_color
     alpha = (np.clip(alpha_p, 0.0, 1.0) * 255).astype(np.uint8)
     bgra = np.dstack([color_bgr, alpha])
     cv2.imwrite(str(path), bgra)
@@ -182,6 +201,11 @@ def save_layered_vis(
         obj_stride = out_np[i, 0]
         obj_full = cv2.resize(obj_stride, (W, H), interpolation=cv2.INTER_NEAREST)
         obj_path = out_sub / f"sample_{i}_obj_heat.png"
+        # gamma=0.4 boosts low-value visibility without lying about magnitude.
+        # No per-frame normalize — when the model is properly calibrated
+        # (apply_temperature done before vis in train.py), peaks genuinely
+        # saturate near 1.0 → red. If you ever want a normalized view,
+        # pass normalize=True here.
         save_heatmap_overlay_png(obj_full, str(obj_path),
                                   colormap=cv2.COLORMAP_TURBO, gamma=0.4)
 
