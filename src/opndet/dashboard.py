@@ -153,43 +153,19 @@ def serve(run_dir: str | Path, host: str = "127.0.0.1", port: int = 5000) -> Non
     uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
 
 
-def is_colab() -> bool:
-    """Detect a Google Colab environment."""
-    try:
-        import google.colab  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def embed_colab_iframe(port: int, height: int = 800) -> None:
-    """Embed the dashboard as an iframe in the current Colab cell. Mirrors
-    the same pattern that %tensorboard uses internally. Silent no-op outside
-    Colab so call sites don't need a guard.
-    """
-    if not is_colab():
-        return
-    try:
-        from google.colab import output
-        output.serve_kernel_port_as_iframe(port, height=str(height))
-    except Exception as e:  # best-effort
-        print(f"opndet dashboard: iframe embed failed ({e}); open http://127.0.0.1:{port} manually")
-
-
 def spawn_background(
     run_dir: str | Path,
     host: str = "127.0.0.1",
     port: int = 5000,
-    embed_iframe: bool = True,
     wait_for_ready: float = 1.5,
 ):
-    """Spawn the dashboard as a child process and (when in Colab and
-    embed_iframe=True) auto-embed it as an iframe in the calling notebook
-    cell. Returns the subprocess.Popen so callers can terminate() at exit.
+    """Spawn the dashboard as a child process. Returns the subprocess.Popen
+    so callers can terminate() at exit.
 
-    Prints the URL from the parent process so it shows in the notebook cell
-    output even when invoked from inside a `!opndet train` bash subprocess
-    (where the child's stdout would otherwise be lost).
+    Prints `http://localhost:<port>` to stdout so the URL is visible in any
+    notebook/cell/log. Notebook hosts (Colab, Jupyter, etc.) can surface
+    it however they want — call this from a Python cell and follow up with
+    e.g. google.colab.output.serve_kernel_port_as_window(port).
     """
     import subprocess
     import sys
@@ -199,11 +175,9 @@ def spawn_background(
         "--run", str(run_dir), "--host", host, "--port", str(port),
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"opndet dashboard: http://{host}:{port}", flush=True)
+    print(f"opndet dashboard: http://localhost:{port}", flush=True)
     if wait_for_ready > 0:
         time.sleep(wait_for_ready)
-    if embed_iframe:
-        embed_colab_iframe(port)
     return proc
 
 
