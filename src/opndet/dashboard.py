@@ -949,10 +949,21 @@ async function loadImageEpochs() {
 async function loadImages() {
   const tag = document.getElementById('img-tag').value;
   const ep = document.getElementById('img-ep').value;
-  if (!tag || !ep) return;
-  const samples = await api(`/api/samples?tag=${encodeURIComponent(tag)}&ep=${ep}` + qrun());
   const grid = document.getElementById('image-grid');
   grid.innerHTML = '';
+  if (!tag || !ep) {
+    grid.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">no tag/epoch selected</div>`;
+    return;
+  }
+  const samples = await api(`/api/samples?tag=${encodeURIComponent(tag)}&ep=${ep}` + qrun());
+  if (!samples) {
+    grid.innerHTML = `<div style="color:#ff6b35;font-size:12px;padding:8px">/api/samples returned null — check DevTools network tab</div>`;
+    return;
+  }
+  if (samples.length === 0) {
+    grid.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">0 samples for ${tag} @ epoch ${ep}</div>`;
+    return;
+  }
   for (const s of samples) renderSample(grid, s);
 }
 
