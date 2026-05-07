@@ -19,7 +19,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
     from opndet.presets import resolve
 
     if args.model:
-        from opndet.export import _InputNormalizer
+        from opndet.export import _DiagnosticWrapper, _InputNormalizer
         from opndet.yaml_build import build_model_from_yaml
         m = build_model_from_yaml(resolve(args.model)).eval()
         if args.ckpt:
@@ -33,6 +33,14 @@ def _cmd_export(args: argparse.Namespace) -> int:
                 print(f"baking calibration temperature T={T:.4f} into the graph")
         import torch
         c, h, w = m.input_shape
+        diag_names: list[str] = []
+        if args.diagnostic:
+            with torch.no_grad():
+                cache = m._run(torch.zeros(1, c, h, w))
+            for name, idx in sorted(m.aliases.items(), key=lambda kv: kv[1]):
+                if cache[idx].ndim == 4:
+                    diag_names.append(name)
+            m = _DiagnosticWrapper(m, diag_names).eval()
         if args.bake_input_norm:
             if c != 3:
                 print(f"FAIL: --bake-input-norm only supports 3-ch models; this model has in_ch={c} "
@@ -45,11 +53,20 @@ def _cmd_export(args: argparse.Namespace) -> int:
             dummy = torch.randn(1, c, h, w)
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        output_names = ["output"] + diag_names
         torch.onnx.export(m, dummy, str(out_path),
-                          input_names=["image"], output_names=["output"],
+                          input_names=["image"], output_names=output_names,
                           opset_version=args.opset, do_constant_folding=True,
                           dynamic_axes=None, dynamo=False)
-        print(f"exported: {out_path}{' (with input norm baked in: expects raw 0-255)' if args.bake_input_norm else ''}")
+        suffix_parts = []
+        if args.bake_input_norm:
+            suffix_parts.append("with input norm baked in: expects raw 0-255")
+        if args.diagnostic:
+            suffix_parts.append(f"diagnostic: +{len(diag_names)} layer outputs")
+        suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
+        print(f"exported: {out_path}{suffix}")
+        if args.diagnostic:
+            print(f"  diagnostic outputs: {diag_names}")
         return 0
 
     cfg = ModelConfig()
@@ -246,6 +263,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="Prepend ImageNet mean/std normalization to the graph. "
                          "Use for embedded deployment (depthai, OpenVINO) that "
                          "passes raw uint8 0-255 RGB frames without preprocessing.")
+    pe.add_argument("--diagnostic", action="store_true",
+                    help="Expose every named 4D layer activation as an additional ONNX output. "
+                         "Used by the webui's explain mode (per-layer activation slider). "
+                         "Production graph (no flag) is unchanged.")
     pe.set_defaults(func=_cmd_export)
 
     pp = sub.add_parser("predict", help="Run inference on an image or video")

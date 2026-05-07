@@ -102,6 +102,26 @@
       <label style="margin-top:10px"><input type="checkbox" id="bakedNorm" checked /> ONNX has input norm baked in (--bake-input-norm)</label>
     </fieldset>
 
+    <fieldset id="explainFs">
+      <legend>Explain</legend>
+      <label style="margin-top:0"><input type="checkbox" id="explainOn" /> enable explain mode</label>
+      <div id="explainBody" style="display:none">
+        <div class="small" id="explainStatus" style="margin:6px 0">load a diagnostic ONNX (export with <code>--diagnostic</code>) to see per-layer activations.</div>
+
+        <label style="margin-top:8px">Layer: <span id="layerName" class="v" style="color:var(--fg)">—</span></label>
+        <input id="layerSlider" type="range" min="0" max="0" value="0" disabled />
+        <div class="small" id="layerInfo" style="margin-top:4px; font-family:ui-monospace,Menlo,monospace">—</div>
+
+        <label style="margin-top:10px">Overlay alpha: <span id="alphaVal">0.55</span></label>
+        <input id="alpha" type="range" min="0" max="1" step="0.05" value="0.55" />
+
+        <label style="margin-top:10px"><input type="checkbox" id="clickAttribOn" /> click canvas → occlusion attribution</label>
+        <div class="small" style="margin-top:4px">~30 forward passes per click; works with any ONNX (not just diagnostic).</div>
+        <button id="clearOverlay" class="secondary" style="margin-top:8px">Clear overlay</button>
+        <div class="small" id="attribStatus" style="margin-top:6px">—</div>
+      </div>
+    </fieldset>
+
     <fieldset>
       <legend>Stats</legend>
       <div class="stats" id="stats">
@@ -155,6 +175,17 @@ const els = {
   sFps: document.getElementById("sFps"),
   sObjMax: document.getElementById("sObjMax"),
   sDets: document.getElementById("sDets"),
+  explainOn: document.getElementById("explainOn"),
+  explainBody: document.getElementById("explainBody"),
+  explainStatus: document.getElementById("explainStatus"),
+  layerSlider: document.getElementById("layerSlider"),
+  layerName: document.getElementById("layerName"),
+  layerInfo: document.getElementById("layerInfo"),
+  alpha: document.getElementById("alpha"),
+  alphaVal: document.getElementById("alphaVal"),
+  clickAttribOn: document.getElementById("clickAttribOn"),
+  clearOverlay: document.getElementById("clearOverlay"),
+  attribStatus: document.getElementById("attribStatus"),
 };
 
 let session = null;
@@ -165,6 +196,12 @@ let webcamStream = null;
 let webcamRAF = null;
 let lastImage = null;   // ImageData / HTMLImageElement / VideoFrame
 const fpsBuf = [];
+
+// explain-mode state
+let lastOutputs = null;       // dict: outputName -> ort.Tensor (last forward)
+let layerNames = [];          // diagnostic layer names (excludes "output")
+let activeOverlay = null;     // ImageData of overlay heatmap, or null
+let attribBusy = false;
 
 const IMAGENET_MEAN = [0.485, 0.456, 0.406];
 const IMAGENET_STD  = [0.229, 0.224, 0.225];
@@ -178,6 +215,27 @@ els.bakedNorm.oninput = () => { if (lastImage) runOn(lastImage); };
 document.getElementById("ep").onchange = () => {
   if (els.onnxFile.files[0]) els.onnxFile.onchange({ target: els.onnxFile });
 };
+
+// explain-mode handlers
+els.explainOn.onchange = () => {
+  els.explainBody.style.display = els.explainOn.checked ? "" : "none";
+  if (!els.explainOn.checked) { activeOverlay = null; if (lastImage) renderFromCache(); }
+  refreshExplainUI();
+};
+els.alpha.oninput = () => {
+  els.alphaVal.textContent = parseFloat(els.alpha.value).toFixed(2);
+  rebuildLayerOverlay();
+};
+els.layerSlider.oninput = () => { rebuildLayerOverlay(); };
+els.clearOverlay.onclick = () => {
+  activeOverlay = null;
+  els.attribStatus.textContent = "—";
+  if (lastImage) renderFromCache();
+};
+els.clickAttribOn.onchange = () => {
+  canvas.style.cursor = els.clickAttribOn.checked ? "crosshair" : "default";
+};
+canvas.addEventListener("click", onCanvasClick);
 
 // Mobile: collapsible controls panel
 const aside = document.querySelector("aside");
@@ -224,6 +282,12 @@ els.onnxFile.onchange = async (e) => {
     els.modelInfo.innerHTML = `<span class="ok">OK</span> · ${f.name} · ep <code>${epUsed}</code> · input <code>${inp}</code> shape <code>[${modelInputShape}]</code>`;
     els.sModel.textContent = `${f.name} (${epUsed})`;
     els.sInput.textContent = `${modelInputShape}`;
+
+    // Detect diagnostic outputs: anything beyond the first (which we treat as the production "output").
+    const outNames = session.outputNames.slice();
+    layerNames = outNames.length > 1 ? outNames.slice(1) : [];
+    refreshExplainUI();
+
     if (lastImage) runOn(lastImage);
   } catch (err) {
     els.modelInfo.innerHTML = `<span class="err">ERR</span> ${err.message}`;
@@ -363,9 +427,12 @@ async function runOn(src) {
   const out = await session.run({ [modelInputName]: tensor });
   const dt = performance.now() - t0;
 
-  const outName = Object.keys(out)[0];
+  // The production output is named "output" if present, else the first output.
+  const outName = ("output" in out) ? "output" : Object.keys(out)[0];
   const o = out[outName];
   const [B, C, H, W] = o.dims;
+
+  lastOutputs = out;
 
   const stride = parseInt(els.stride.value, 10) || 4;
   const threshold = parseFloat(els.threshold.value);
@@ -387,6 +454,10 @@ async function runOn(src) {
   els.sObjMax.textContent = objMax.toFixed(3);
   els.sDets.textContent = dets.length;
 
+  // Refresh layer overlay if explain mode is on (uses freshly captured outputs).
+  if (els.explainOn.checked && layerNames.length > 0) rebuildLayerOverlay();
+  if (activeOverlay) blitOverlay();
+
   drawDetections(dets);
 }
 
@@ -398,6 +469,7 @@ function renderFromCache() {
   const dets = decode(o.data, C, H, W, inputH, inputW, stride, threshold);
   els.sDets.textContent = dets.length;
   if (lastImage) drawLetterbox(lastImage);
+  if (activeOverlay) blitOverlay();
   drawDetections(dets);
 }
 
@@ -445,6 +517,200 @@ function drawDetections(dets) {
     ctx.fillStyle = "#0d1117";
     ctx.fillText(label, d.x1 + 2, d.y1 - 1);
   }
+}
+
+// === Explain mode ===========================================================
+
+function refreshExplainUI() {
+  const on = els.explainOn.checked;
+  if (!on) { return; }
+  if (layerNames.length === 0) {
+    els.explainStatus.innerHTML = `<span class="warn">no diagnostic outputs</span> — re-export with <code>--diagnostic</code> for the layer slider. Click-to-attribute still works.`;
+    els.layerSlider.disabled = true;
+    els.layerSlider.max = 0;
+    els.layerName.textContent = "—";
+    els.layerInfo.textContent = "—";
+    return;
+  }
+  els.explainStatus.innerHTML = `<span class="ok">${layerNames.length} diagnostic layers</span>`;
+  els.layerSlider.disabled = false;
+  els.layerSlider.max = layerNames.length - 1;
+  if (parseInt(els.layerSlider.value) >= layerNames.length) els.layerSlider.value = 0;
+  rebuildLayerOverlay();
+}
+
+// 7-stop Turbo approximation (Mikhail Bouzin's polynomial fit, simplified).
+function turbo(t) {
+  t = Math.max(0, Math.min(1, t));
+  const r = 34.61 + t * (1172.33 - t * (10793.56 - t * (33300.12 - t * (38394.49 - t * 14825.05))));
+  const g = 23.31 + t * (557.33 + t * (1225.33 - t * (3574.96 - t * (1073.77 + t * 707.56))));
+  const b = 27.2 + t * (3211.1 - t * (15327.97 - t * (27814.0 - t * (22569.18 - t * 6838.66))));
+  return [Math.max(0, Math.min(255, r)), Math.max(0, Math.min(255, g)), Math.max(0, Math.min(255, b))];
+}
+
+// Render a (H, W) Float32Array as a Turbo heatmap ImageData at canvas size.
+// Uses nearest-neighbor upsample to (inputW, inputH) — matches the analyze.py choice.
+function renderHeatmapImageData(arr, h, w) {
+  // Find min/max
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  const span = mx - mn;
+  const inv = span > 1e-12 ? 1 / span : 0;
+  const id = ctx.createImageData(inputW, inputH);
+  const px = id.data;
+  // map dest pixel (x,y) -> src cell (sx,sy) via floor
+  const sx_step = w / inputW, sy_step = h / inputH;
+  let didx = 0;
+  for (let y = 0; y < inputH; y++) {
+    const sy = Math.min(h - 1, Math.floor(y * sy_step));
+    const row_off = sy * w;
+    for (let x = 0; x < inputW; x++) {
+      const sx = Math.min(w - 1, Math.floor(x * sx_step));
+      const v = (arr[row_off + sx] - mn) * inv;
+      const [r, g, b] = turbo(v);
+      px[didx++] = r; px[didx++] = g; px[didx++] = b; px[didx++] = 255;
+    }
+  }
+  return id;
+}
+
+// Build layer activation overlay: max-over-channels of selected layer's tensor.
+function rebuildLayerOverlay() {
+  if (!els.explainOn.checked || !lastOutputs || layerNames.length === 0) return;
+  const i = parseInt(els.layerSlider.value) || 0;
+  const name = layerNames[i];
+  const t = lastOutputs[name];
+  if (!t) return;
+  const [B, C, H, W] = t.dims;
+  const N = H * W;
+  // Max over channels.
+  const flat = new Float32Array(N);
+  const data = t.data;
+  for (let c = 0; c < C; c++) {
+    const base = c * N;
+    for (let p = 0; p < N; p++) {
+      const v = Math.abs(data[base + p]);
+      if (v > flat[p]) flat[p] = v;
+    }
+  }
+  activeOverlay = renderHeatmapImageData(flat, H, W);
+  els.layerName.textContent = name;
+  els.layerInfo.textContent = `idx ${i+1}/${layerNames.length} · shape [${B},${C},${H},${W}]`;
+  if (lastImage) renderFromCache();
+}
+
+// Composite activeOverlay onto the canvas with the current alpha.
+function blitOverlay() {
+  if (!activeOverlay) return;
+  const alpha = parseFloat(els.alpha.value);
+  // Pull current image, blend each pixel.
+  const base = ctx.getImageData(0, 0, inputW, inputH);
+  const o = activeOverlay.data;
+  const b = base.data;
+  for (let i = 0; i < b.length; i += 4) {
+    b[i]   = (1 - alpha) * b[i]   + alpha * o[i];
+    b[i+1] = (1 - alpha) * b[i+1] + alpha * o[i+1];
+    b[i+2] = (1 - alpha) * b[i+2] + alpha * o[i+2];
+  }
+  ctx.putImageData(base, 0, 0);
+}
+
+// Build a Float32 tensor from an existing ImageData (the letterboxed canvas)
+// modified by an occlusion patch at (px, py) of size (ph, pw).
+function tensorWithOcclusion(srcImg, px, py, pw, ph) {
+  const N = inputH * inputW;
+  const data = new Float32Array(3 * N);
+  const baked = els.bakedNorm.checked;
+  for (let y = 0; y < inputH; y++) {
+    const insideY = (y >= py && y < py + ph);
+    for (let x = 0; x < inputW; x++) {
+      const idx = y * inputW + x;
+      let r = srcImg[idx * 4 + 0];
+      let g = srcImg[idx * 4 + 1];
+      let b = srcImg[idx * 4 + 2];
+      if (insideY && x >= px && x < px + pw) { r = 114; g = 114; b = 114; }   // gray patch
+      if (baked) {
+        data[idx]         = r;
+        data[idx + N]     = g;
+        data[idx + 2*N]   = b;
+      } else {
+        data[idx]         = (r/255 - IMAGENET_MEAN[0]) / IMAGENET_STD[0];
+        data[idx + N]     = (g/255 - IMAGENET_MEAN[1]) / IMAGENET_STD[1];
+        data[idx + 2*N]   = (b/255 - IMAGENET_MEAN[2]) / IMAGENET_STD[2];
+      }
+    }
+  }
+  return new ort.Tensor("float32", data, [1, 3, inputH, inputW]);
+}
+
+async function runOcclusionAttribution(clickX, clickY) {
+  if (!session || !lastDecodeArgs || !lastImage || attribBusy) return;
+  attribBusy = true;
+  els.attribStatus.innerHTML = `<span class="warn">computing occlusion attribution...</span>`;
+
+  const { o, C, H, W } = lastDecodeArgs;
+  const stride = parseInt(els.stride.value, 10) || 4;
+  // Map the clicked canvas pixel to a target output cell.
+  const cellX = Math.max(0, Math.min(W - 1, Math.floor(clickX / stride)));
+  const cellY = Math.max(0, Math.min(H - 1, Math.floor(clickY / stride)));
+  const planeSize = H * W;
+  const baseScore = o.data[cellY * W + cellX];
+  // If the clicked cell isn't a peak, attribution can still work but is less interpretable.
+
+  // Snapshot the current letterboxed canvas pixels (before any overlays).
+  // The canvas might have an overlay from layer mode — re-letterbox first.
+  drawLetterbox(lastImage);
+  const snap = ctx.getImageData(0, 0, inputW, inputH).data;
+
+  // Build a coarse grid of patches over the whole image.
+  const gridN = 5;   // 5x5 = 25 patches; tune for speed
+  const patchH = Math.ceil(inputH / gridN);
+  const patchW = Math.ceil(inputW / gridN);
+
+  // Score-drop heatmap at output (H, W) resolution, but we accumulate at grid resolution then upsample.
+  const gridScores = new Float32Array(gridN * gridN);
+  const t0 = performance.now();
+
+  for (let gy = 0; gy < gridN; gy++) {
+    for (let gx = 0; gx < gridN; gx++) {
+      const py = gy * patchH;
+      const px = gx * patchW;
+      const tensor = tensorWithOcclusion(snap, px, py, patchW, patchH);
+      const out = await session.run({ [modelInputName]: tensor });
+      const oName = ("output" in out) ? "output" : Object.keys(out)[0];
+      const od = out[oName].data;
+      const s = od[cellY * W + cellX];
+      gridScores[gy * gridN + gx] = Math.max(0, baseScore - s);
+      els.attribStatus.textContent = `occluding patch ${gy * gridN + gx + 1} / ${gridN * gridN}...`;
+    }
+  }
+  const dt = (performance.now() - t0) / 1000;
+
+  activeOverlay = renderHeatmapImageData(gridScores, gridN, gridN);
+  // Mark click point + the target cell as a small green square for clarity.
+  els.attribStatus.innerHTML = `<span class="ok">attribution done</span> · cell (${cellY},${cellX}) base=${baseScore.toFixed(3)} · ${dt.toFixed(1)}s for ${gridN*gridN} occlusions`;
+  attribBusy = false;
+  if (lastImage) renderFromCache();
+  // Highlight clicked spot
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(clickX - 4, clickY - 4, 8, 8);
+}
+
+function onCanvasClick(e) {
+  if (!els.explainOn.checked || !els.clickAttribOn.checked) return;
+  if (!session || !lastImage) return;
+  // Convert client-space click to canvas-pixel space (canvas may be CSS-scaled).
+  const r = canvas.getBoundingClientRect();
+  const sx = canvas.width / r.width;
+  const sy = canvas.height / r.height;
+  const x = (e.clientX - r.left) * sx;
+  const y = (e.clientY - r.top) * sy;
+  runOcclusionAttribution(x, y);
 }
 </script>
 </body>

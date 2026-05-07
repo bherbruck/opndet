@@ -138,6 +138,47 @@ Standard detection losses optimize per-cell BCE/focal + per-cell box regression.
 
 Listed under Part 2 architecturally but elevated to high priority. Pluggable label loaders (the `format:` field in `data.sources`) ship as the foundation; `opndet sam-obb` CLI generates labels from any AABB-annotated dataset; `opndet-bbox-x-obb` preset trains the rotated-output variant. AABB → OBB unblocks fair mAP@.5:.95 evaluation on rotated convex objects and replaces convexity loss with shape-aware heatmap supervision. Full plan in 2.1.
 
+### 1.7 Grad-CAM-driven hard-negative mining — **HIGH PRIORITY**
+
+A targeted attack on the residual ghost-rate. Instead of architectural changes (which `opndet analyze` already shows are doing fine), train DIRECTLY against the model's actual failure modes by mining its own false positives.
+
+**Why this is high priority:** Residual ghost rate at convergence is ~1-2%, dominated by phantom detections on shadows / dust / texture artifacts the model has never seen labeled as "not an egg." Architectural fixes (k=7 peak suppression, repulsion baseline-subtract, focal_beta tuning) won't move this number further — it's a *training-data gap*, not a *model-capacity gap*. The model has the architecture to ignore these patterns; it just hasn't been told to.
+
+**Plan:**
+
+1. **Mine FPs from val** — given a trained ckpt and val set, run inference, identify all unmatched-to-GT predictions whose score is above eval_threshold. These are the model's actual ghosts in deployment.
+
+2. **Compute attribution per ghost** — use the existing `opndet analyze` Grad-CAM pipeline. For each ghost, the input-gradient saliency map shows which input pixels drove the prediction. Crop the high-attribution region (e.g., a 32×32 patch centered on the gradient peak) — this is the "false reason."
+
+3. **Cluster the false-reason patches** — K-means on raw pixels OR on a feature embedding (e.g., the model's own backbone features at that patch). K=10-20 clusters typically. Each cluster center represents a category of false reason (likely: shadow, dust speck, packaging texture, light reflection, partial-occluded background, etc.).
+
+4. **Generate hard-negative augmentation pool** — save cluster representatives + a sampling of patches from each cluster. Tag with cluster label so the user can inspect ("oh, cluster 3 is shadows under egg trays — that's the dominant FP cause").
+
+5. **Inject as training augmentation** — add an aug step `--hard-negative-pool <dir>`: with probability `p`, paste a randomly-chosen hard-negative patch into a non-GT region of a training image (no label, all background). The model gets explicit "DON'T FIRE ON THIS" supervision targeted at its actual failure modes.
+
+6. **Iterate** — retrain → mine new FPs → re-cluster (some old clusters fade, new ones emerge as the model levels up). 2-3 iterations should saturate.
+
+**Implementation:**
+
+- New CLI: `opndet mine-negatives --ckpt <pt> --config <yaml> --out <dir>` — runs val, computes Grad-CAM for ghosts, clusters them, dumps patches + manifest JSON
+- Augmentation extension: add `hard_negative_pool: <dir>` and `hard_negative_prob: 0.2` to the `augment:` block in train yaml. Implemented in `augment.py` as a new aug op that pastes a random patch from the pool into a non-GT region (using existing `min_visible_frac` logic to ensure GTs aren't blocked)
+- Dashboard view: a "ghost atlas" tab that browses the clusters and their members visually
+
+**Definition of done:**
+
+- `opndet mine-negatives` CLI exists and produces a clustered hard-negative pool from any ckpt+dataset
+- Training yaml supports `hard_negative_pool` augmentation
+- Validation: a kitchen-sink retrain WITH hard-negative mining shows ≥40% reduction in `center_ghost_rate` vs the same yaml WITHOUT hard-neg mining (e.g., 1.5% → <0.9%)
+- Browseable cluster gallery in the dashboard so the user can inspect "what's the model getting wrong"
+
+**Why this matters more than pruning:**
+
+Tiny models like opndet (10M params, bbox-x) don't have spare channels to prune — every filter is doing real work. The "find FP-causing weights and zero them out" approach (channel ablation) typically hurts recall on small models. Targeted retraining with the right negatives is the orthogonal-effort, predictable-payoff path.
+
+This pairs naturally with `opndet analyze` (already shipped, §1.4-adjacent): analyze surfaces the per-detection attribution that mine-negatives consumes at scale.
+
+Connects to but is distinct from §1.5's "asymmetric count loss" — that biases toward recall vs precision; this attacks the precision side specifically.
+
 ---
 
 ## Part 2 — The convex prior (the differentiator)

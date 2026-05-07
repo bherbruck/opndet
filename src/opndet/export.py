@@ -28,6 +28,36 @@ def build_pt_model(ckpt_path: str | None, cfg: ModelConfig) -> OpndetBbox:
     return m
 
 
+class _DiagnosticWrapper(torch.nn.Module):
+    """Wraps a YamlModel so that forward() returns the production output PLUS
+    every named 4D-shaped intermediate activation as additional output tensors.
+    Used by `opndet export --diagnostic` so the browser can render per-layer
+    activation heatmaps.
+    """
+
+    def __init__(self, model: torch.nn.Module, diag_names: list[str]):
+        super().__init__()
+        self.model = model
+        self._diag_names = list(diag_names)
+        self._diag_idx = [int(model.aliases[n]) for n in self._diag_names]
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        cache = self.model._run(x)
+        # Derive the production "output" from cache via the model's output specs.
+        result_dict = {}
+        for spec in self.model._out_specs:
+            t = cache[spec["layer_idx"]]
+            s, e = spec["start"], spec["end"]
+            if s is not None:
+                t = t[:, s:e]
+            act = spec["activation_fn"]
+            if act is not None:
+                t = act(t)
+            result_dict[spec["name"]] = t
+        prod = result_dict.get("output", next(iter(result_dict.values())))
+        return (prod, *[cache[i] for i in self._diag_idx])
+
+
 class _InputNormalizer(torch.nn.Module):
     """Wraps a model to accept raw uint8-range fp32 inputs [0, 255] and apply
     ImageNet (or arbitrary) mean/std normalization in-graph. Makes the exported
