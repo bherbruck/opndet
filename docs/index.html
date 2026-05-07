@@ -455,7 +455,7 @@ async function runOn(src) {
   els.sDets.textContent = dets.length;
 
   // Refresh layer overlay if explain mode is on (uses freshly captured outputs).
-  if (els.explainOn.checked && layerNames.length > 0) rebuildLayerOverlay();
+  if (els.explainOn.checked && layerNames.length > 0) rebuildLayerOverlay(false);
   if (activeOverlay) blitOverlay();
 
   drawDetections(dets);
@@ -579,7 +579,8 @@ function renderHeatmapImageData(arr, h, w) {
 }
 
 // Build layer activation overlay: max-over-channels of selected layer's tensor.
-function rebuildLayerOverlay() {
+// Only sets activeOverlay + labels; the caller is responsible for redrawing.
+function rebuildLayerOverlay(redraw = true) {
   if (!els.explainOn.checked || !lastOutputs || layerNames.length === 0) return;
   const i = parseInt(els.layerSlider.value) || 0;
   const name = layerNames[i];
@@ -600,7 +601,7 @@ function rebuildLayerOverlay() {
   activeOverlay = renderHeatmapImageData(flat, H, W);
   els.layerName.textContent = name;
   els.layerInfo.textContent = `idx ${i+1}/${layerNames.length} · shape [${B},${C},${H},${W}]`;
-  if (lastImage) renderFromCache();
+  if (redraw && lastImage) renderFromCache();
 }
 
 // Composite activeOverlay onto the canvas with the current alpha.
