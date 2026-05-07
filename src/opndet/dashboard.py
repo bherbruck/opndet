@@ -486,6 +486,14 @@ const charts = {};
 let selectedRuns = [], scalarTags = [], imageTags = [];
 const RUN_COLORS = ['#58a6ff', '#39c860', '#ff6b35', '#ffb86c', '#bd93f9', '#ff79c6', '#8be9fd', '#f1fa8c'];
 
+// Deterministic color per run name — same run always renders in the same
+// color regardless of selection order. djb2-ish string hash → palette idx.
+function colorFor(run) {
+  let h = 5381;
+  for (let i = 0; i < run.length; i++) h = (((h << 5) + h) + run.charCodeAt(i)) >>> 0;
+  return RUN_COLORS[h % RUN_COLORS.length];
+}
+
 // Persist selection across reloads. URL hash is primary (works inside
 // Colab's sandboxed iframe where localStorage is blocked, and makes the
 // view shareable). localStorage is a fallback for fresh URL visits.
@@ -593,11 +601,12 @@ async function refreshRuns() {
     const id = 'run_' + r.name.replace(/[^a-z0-9]/gi, '_');
     const lbl = document.createElement('label');
     lbl.title = `${r.path}\n${new Date(r.mtime * 1000).toString()}`;
-    // color swatch matches the chart's line color for this run (only for
-    // selected runs — unselected get a neutral dot)
-    const idx = selectedRuns.indexOf(r.name);
-    const color = idx >= 0 ? RUN_COLORS[idx % RUN_COLORS.length] : '#30363d';
-    lbl.innerHTML = `<input type="checkbox" data-run="${r.name}" id="${id}"${sel.has(r.name) ? ' checked' : ''}><span class="swatch" style="background:${color}"></span><span style="font-weight:500">${r.name}</span> <span style="color:#7d8590;font-size:11px">${dt}</span>`;
+    // Deterministic color per run name. Selected runs show full color;
+    // unselected dim the swatch via opacity so the assignment is still
+    // visible but not distracting.
+    const color = colorFor(r.name);
+    const checked = sel.has(r.name);
+    lbl.innerHTML = `<input type="checkbox" data-run="${r.name}" id="${id}"${checked ? ' checked' : ''}><span class="swatch" style="background:${color};opacity:${checked ? 1 : 0.3}"></span><span style="font-weight:500">${r.name}</span> <span style="color:#7d8590;font-size:11px">${dt}</span>`;
     list.appendChild(lbl);
   }
   if (runs.length === 0) {
@@ -767,9 +776,9 @@ async function addChart(tag, parent) {
   const perRun = await api(`/api/scalars/runs?tag=${encodeURIComponent(tag)}&runs=${selectedRuns.map(encodeURIComponent).join(',')}`) || {};
   const alpha = currentSmoothing();
   const datasets = [];
-  selectedRuns.forEach((run, i) => {
+  selectedRuns.forEach((run) => {
     const series = (perRun[run] || []).map(d => ({ x: d.ep, y: d.value }));
-    const color = RUN_COLORS[i % RUN_COLORS.length];
+    const color = colorFor(run);
     if (alpha > 0) {
       // raw line, faint dashed (kept for reference)
       datasets.push({
