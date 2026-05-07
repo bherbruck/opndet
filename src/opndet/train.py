@@ -765,6 +765,20 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     best_metric = -1.0
     best_epoch = 0
     patience = int(c.get("patience", 0))   # 0 = disabled
+
+    # eval_threshold: numeric (static) OR "auto" (track threshold_opt with EMA).
+    # Auto: each epoch's score_thresh = EMA of past threshold_opt values, so the
+    # operating point self-tunes to where F1 actually peaks given the model's
+    # current calibration. Reduces guesswork; trades 1-epoch lag for it.
+    _eval_threshold_cfg = c.get("eval_threshold", 0.3)
+    eval_threshold_auto = (isinstance(_eval_threshold_cfg, str)
+                           and _eval_threshold_cfg.lower() == "auto")
+    eval_threshold_ema_alpha = float(c.get("eval_threshold_ema_alpha", 0.3))
+    eval_threshold_min = float(c.get("eval_threshold_min", 0.10))  # bootstrap floor
+    cur_eval_threshold = eval_threshold_min if eval_threshold_auto else float(_eval_threshold_cfg)
+    if eval_threshold_auto:
+        print(f"eval_threshold: auto (EMA α={eval_threshold_ema_alpha}, "
+              f"bootstrap={eval_threshold_min})")
     step = 0
     start_epoch = 0
     if resume_state is not None:
@@ -834,7 +848,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         dt = time.time() - t0
         eval_model = ema.shadow if ema is not None else model
         _t_phase = time.time()
-        m = evaluate(eval_model, val_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+        m = evaluate(eval_model, val_loader, cfg_shim, device, score_thresh=cur_eval_threshold)
         _t_val = time.time() - _t_phase
         cur_lr = opt.param_groups[0]["lr"]
         print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  (train {dt:.1f}s val {_t_val:.1f}s)")
@@ -845,12 +859,22 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         for k, v in avg.items():
             writer.add_scalar(f"train/{k}", v, ep)
 
+        # Auto eval_threshold: EMA-track threshold_opt for next epoch.
+        if eval_threshold_auto:
+            new_t = float(m.get("threshold_opt", cur_eval_threshold))
+            cur_eval_threshold = max(eval_threshold_min,
+                                     (1 - eval_threshold_ema_alpha) * cur_eval_threshold
+                                     + eval_threshold_ema_alpha * new_t)
+            writer.add_scalar("eval_threshold", cur_eval_threshold, ep)
+            print(f"          eval_threshold: {cur_eval_threshold:.3f} "
+                  f"(EMA, this-ep optimum={new_t:.2f})")
+
         # Cold-start diagnostic: same val with zero priors. Quantifies how
         # much the prior is helping. Selection metric still uses warm `m`.
         if cold_val_loader is not None:
             _t_phase = time.time()
             m_cold = evaluate(eval_model, cold_val_loader, cfg_shim, device,
-                              score_thresh=float(c.get("eval_threshold", 0.3)))
+                              score_thresh=cur_eval_threshold)
             _t_cold = time.time() - _t_phase
             print(f"  cold (zero-prior): F1={m_cold['f1']:.3f}  F1_opt={m_cold['f1_opt']:.3f}@{m_cold['threshold_opt']:.2f}  mAP@.5={m_cold['map50']:.3f}")
             for k, v in m_cold.items():
@@ -886,7 +910,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 # also useful as a TB readout when calibrate_every fires.
                 apply_temperature(eval_model, cur_T)
                 m_cal = evaluate(eval_model, val_loader, cfg_shim, device,
-                                 score_thresh=float(c.get("eval_threshold", 0.3)))
+                                 score_thresh=cur_eval_threshold)
                 for k, v in m_cal.items():
                     writer.add_scalar(f"val_cal/{k}", v, ep)
                 _t_calib = time.time() - _t_phase
@@ -904,7 +928,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         elif metric_for_best.startswith("f1_opt") and "threshold_opt" in m:
             vis_thresh_now = float(m["threshold_opt"])
         else:
-            vis_thresh_now = float(c.get("eval_threshold", 0.3))
+            vis_thresh_now = cur_eval_threshold
 
         # Selection metric (computed up here so we can gate test/vis on
         # is_new_best): calibrated value if metric_for_best ends in _cal AND
@@ -925,13 +949,13 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             return best_epoch > last_fire_epoch
 
         if test_every > 0 and ep % test_every == 0 and len(test_ds) > 0 and _should_fire(last_test_epoch):
-            mt = evaluate(eval_model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+            mt = evaluate(eval_model, test_loader, cfg_shim, device, score_thresh=cur_eval_threshold)
             print(f"  test: P={mt['precision']:.3f} R={mt['recall']:.3f} F1={mt['f1']:.3f}  mAP@.5={mt['map50']:.3f} mAP@.5:.95={mt['map_50_95']:.3f}")
             for k, v in mt.items():
                 writer.add_scalar(f"test/{k}", v, ep)
             if cold_test_loader is not None:
                 mt_cold = evaluate(eval_model, cold_test_loader, cfg_shim, device,
-                                   score_thresh=float(c.get("eval_threshold", 0.3)))
+                                   score_thresh=cur_eval_threshold)
                 print(f"  test cold (zero-prior): F1={mt_cold['f1']:.3f}  F1_opt={mt_cold['f1_opt']:.3f}@{mt_cold['threshold_opt']:.2f}  mAP@.5={mt_cold['map50']:.3f}")
                 for k, v in mt_cold.items():
                     writer.add_scalar(f"test_cold/{k}", v, ep)
@@ -1106,7 +1130,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     if "temperature" in state and float(state["temperature"]) != 1.0:
         from opndet.calibrate import apply_temperature
         apply_temperature(model, float(state["temperature"]))
-    m = evaluate(model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+    m = evaluate(model, test_loader, cfg_shim, device, score_thresh=cur_eval_threshold)
     print(f"TEST: P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  n_pred={m['n_pred']:.0f}/n_gt={m['n_gt']:.0f}")
     for k, v in m.items():
         writer.add_scalar(f"test/{k}", v, epochs)
@@ -1127,7 +1151,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             model.load_state_dict(state["model"])
             from opndet.calibrate import apply_temperature
             apply_temperature(model, float(state.get("temperature", 1.0)))
-            m_cal = evaluate(model, test_loader, cfg_shim, device, score_thresh=float(c.get("eval_threshold", 0.3)))
+            m_cal = evaluate(model, test_loader, cfg_shim, device, score_thresh=cur_eval_threshold)
             print(f"TEST(cal): P={m_cal['precision']:.3f} R={m_cal['recall']:.3f} F1={m_cal['f1']:.3f}  n_pred={m_cal['n_pred']:.0f}/n_gt={m_cal['n_gt']:.0f}")
             for k, v in m_cal.items():
                 writer.add_scalar(f"test_cal/{k}", v, epochs)
