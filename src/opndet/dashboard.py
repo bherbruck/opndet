@@ -343,6 +343,67 @@ def build_app(root_dir: Path) -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
 
+    @app.get("/api/tags/bulk")
+    def api_tags_bulk(runs: str = Query("")) -> dict[str, Any]:
+        """One round-trip: union scalar+image tags across all requested runs,
+        plus per-run breakdown so the frontend can tell which run owns
+        which tag without re-fetching."""
+        names = [r.strip() for r in runs.split(",") if r.strip()]
+        all_runs = _discover_runs(root_dir)
+        per_run: dict[str, dict[str, list[str]]] = {}
+        scalar_set, image_set = set(), set()
+        for n in names:
+            if n not in all_runs:
+                per_run[n] = {"scalars": [], "images": []}
+                continue
+            try:
+                with _open_db(all_runs[n]) as con:
+                    s = [r[0] for r in con.execute("SELECT DISTINCT tag FROM scalars ORDER BY tag").fetchall()]
+                    i = [r[0] for r in con.execute("SELECT DISTINCT tag FROM images ORDER BY tag").fetchall()]
+                    per_run[n] = {"scalars": s, "images": i}
+                    scalar_set.update(s); image_set.update(i)
+            except Exception:
+                per_run[n] = {"scalars": [], "images": []}
+        return {
+            "scalars": sorted(scalar_set),
+            "images": sorted(image_set),
+            "per_run": per_run,
+        }
+
+    @app.get("/api/scalars/bulk")
+    def api_scalars_bulk(
+        runs: str = Query(""),
+        tags: str = Query("", description="comma-separated tag list; omit for all"),
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        """One request returns the full {tag: {run: [{ep,value}]}} matrix.
+        Replaces N per-tag /api/scalars/runs round-trips."""
+        run_names = [r.strip() for r in runs.split(",") if r.strip()]
+        tag_filter = [t.strip() for t in tags.split(",") if t.strip()]
+        all_runs = _discover_runs(root_dir)
+        # collect: dict[tag][run] -> list[(ep,value)]
+        out: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for n in run_names:
+            if n not in all_runs:
+                continue
+            try:
+                with _open_db(all_runs[n]) as con:
+                    if tag_filter:
+                        placeholders = ",".join(["?"] * len(tag_filter))
+                        q = f"SELECT tag, ep, value FROM scalars WHERE tag IN ({placeholders}) ORDER BY tag, ep"
+                        rows = con.execute(q, tag_filter).fetchall()
+                    else:
+                        rows = con.execute("SELECT tag, ep, value FROM scalars ORDER BY tag, ep").fetchall()
+                    for tag, ep, value in rows:
+                        out.setdefault(tag, {}).setdefault(n, []).append({"ep": ep, "value": value})
+            except Exception:
+                continue
+        # ensure every requested run is keyed under each tag (empty if no data)
+        for tag in (tag_filter or list(out.keys())):
+            d = out.setdefault(tag, {})
+            for n in run_names:
+                d.setdefault(n, [])
+        return out
+
     @app.get("/api/scalars/runs")
     def api_scalars_runs(
         tag: str = Query(...),
@@ -708,33 +769,51 @@ function toggleAllRuns(on) {
   refreshAll();
 }
 
+// Bulk-fetched cache: { tag: { run: [{ep, value}] } }
+let bulkScalars = {};
+
+function currentTabName() {
+  const t = document.querySelector('.tab.active');
+  return t ? t.dataset.tab : 'charts';
+}
+
+async function fetchTagsBulk() {
+  if (selectedRuns.length === 0) return {scalars: [], images: [], per_run: {}};
+  const res = await api(`/api/tags/bulk?runs=${selectedRuns.map(encodeURIComponent).join(',')}`);
+  return res || {scalars: [], images: [], per_run: {}};
+}
+
+async function fetchScalarsBulk(tags) {
+  if (selectedRuns.length === 0 || tags.length === 0) return {};
+  const res = await api(
+    `/api/scalars/bulk?runs=${selectedRuns.map(encodeURIComponent).join(',')}` +
+    `&tags=${tags.map(encodeURIComponent).join(',')}`
+  );
+  return res || {};
+}
+
 async function refreshAll() {
   await refreshRuns();
   if (!primaryRun()) {
-    // no runs yet — clear what's currently rendered, leave UI quiet
     document.getElementById('chart-groups').innerHTML = '';
     document.getElementById('img-tag').innerHTML = '';
     document.getElementById('img-ep').innerHTML = '';
     document.getElementById('image-grid').innerHTML = '';
     return;
   }
-  // Tags = UNION across all selected runs. The most-recent run might not
-  // have any scalars yet (e.g. just started training), so fetching tags
-  // only from primaryRun would leave the page blank for a few epochs.
-  const allScalars = new Set(), allImages = new Set();
-  for (const run of selectedRuns) {
-    const t = await api('/api/tags?run=' + encodeURIComponent(run));
-    if (!t) continue;
-    (t.scalars || []).forEach(x => allScalars.add(x));
-    (t.images  || []).forEach(x => allImages.add(x));
-  }
-  scalarTags = [...allScalars].sort();
-  imageTags  = [...allImages].sort();
-  await renderAllCharts();
-  renderImageTagDropdown();
-  if (imageTags.length && !document.getElementById('img-tag').value) {
-    document.getElementById('img-tag').value = imageTags[0];
-    await loadImageEpochs();
+  // Single bulk call for the tag union.
+  const t = await fetchTagsBulk();
+  scalarTags = t.scalars; imageTags = t.images;
+
+  if (currentTabName() === 'charts') {
+    bulkScalars = await fetchScalarsBulk(scalarTags);
+    await renderAllCharts();
+  } else {
+    renderImageTagDropdown();
+    if (imageTags.length && !document.getElementById('img-tag').value) {
+      document.getElementById('img-tag').value = imageTags[0];
+      await loadImageEpochs();
+    }
   }
 }
 
@@ -858,7 +937,15 @@ async function addChart(tag, parent) {
   card.innerHTML = `<div class="title">${tag}</div><div class="canvas-wrap"><canvas></canvas></div>`;
   (parent || document.querySelector('#chart-groups .chart-group[open] .charts') || document.getElementById('chart-groups')).appendChild(card);
 
-  const perRun = await api(`/api/scalars/runs?tag=${encodeURIComponent(tag)}&runs=${selectedRuns.map(encodeURIComponent).join(',')}`) || {};
+  // Pull from bulk cache if available; fall back to per-tag fetch only when
+  // the chart was added outside the bulk render path (e.g. user expanded a
+  // collapsed group whose tags weren't pre-fetched).
+  let perRun = bulkScalars[tag];
+  if (!perRun) {
+    const fresh = await fetchScalarsBulk([tag]);
+    perRun = fresh[tag] || {};
+    bulkScalars[tag] = perRun;
+  }
   const alpha = currentSmoothing();
   const datasets = [];
   selectedRuns.forEach((run) => {
@@ -1200,47 +1287,49 @@ async function pollUpdate(force = false) {
 }
 async function _pollUpdateImpl(force) {
   const autoAdded = await refreshRuns();
+  if (selectedRuns.length === 0) return;
 
-  // Re-fetch the tag union — handles new scalar tags emerging mid-training
-  // (e.g. test/* and val_cal/* don't appear until first calibrate fires).
+  // ALWAYS one bulk tags call (cheap, ~kb response, lets both tabs detect
+  // structural changes).
   const prevScalarKey = scalarTags.join('|');
-  if (selectedRuns.length > 0) {
-    const allScalars = new Set(), allImages = new Set();
-    for (const run of selectedRuns) {
-      const t = await api('/api/tags?run=' + encodeURIComponent(run));
-      if (!t) continue;
-      (t.scalars || []).forEach(x => allScalars.add(x));
-      (t.images  || []).forEach(x => allImages.add(x));
-    }
-    scalarTags = [...allScalars].sort();
-    imageTags  = [...allImages].sort();
-    renderImageTagDropdown();
-  }
+  const prevImageKey = imageTags.join('|');
+  const t = await fetchTagsBulk();
+  scalarTags = t.scalars; imageTags = t.images;
   const tagsChanged = scalarTags.join('|') !== prevScalarKey;
+  const imagesChanged = imageTags.join('|') !== prevImageKey;
 
-  if (autoAdded > 0 || tagsChanged || (force && Object.keys(charts).length === 0)) {
-    await renderAllCharts();
-    return;
-  }
-  if (Object.keys(charts).length === 0 || selectedRuns.length === 0) return;
-
-  // Existing charts: fetch latest series, swap dataset.data in place.
-  const tags = Object.keys(charts);
-  const runs = selectedRuns;
-  for (const tag of tags) {
-    const chart = charts[tag];
-    const perRun = await api(`/api/scalars/runs?tag=${encodeURIComponent(tag)}&runs=${runs.map(encodeURIComponent).join(',')}`) || {};
+  const tab = currentTabName();
+  if (tab === 'charts') {
+    // ONE bulk call for the whole tag×run scalar matrix.
+    bulkScalars = await fetchScalarsBulk(scalarTags);
+    if (autoAdded > 0 || tagsChanged || (force && Object.keys(charts).length === 0)) {
+      await renderAllCharts();
+      return;
+    }
+    if (Object.keys(charts).length === 0) return;
+    // Existing charts: refresh in place from cache.
     const alpha = currentSmoothing();
-    runs.forEach((run, i) => {
-      const seriesRaw = (perRun[run] || []).map(d => ({ x: d.ep, y: d.value }));
-      const smoothedDS = chart.data.datasets.find(d => d.label === run);
-      const rawDS = chart.data.datasets.find(d => d.label === `${run} (raw)`);
-      const smoothed = alpha > 0 ? emaSmooth(seriesRaw, alpha) : seriesRaw;
-      if (!smoothedDS) return;
-      smoothedDS.data = smoothed;
-      if (rawDS) rawDS.data = seriesRaw;
-    });
-    chart.update('none');
+    for (const tag of Object.keys(charts)) {
+      const chart = charts[tag];
+      const perRun = bulkScalars[tag] || {};
+      selectedRuns.forEach((run) => {
+        const seriesRaw = (perRun[run] || []).map(d => ({ x: d.ep, y: d.value }));
+        const smoothedDS = chart.data.datasets.find(d => d.label === run);
+        const rawDS = chart.data.datasets.find(d => d.label === `${run} (raw)`);
+        if (!smoothedDS) return;
+        smoothedDS.data = alpha > 0 ? emaSmooth(seriesRaw, alpha) : seriesRaw;
+        if (rawDS) rawDS.data = seriesRaw;
+      });
+      chart.update('none');
+    }
+  } else if (tab === 'images') {
+    if (imagesChanged) renderImageTagDropdown();
+    // Reload the visible epoch's images so newly-saved samples appear.
+    if (imageTags.length) {
+      const imgTag = document.getElementById('img-tag');
+      if (!imgTag.value || !imageTags.includes(imgTag.value)) imgTag.value = imageTags[0];
+      await loadImageEpochs();
+    }
   }
 }
 // Auto-refresh: configurable interval + toggle, persisted in hash/localStorage.
