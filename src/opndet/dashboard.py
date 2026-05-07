@@ -1106,12 +1106,31 @@ function exportCSV() {
 }
 
 // Tabs
-function activateTab(name) {
+async function activateTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.dataset.panel === name));
   const params = new URLSearchParams((location.hash || '').replace(/^#/, ''));
   if (name === 'charts') params.delete('tab'); else params.set('tab', name);
   history.replaceState(null, '', location.pathname + location.search + '#' + params.toString());
+  // When switching INTO images, re-fetch tag list and (re)load images.
+  // This handles the case where images appeared mid-run after the initial
+  // page load — without this you'd have to manually click refresh.
+  if (name === 'images') {
+    if (selectedRuns.length === 0) return;
+    const allImages = new Set();
+    for (const run of selectedRuns) {
+      const t = await api('/api/tags?run=' + encodeURIComponent(run));
+      if (!t) continue;
+      (t.images || []).forEach(x => allImages.add(x));
+    }
+    imageTags = [...allImages].sort();
+    renderImageTagDropdown();
+    if (imageTags.length) {
+      const sel = document.getElementById('img-tag');
+      if (!sel.value || !imageTags.includes(sel.value)) sel.value = imageTags[0];
+      await loadImageEpochs();
+    }
+  }
 }
 document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => activateTab(t.dataset.tab));
