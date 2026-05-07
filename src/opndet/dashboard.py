@@ -451,6 +451,20 @@ const charts = {};
 let selectedRuns = [], scalarTags = [], imageTags = [];
 const RUN_COLORS = ['#58a6ff', '#39c860', '#ff6b35', '#ffb86c', '#bd93f9', '#ff79c6', '#8be9fd', '#f1fa8c'];
 
+// Persist selection across reloads. Auto-add freshly-discovered runs so a
+// new training run shows up checked the first time you open the page after
+// it appears, but a run you explicitly unchecked stays unchecked.
+const LS_RUNS = 'opndet:selectedRuns';
+const LS_KNOWN = 'opndet:knownRuns';
+const LS_SCALARS = 'opndet:selectedScalars';
+function lsGet(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
+  catch { return fallback; }
+}
+function lsSet(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
+
 const primaryRun = () => selectedRuns[0] || null;
 const qrun = () => primaryRun() ? '&run=' + encodeURIComponent(primaryRun()) : '';
 
@@ -467,8 +481,39 @@ async function api(path, opts) {
 async function refreshRuns() {
   const runs = await api('/api/runs') || [];
   const list = document.getElementById('run-list');
-  const prev = new Set(selectedRuns);
   list.innerHTML = '';
+
+  // Load prior selection + run set from localStorage on first call;
+  // subsequent calls reuse the in-memory state.
+  if (selectedRuns.length === 0 && list.dataset.bootstrapped !== '1') {
+    selectedRuns = lsGet(LS_RUNS, []);
+    list.dataset.bootstrapped = '1';
+  }
+  const known = new Set(lsGet(LS_KNOWN, []));
+  const currentNames = new Set(runs.map(r => r.name));
+
+  // Auto-select runs that have appeared since our last visit. A run the
+  // user explicitly unchecked WHILE it was visible stays in known, so it
+  // won't auto-reselect.
+  let autoAdded = 0;
+  for (const name of currentNames) {
+    if (!known.has(name) && !selectedRuns.includes(name)) {
+      selectedRuns.push(name);
+      autoAdded++;
+    }
+  }
+  // Drop selections that no longer exist (run dir deleted)
+  selectedRuns = selectedRuns.filter(n => currentNames.has(n));
+
+  // First-ever load with no known runs: select the most recent.
+  if (known.size === 0 && selectedRuns.length === 0 && runs.length > 0) {
+    selectedRuns.push(runs[0].name);
+  }
+
+  lsSet(LS_KNOWN, [...currentNames]);
+  lsSet(LS_RUNS, selectedRuns);
+
+  const sel = new Set(selectedRuns);
   const fmt = new Intl.DateTimeFormat(undefined, {
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
   });
@@ -477,26 +522,24 @@ async function refreshRuns() {
     const id = 'run_' + r.name.replace(/[^a-z0-9]/gi, '_');
     const lbl = document.createElement('label');
     lbl.title = `${r.path}\n${new Date(r.mtime * 1000).toString()}`;
-    lbl.innerHTML = `<input type="checkbox" data-run="${r.name}" id="${id}"${prev.has(r.name) ? ' checked' : ''}> <span style="font-weight:500">${r.name}</span> <span style="color:#7d8590;font-size:11px">${dt}</span>`;
+    lbl.innerHTML = `<input type="checkbox" data-run="${r.name}" id="${id}"${sel.has(r.name) ? ' checked' : ''}> <span style="font-weight:500">${r.name}</span> <span style="color:#7d8590;font-size:11px">${dt}</span>`;
     list.appendChild(lbl);
   }
   if (runs.length === 0) {
     document.getElementById('empty-banner').style.display = 'inline';
     selectedRuns = [];
     document.getElementById('runs-count').textContent = '0 selected';
-    return;
+    return autoAdded;
   }
   document.getElementById('empty-banner').style.display = 'none';
-  // auto-select most recent if nothing currently selected
-  if (selectedRuns.length === 0 || !runs.some(r => prev.has(r.name))) {
-    list.querySelector('input[data-run]').checked = true;
-  }
   syncSelectedRuns();
+  return autoAdded;
 }
 
 function syncSelectedRuns() {
   selectedRuns = [...document.querySelectorAll('#run-list input[data-run]:checked')].map(el => el.dataset.run);
   document.getElementById('runs-count').textContent = `${selectedRuns.length} selected`;
+  lsSet(LS_RUNS, selectedRuns);
 }
 
 function toggleAllRuns(on) {
@@ -520,10 +563,13 @@ async function refreshAll() {
   scalarTags = tags.scalars; imageTags = tags.images;
   renderScalarTags();
   renderImageTags();
-  // pre-check common scalars on first load
+  // pre-check from localStorage if present, else common defaults
   if (Object.keys(charts).length === 0) {
-    const commonChecks = ['val/f1', 'val/f1_opt', 'val_cold/f1_opt', 'prior_lift/val/f1_opt', 'val_cal/f1', 'train/loss'];
-    for (const t of commonChecks) {
+    let toCheck = lsGet(LS_SCALARS, null);
+    if (!Array.isArray(toCheck) || toCheck.length === 0) {
+      toCheck = ['val/f1', 'val/f1_opt', 'val_cold/f1_opt', 'prior_lift/val/f1_opt', 'val_cal/f1', 'train/loss'];
+    }
+    for (const t of toCheck) {
       const el = document.querySelector(`input[data-scalar="${CSS.escape(t)}"]`);
       if (el) { el.checked = true; el.dispatchEvent(new Event('change')); }
     }
@@ -553,6 +599,7 @@ function renderScalarTags() {
     if (e.target.matches('input[data-scalar]')) {
       const tag = e.target.dataset.scalar;
       if (e.target.checked) addChart(tag); else removeChart(tag);
+      lsSet(LS_SCALARS, Object.keys(charts));
     }
   };
 }
@@ -757,7 +804,13 @@ document.getElementById('show-prior').addEventListener('change', rerenderOverlay
 document.getElementById('overlay-alpha').addEventListener('input', rerenderOverlays);
 
 refreshAll();
-setInterval(async () => { await refreshRuns(); await refreshAll(); }, 30000);
+setInterval(async () => {
+  const autoAdded = await refreshRuns();
+  // re-fetch charts only when something actually changed
+  if (autoAdded > 0) {
+    for (const tag of Object.keys(charts)) { removeChart(tag); addChart(tag); }
+  }
+}, 30000);
 </script>
 </body>
 </html>
