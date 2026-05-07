@@ -935,36 +935,59 @@ function removeChart(tag) {
 async function loadImageEpochs() {
   const tag = document.getElementById('img-tag').value;
   if (!tag) return;
-  const eps = await api('/api/epochs?tag=' + encodeURIComponent(tag) + qrun());
+  // Union of epochs across all selected runs.
+  const allEps = new Set();
+  for (const run of selectedRuns) {
+    const eps = await api(`/api/epochs?tag=${encodeURIComponent(tag)}&run=${encodeURIComponent(run)}`) || [];
+    eps.forEach(e => allEps.add(e));
+  }
+  const eps = [...allEps].sort((a, b) => a - b);
   const sel = document.getElementById('img-ep');
+  const prev = sel.value;
   sel.innerHTML = '';
   for (const ep of eps) {
     const opt = document.createElement('option');
     opt.value = opt.textContent = ep;
     sel.appendChild(opt);
   }
-  if (eps.length) { sel.value = eps[eps.length - 1]; await loadImages(); }
+  if (eps.length) {
+    sel.value = (prev && eps.includes(parseInt(prev))) ? prev : eps[eps.length - 1];
+    await loadImages();
+  }
 }
 
 async function loadImages() {
   const tag = document.getElementById('img-tag').value;
   const ep = document.getElementById('img-ep').value;
-  const grid = document.getElementById('image-grid');
-  grid.innerHTML = '';
+  const root = document.getElementById('image-grid');
+  root.innerHTML = '';
   if (!tag || !ep) {
-    grid.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">no tag/epoch selected</div>`;
+    root.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">no tag/epoch selected</div>`;
     return;
   }
-  const samples = await api(`/api/samples?tag=${encodeURIComponent(tag)}&ep=${ep}` + qrun());
-  if (!samples) {
-    grid.innerHTML = `<div style="color:#ff6b35;font-size:12px;padding:8px">/api/samples returned null — check DevTools network tab</div>`;
+  if (selectedRuns.length === 0) {
+    root.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">no runs selected</div>`;
     return;
   }
-  if (samples.length === 0) {
-    grid.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">0 samples for ${tag} @ epoch ${ep}</div>`;
-    return;
+  // One section per selected run, color-tagged. Skip runs that don't have
+  // a sample at this (tag, ep) — they may not have hit vis_every yet.
+  let total = 0;
+  for (const run of selectedRuns) {
+    const samples = await api(`/api/samples?tag=${encodeURIComponent(tag)}&ep=${ep}&run=${encodeURIComponent(run)}`) || [];
+    if (samples.length === 0) continue;
+    const sec = document.createElement('div');
+    const color = colorFor(run);
+    sec.innerHTML = `<div style="margin:14px 0 6px;font-size:13px;color:#c9d1d9;font-weight:600;display:flex;align-items:center;gap:6px"><span class="swatch" style="background:${color}"></span>${run} <span style="color:#7d8590;font-size:11px;font-weight:400">${samples.length} samples</span></div>`;
+    const sub = document.createElement('div');
+    sub.className = 'image-grid';
+    sec.appendChild(sub);
+    root.appendChild(sec);
+    for (const s of samples) renderSample(sub, s);
+    total += samples.length;
   }
-  for (const s of samples) renderSample(grid, s);
+  if (total === 0) {
+    root.innerHTML = `<div style="color:#7d8590;font-size:12px;padding:8px">no selected run has samples for ${tag} @ epoch ${ep}</div>`;
+  }
 }
 
 function renderSample(grid, s) {
