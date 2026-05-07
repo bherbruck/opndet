@@ -232,7 +232,8 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
     #   count_off_by_le1: fraction of images where |n_pred - n_gt| <= 1
     from opndet.metrics import center_match
     cm_match_total = cm_pred_total = cm_gt_total = 0
-    cm_dists: list[np.ndarray] = []
+    cm_dists_px: list[np.ndarray] = []
+    cm_dists_frac: list[np.ndarray] = []
     cnt_off_le1 = 0
     cnt_total = len(per_image)
     for scores_full, boxes_full, gt in per_image:
@@ -245,16 +246,22 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
         cm_pred_total += m["n_pred"]
         cm_gt_total   += m["n_gt"]
         if m["distances_px"].size > 0:
-            cm_dists.append(m["distances_px"])
+            cm_dists_px.append(m["distances_px"])
+            cm_dists_frac.append(m["distances_frac"])
     center_recall    = cm_match_total / max(1, cm_gt_total)
     center_precision = cm_match_total / max(1, cm_pred_total)
     center_f1 = 2 * center_recall * center_precision / max(1e-9, center_recall + center_precision)
-    if cm_dists:
-        d = np.concatenate(cm_dists)
-        center_dist_mean = float(d.mean())
-        center_dist_p50  = float(np.percentile(d, 50))
-        center_dist_p95  = float(np.percentile(d, 95))
+    if cm_dists_px:
+        d_px = np.concatenate(cm_dists_px)
+        d_fr = np.concatenate(cm_dists_frac)
+        center_dist_mean_px = float(d_px.mean())
+        center_dist_p50_px  = float(np.percentile(d_px, 50))
+        center_dist_p95_px  = float(np.percentile(d_px, 95))
+        center_dist_mean    = float(d_fr.mean())
+        center_dist_p50     = float(np.percentile(d_fr, 50))
+        center_dist_p95     = float(np.percentile(d_fr, 95))
     else:
+        center_dist_mean_px = center_dist_p50_px = center_dist_p95_px = 0.0
         center_dist_mean = center_dist_p50 = center_dist_p95 = 0.0
     count_off_le1_frac = cnt_off_le1 / max(1, cnt_total)
 
@@ -293,9 +300,17 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
             "center_recall": float(center_recall),
             "center_precision": float(center_precision),
             "center_f1": float(center_f1),
-            "center_dist_mean_px": center_dist_mean,
-            "center_dist_p50_px": center_dist_p50,
-            "center_dist_p95_px": center_dist_p95,
+            # Bbox-relative distances (primary — survive image-size changes).
+            # Units: fraction of min(gt_w, gt_h). 0.0 = on center, 0.5 = on
+            # smaller-side edge, >1.0 = outside the bbox.
+            "center_dist_mean": center_dist_mean,
+            "center_dist_p50": center_dist_p50,
+            "center_dist_p95": center_dist_p95,
+            # Pixel-units (informational — only directly comparable across
+            # runs at the same input resolution).
+            "center_dist_mean_px": center_dist_mean_px,
+            "center_dist_p50_px": center_dist_p50_px,
+            "center_dist_p95_px": center_dist_p95_px,
             "count_off_le1_frac": float(count_off_le1_frac)}
 
 
@@ -769,7 +784,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         _t_val = time.time() - _t_phase
         cur_lr = opt.param_groups[0]["lr"]
         print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  (train {dt:.1f}s val {_t_val:.1f}s)")
-        print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} F1={m['center_f1']:.3f}  dist(px) mean={m['center_dist_mean_px']:.1f} p50={m['center_dist_p50_px']:.1f} p95={m['center_dist_p95_px']:.1f}  count±1={m['count_off_le1_frac']:.1%}")
+        print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} F1={m['center_f1']:.3f}  dist(frac) mean={m['center_dist_mean']:.3f} p50={m['center_dist_p50']:.3f} p95={m['center_dist_p95']:.3f}  (px p50={m['center_dist_p50_px']:.1f})  count±1={m['count_off_le1_frac']:.1%}")
 
         ep = epoch + 1
         writer.add_scalar("lr", cur_lr, ep)

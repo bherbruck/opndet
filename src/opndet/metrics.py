@@ -189,13 +189,20 @@ def center_match(
     row, col = linear_sum_assignment(cost)
     valid = cost[row, col] < 1e8
     n_match = int(valid.sum())
-    matched_d = dist[row[valid], col[valid]]
+    matched_d_px = dist[row[valid], col[valid]]
+    # Bbox-relative distance: dist_px / min(gt_w, gt_h). 0 = exactly on
+    # center, 0.5 = on the edge of the smaller bbox side, >1 = outside.
+    # Survives changes in image size — the pixel version doesn't.
+    matched_min_side = np.minimum(gw[col[valid]], gh[col[valid]])
+    matched_d_frac = matched_d_px / np.maximum(matched_min_side, 1.0)
     p = n_match / max(1, n_pred)
     r = n_match / max(1, n_gt)
     f1 = 2 * p * r / max(1e-9, p + r)
     return {"recall": float(r), "precision": float(p), "f1": float(f1),
             "n_match": n_match, "n_pred": n_pred, "n_gt": n_gt,
-            "distances_px": matched_d, "radii_px": radii}
+            "distances_px": matched_d_px,
+            "distances_frac": matched_d_frac.astype(np.float32),
+            "radii_px": radii}
 
 
 def loc_bias(matched_pred: np.ndarray, matched_gt: np.ndarray) -> dict:
