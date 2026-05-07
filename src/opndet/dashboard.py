@@ -295,6 +295,54 @@ def build_app(root_dir: Path) -> FastAPI:
             "truncated": len(rows) > 1000,
         })
 
+    @app.get("/api/export/scalars.csv")
+    def api_export_scalars(
+        runs: str | None = Query(None, description="comma-separated; omit for all selected runs implicit"),
+        tags: str | None = Query(None, description="comma-separated tag filter; omit for all"),
+    ) -> "Response":
+        """Stream a long-format CSV of scalars across the requested runs.
+
+        Columns: run,ep,tag,value
+        Filter optionally by ?runs=...&tags=... (each comma-separated).
+        Suitable for pandas.read_csv directly.
+        """
+        from fastapi.responses import StreamingResponse
+        all_runs = _discover_runs(root_dir)
+        run_names = [r.strip() for r in (runs or "").split(",") if r.strip()] or list(all_runs.keys())
+        tag_filter = [t.strip() for t in (tags or "").split(",") if t.strip()]
+
+        def _gen():
+            yield "run,ep,tag,value\n"
+            for n in run_names:
+                if n not in all_runs:
+                    continue
+                try:
+                    with _open_db(all_runs[n]) as con:
+                        if tag_filter:
+                            placeholders = ",".join(["?"] * len(tag_filter))
+                            q = f"SELECT ep, tag, value FROM scalars WHERE tag IN ({placeholders}) ORDER BY tag, ep"
+                            rows = con.execute(q, tag_filter).fetchall()
+                        else:
+                            rows = con.execute(
+                                "SELECT ep, tag, value FROM scalars ORDER BY tag, ep"
+                            ).fetchall()
+                        for ep, tag, value in rows:
+                            # CSV-quote the run/tag if they contain commas/quotes/newlines
+                            t_safe = tag.replace('"', '""')
+                            n_safe = n.replace('"', '""')
+                            yield f'"{n_safe}",{ep},"{t_safe}",{value}\n'
+                except Exception as e:
+                    # surface failures inline rather than aborting the stream
+                    yield f'"{n}",,,error: {str(e).replace(",", " ")}\n'
+
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"opndet_scalars_{ts}.csv"
+        return StreamingResponse(
+            _gen(), media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
     @app.get("/api/scalars/runs")
     def api_scalars_runs(
         tag: str = Query(...),
@@ -465,9 +513,12 @@ _INDEX_HTML = """<!doctype html>
     </div>
 
     <div class="tab-panel active" data-panel="charts">
-      <div style="display:flex;justify-content:flex-end;align-items:center;font-size:11px;color:#7d8590;margin-bottom:8px">
-        smoothing <input id="smooth-slider" type="range" min="0" max="0.99" step="0.01" value="0" style="vertical-align:middle;margin-left:6px">
-        <span id="smooth-val" style="margin-left:6px">0.00</span>
+      <div style="display:flex;justify-content:flex-end;align-items:center;gap:14px;font-size:11px;color:#7d8590;margin-bottom:8px">
+        <button onclick="exportCSV()" style="font-size:11px;padding:3px 8px">⬇ csv</button>
+        <label>smoothing
+          <input id="smooth-slider" type="range" min="0" max="0.99" step="0.01" value="0" style="vertical-align:middle;margin-left:6px">
+          <span id="smooth-val" style="margin-left:4px">0.00</span>
+        </label>
       </div>
       <div id="chart-groups"></div>
     </div>
@@ -1017,6 +1068,27 @@ document.getElementById('smooth-slider').addEventListener('input', () => {
   document.getElementById('smooth-val').textContent = currentSmoothing().toFixed(2);
 });
 document.getElementById('smooth-slider').addEventListener('change', reapplySmoothing);
+
+function exportCSV() {
+  if (selectedRuns.length === 0) {
+    alert('Select at least one run to export.');
+    return;
+  }
+  const params = new URLSearchParams();
+  params.set('runs', selectedRuns.join(','));
+  // optional tag filter — only export tags currently rendered as charts
+  // if any are open. Otherwise dump everything.
+  if (Object.keys(charts).length > 0) {
+    params.set('tags', Object.keys(charts).join(','));
+  }
+  // Trigger download via a temporary anchor so the file pops up named.
+  const a = document.createElement('a');
+  a.href = '/api/export/scalars.csv?' + params.toString();
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
 
 // Tabs
 function activateTab(name) {
