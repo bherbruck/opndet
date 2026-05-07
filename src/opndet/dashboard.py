@@ -618,9 +618,8 @@ function toggleAllRuns(on) {
 async function refreshAll() {
   await refreshRuns();
   if (!primaryRun()) {
-    // no runs yet — wipe lists, leave UI quiet
-    document.getElementById('scalar-tags').innerHTML = '';
-    document.getElementById('image-tags').innerHTML = '';
+    // no runs yet — clear what's currently rendered, leave UI quiet
+    document.getElementById('chart-groups').innerHTML = '';
     document.getElementById('img-tag').innerHTML = '';
     document.getElementById('img-ep').innerHTML = '';
     document.getElementById('image-grid').innerHTML = '';
