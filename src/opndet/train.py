@@ -701,6 +701,24 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     # influences WHEN to stop, never WHAT to save), useful when test/val have noticeable lag.
     best_per_metric: dict[str, tuple[float, int]] = {}
 
+    # Trajectory-patience: stop only when ALL key metrics' slopes flatten over a window.
+    # Beats best-not-improved when one metric saturates while another is still climbing.
+    patience_trajectory = bool(c.get("patience_trajectory", False))
+    patience_window = int(c.get("patience_window", 15))
+    patience_min_slope = float(c.get("patience_min_slope", 0.001))  # relative slope/epoch
+    patience_rule = str(c.get("patience_rule", "any_climbing"))  # or "weighted_sum"
+    # dict: metric_name -> direction (+1 higher-better, -1 lower-better). Magnitude = weight.
+    patience_metrics_cfg: dict[str, float] = dict(c.get("patience_metrics", {
+        "center_f1_lenient": 1.0,
+        "map_50_95": 1.0,
+        "center_ghost_rate": -1.0,
+        "count_off_le1_frac": 0.5,
+    }))
+    metric_history: list[dict[str, float]] = []  # one dict per evaluated epoch
+    if patience_trajectory:
+        print(f"trajectory-patience: window={patience_window} rule={patience_rule} "
+              f"min_slope={patience_min_slope}  metrics={patience_metrics_cfg}")
+
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
     vis_imgs = []
@@ -1021,7 +1039,41 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             torch.save(slim, out_dir / f"{out_dir.name}_best.pt")
             print(f"  -> saved best ({metric_for_best}={best_metric:.3f}, T={cur_T:.3f})  (save {time.time() - _t_phase:.1f}s)")
 
-        if patience > 0:
+        # Snapshot metrics for trajectory analysis (always tracked; only consulted
+        # if patience_trajectory is on).
+        if patience_trajectory:
+            snap = {k: float(m.get(k, 0.0)) for k in patience_metrics_cfg}
+            metric_history.append(snap)
+
+        if patience > 0 and patience_trajectory:
+            # Floor: never stop before `patience` epochs OR before window full.
+            if ep >= patience and len(metric_history) >= patience_window:
+                window = metric_history[-patience_window:]
+                xs = np.arange(patience_window, dtype=np.float64)
+                slopes_rel: dict[str, float] = {}
+                for k, weight in patience_metrics_cfg.items():
+                    ys = np.array([h[k] for h in window], dtype=np.float64)
+                    mean_abs = max(abs(ys.mean()), 1e-6)
+                    slope = float(np.polyfit(xs, ys, 1)[0]) / mean_abs  # rel slope/epoch
+                    slopes_rel[k] = slope * weight  # sign-correct + weight
+                if patience_rule == "weighted_sum":
+                    score = sum(slopes_rel.values()) / max(1, len(slopes_rel))
+                    moving = score > patience_min_slope
+                    verdict = f"weighted_sum={score:+.4f}"
+                else:
+                    moving = any(s > patience_min_slope for s in slopes_rel.values())
+                    verdict = "any_climbing"
+                slope_str = " ".join(f"{k.split('_', 1)[-1]}={s:+.4f}" for k, s in slopes_rel.items())
+                writer.add_scalar("trajectory/score",
+                                  sum(slopes_rel.values()) / max(1, len(slopes_rel)), ep)
+                for k, s in slopes_rel.items():
+                    writer.add_scalar(f"trajectory/{k}", s, ep)
+                print(f"          trajectory[{patience_window}ep, {verdict}]: {slope_str}  -> {'moving' if moving else 'FLAT'}")
+                if not moving:
+                    print(f"early stop: trajectory flat over {patience_window} epochs "
+                          f"(rule={patience_rule}, min_slope={patience_min_slope})")
+                    break
+        elif patience > 0:
             if patience_smart:
                 # Update best for each tracked metric (raw + calibrated where available).
                 for k in ("f1", "map50", "map_50_95"):
