@@ -423,7 +423,7 @@ _INDEX_HTML = """<!doctype html>
   <div class="title">opndet · __ROOT_NAME__</div>
   <div style="flex:1"></div>
   <span id="empty-banner" style="color:#ff6b35;font-size:12px;display:none">no runs yet — waiting…</span>
-  <button onclick="refreshAll()">refresh</button>
+  <button onclick="pollUpdate(true)">refresh</button>
 </header>
 
 <div class="grid">
@@ -633,8 +633,18 @@ async function refreshAll() {
     document.getElementById('image-grid').innerHTML = '';
     return;
   }
-  const tags = await api('/api/tags?run=' + encodeURIComponent(primaryRun())) || {scalars: [], images: []};
-  scalarTags = tags.scalars; imageTags = tags.images;
+  // Tags = UNION across all selected runs. The most-recent run might not
+  // have any scalars yet (e.g. just started training), so fetching tags
+  // only from primaryRun would leave the page blank for a few epochs.
+  const allScalars = new Set(), allImages = new Set();
+  for (const run of selectedRuns) {
+    const t = await api('/api/tags?run=' + encodeURIComponent(run));
+    if (!t) continue;
+    (t.scalars || []).forEach(x => allScalars.add(x));
+    (t.images  || []).forEach(x => allImages.add(x));
+  }
+  scalarTags = [...allScalars].sort();
+  imageTags  = [...allImages].sort();
   await renderAllCharts();
   renderImageTagDropdown();
   if (imageTags.length && !document.getElementById('img-tag').value) {
@@ -1004,18 +1014,39 @@ activateTab(persistedGet('tab') || 'charts');
 
 refreshAll();
 
-// Background poll: incrementally update existing charts (append-only) +
-// redraw run list. Cheap; doesn't tear down charts so no flicker between
-// epochs. If a new run appeared, do a full re-render so the new run's
-// line is added to every chart.
-async function pollUpdate() {
+// Background poll: incrementally update existing charts (in-place data
+// swap, no flicker) + redraw run list. If a new run appeared OR new scalar
+// tags appeared since last render, do a full re-render so new lines/groups
+// show up. If `force` is true (manual refresh), always rebuild tag union
+// + chart groups but keep existing chart data slot until renderAllCharts
+// fills them so the area never goes empty.
+async function pollUpdate(force = false) {
   const autoAdded = await refreshRuns();
-  if (autoAdded > 0) {
+
+  // Re-fetch the tag union — handles new scalar tags emerging mid-training
+  // (e.g. test/* and val_cal/* don't appear until first calibrate fires).
+  const prevScalarKey = scalarTags.join('|');
+  if (selectedRuns.length > 0) {
+    const allScalars = new Set(), allImages = new Set();
+    for (const run of selectedRuns) {
+      const t = await api('/api/tags?run=' + encodeURIComponent(run));
+      if (!t) continue;
+      (t.scalars || []).forEach(x => allScalars.add(x));
+      (t.images  || []).forEach(x => allImages.add(x));
+    }
+    scalarTags = [...allScalars].sort();
+    imageTags  = [...allImages].sort();
+    renderImageTagDropdown();
+  }
+  const tagsChanged = scalarTags.join('|') !== prevScalarKey;
+
+  if (autoAdded > 0 || tagsChanged || (force && Object.keys(charts).length === 0)) {
     await renderAllCharts();
     return;
   }
   if (Object.keys(charts).length === 0 || selectedRuns.length === 0) return;
-  // For each existing chart, fetch latest series and append new points.
+
+  // Existing charts: fetch latest series, swap dataset.data in place.
   const tags = Object.keys(charts);
   const runs = selectedRuns;
   for (const tag of tags) {
@@ -1024,13 +1055,9 @@ async function pollUpdate() {
     const alpha = currentSmoothing();
     runs.forEach((run, i) => {
       const seriesRaw = (perRun[run] || []).map(d => ({ x: d.ep, y: d.value }));
-      // Datasets are interleaved when smoothing is on (raw, smoothed, raw,
-      // smoothed, …). Find this run's smoothed dataset by label match.
       const smoothedDS = chart.data.datasets.find(d => d.label === run);
       const rawDS = chart.data.datasets.find(d => d.label === `${run} (raw)`);
       const smoothed = alpha > 0 ? emaSmooth(seriesRaw, alpha) : seriesRaw;
-      // Replace data wholesale if length differs by more than just an append
-      // — handles edge cases like calibrate emitting a different metric set.
       if (!smoothedDS) return;
       smoothedDS.data = smoothed;
       if (rawDS) rawDS.data = seriesRaw;
@@ -1038,7 +1065,7 @@ async function pollUpdate() {
     chart.update('none');
   }
 }
-setInterval(pollUpdate, 10000);
+setInterval(() => pollUpdate(false), 10000);
 </script>
 </body>
 </html>
