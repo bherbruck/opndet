@@ -550,6 +550,41 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         if loss_kw.get("count_weight", 0.0) > 0:
             print(f"count-aware loss: peak_kernel={peak_k}, peak_eps={peak_eps} (auto-detected from model)")
     loss_fn = OpndetBboxLoss(**loss_kw)
+
+    # Loss-weight curriculum. Two YAML forms:
+    #   curriculum: warmup_wh           # shorthand: ramp w_wh from 0 → final
+    #                                   # over the first 20% of total epochs
+    #   curriculum:                     # custom per-weight schedule
+    #     w_wh:  {start_epoch: 0,  end_epoch: 15, start_value: 0.0, end_value: 1.5}
+    #     w_cxy: {start_epoch: 0,  end_epoch:  5, start_value: 0.0, end_value: 1.0}
+    # Each entry is a linear ramp; before start_epoch = start_value, after
+    # end_epoch = end_value.
+    curriculum_cfg = c.get("curriculum")
+    curriculum_schedule: dict[str, dict] = {}
+    if curriculum_cfg == "warmup_wh":
+        warmup_end = max(1, int(epochs * 0.20))
+        curriculum_schedule = {
+            "w_wh":  {"start_epoch": 0, "end_epoch": warmup_end,
+                      "start_value": 0.0, "end_value": float(loss_fn.w_wh)},
+        }
+        print(f"curriculum: warmup_wh — w_wh ramps 0 → {loss_fn.w_wh:.2f} over epochs 1-{warmup_end}")
+    elif isinstance(curriculum_cfg, dict):
+        for k, spec in curriculum_cfg.items():
+            curriculum_schedule[k] = dict(spec)
+        if curriculum_schedule:
+            print(f"curriculum: custom schedule — {sorted(curriculum_schedule.keys())}")
+
+    def _apply_curriculum(epoch_1based: int) -> None:
+        for name, spec in curriculum_schedule.items():
+            s_ep = float(spec.get("start_epoch", 0))
+            e_ep = float(spec.get("end_epoch", s_ep + 1))
+            s_v  = float(spec.get("start_value", 0.0))
+            e_v  = float(spec.get("end_value", 1.0))
+            t = (epoch_1based - 1 - s_ep) / max(1e-9, e_ep - s_ep)
+            t = max(0.0, min(1.0, t))
+            v = s_v + (e_v - s_v) * t
+            if hasattr(loss_fn, name):
+                setattr(loss_fn, name, v)
     opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
@@ -680,6 +715,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     last_test_epoch = 0
 
     for epoch in range(start_epoch, epochs):
+        _apply_curriculum(epoch + 1)
         model.train()
         t0 = time.time()
         running: dict[str, float] = {}

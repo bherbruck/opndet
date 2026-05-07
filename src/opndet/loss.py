@@ -50,6 +50,17 @@ def _bbox_iou(p: torch.Tensor, g: torch.Tensor, mode: str = "giou", eps: float =
         giou = iou - (c_area - union) / c_area
         return 1.0 - giou
 
+    if mode == "diou":
+        # CIoU minus the aspect-ratio (v) term. Same center+containment
+        # penalty, NO aspect blow-up at random init. Use this when CIoU is
+        # destabilizing wh early in training but you still want the IoU
+        # signal vs plain L1.
+        c_diag2 = c_w * c_w + c_h * c_h + eps
+        p_cx = (px1 + px2) * 0.5; p_cy = (py1 + py2) * 0.5
+        g_cx = (gx1 + gx2) * 0.5; g_cy = (gy1 + gy2) * 0.5
+        center_d2 = (p_cx - g_cx) ** 2 + (p_cy - g_cy) ** 2
+        return 1.0 - iou + center_d2 / c_diag2
+
     if mode == "ciou":
         c_diag2 = c_w * c_w + c_h * c_h + eps
         p_cx = (px1 + px2) * 0.5; p_cy = (py1 + py2) * 0.5
