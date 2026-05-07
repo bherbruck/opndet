@@ -384,6 +384,18 @@ _INDEX_HTML = """<!doctype html>
     .chart-card { background: #0e1116; border: 1px solid #30363d; border-radius: 4px; padding: 8px; }
     .chart-card .title { font-size: 12px; color: #c9d1d9; margin-bottom: 4px; }
     .chart-card canvas { width: 100% !important; height: 180px !important; }
+    .chart-group { background: #161b22; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 12px; }
+    .chart-group > summary { cursor: pointer; padding: 8px 12px; font-size: 13px; color: #f0f6fc; font-weight: 600; user-select: none; list-style: none; display: flex; align-items: center; gap: 8px; }
+    .chart-group > summary::before { content: "▸"; transition: transform 0.15s; color: #7d8590; font-weight: normal; }
+    .chart-group[open] > summary::before { transform: rotate(90deg); }
+    .chart-group > summary .count { color: #7d8590; font-size: 11px; font-weight: normal; margin-left: auto; }
+    .chart-group > .charts { padding: 0 12px 12px; }
+    .tabs { display: flex; gap: 0; border-bottom: 1px solid #30363d; margin-bottom: 12px; }
+    .tab { padding: 8px 16px; cursor: pointer; color: #7d8590; border-bottom: 2px solid transparent; user-select: none; font-size: 13px; }
+    .tab:hover { color: #c9d1d9; }
+    .tab.active { color: #f0f6fc; border-bottom-color: #58a6ff; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
     .image-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; font-size: 12px; }
     .image-controls select, .image-controls input[type=range] { background: #0e1116; color: #d6dee6; border: 1px solid #30363d; border-radius: 3px; padding: 3px 6px; }
     .image-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
@@ -416,16 +428,11 @@ _INDEX_HTML = """<!doctype html>
       <span>runs</span>
       <span id="runs-count" style="color:#39c860;font-size:11px">0 selected</span>
     </h3>
-    <div id="run-list" class="tag-list" style="max-height:220px;overflow:auto;border:1px solid #21262d;border-radius:3px;padding:4px;margin-bottom:6px"></div>
+    <div id="run-list" class="tag-list" style="max-height:60vh;overflow:auto;border:1px solid #21262d;border-radius:3px;padding:4px;margin-bottom:6px"></div>
     <div style="display:flex;gap:6px;margin-bottom:14px">
       <button onclick="toggleAllRuns(true)" style="flex:1">select all</button>
       <button onclick="toggleAllRuns(false)" style="flex:1">deselect all</button>
     </div>
-
-    <h3>scalars</h3>
-    <div id="scalar-tags" class="tag-list"></div>
-    <h3 style="margin-top:14px">image tags</h3>
-    <div id="image-tags" class="tag-list"></div>
 
     <details>
       <summary>SQL</summary>
@@ -438,30 +445,35 @@ _INDEX_HTML = """<!doctype html>
   </div>
 
   <div class="pane">
-    <h3 style="display:flex;justify-content:space-between;align-items:center">
-      <span>charts</span>
-      <span style="font-size:11px;color:#7d8590;text-transform:none;letter-spacing:0">
-        smoothing <input id="smooth-slider" type="range" min="0" max="0.99" step="0.01" value="0" style="vertical-align:middle">
-        <span id="smooth-val">0.00</span>
-      </span>
-    </h3>
-    <div id="charts" class="charts"></div>
-
-    <h3 style="margin-top:18px">images</h3>
-    <div class="image-controls">
-      <label>tag <select id="img-tag"></select></label>
-      <label>epoch <select id="img-ep"></select></label>
-      <label>score ≥ <input id="score-thresh" type="range" min="0" max="1" step="0.01" value="0.2"> <span id="score-val">0.20</span></label>
-      <label><input type="checkbox" id="show-pred" checked> pred</label>
-      <label><input type="checkbox" id="show-gt" checked> gt</label>
-      <label><input type="checkbox" id="show-tp"> tp</label>
-      <label><input type="checkbox" id="show-fp"> fp</label>
-      <label><input type="checkbox" id="show-fn"> fn</label>
-      <label><input type="checkbox" id="show-trail" checked> trail</label>
-      <label><input type="checkbox" id="show-prior" checked> prior heat</label>
-      <label>α <input id="overlay-alpha" type="range" min="0" max="1" step="0.05" value="0.5"></label>
+    <div class="tabs">
+      <div class="tab active" data-tab="charts">charts</div>
+      <div class="tab" data-tab="images">images</div>
     </div>
-    <div id="image-grid" class="image-grid"></div>
+
+    <div class="tab-panel active" data-panel="charts">
+      <div style="display:flex;justify-content:flex-end;align-items:center;font-size:11px;color:#7d8590;margin-bottom:8px">
+        smoothing <input id="smooth-slider" type="range" min="0" max="0.99" step="0.01" value="0" style="vertical-align:middle;margin-left:6px">
+        <span id="smooth-val" style="margin-left:6px">0.00</span>
+      </div>
+      <div id="chart-groups"></div>
+    </div>
+
+    <div class="tab-panel" data-panel="images">
+      <div class="image-controls">
+        <label>tag <select id="img-tag"></select></label>
+        <label>epoch <select id="img-ep"></select></label>
+        <label>score ≥ <input id="score-thresh" type="range" min="0" max="1" step="0.01" value="0.2"> <span id="score-val">0.20</span></label>
+        <label><input type="checkbox" id="show-pred" checked> pred</label>
+        <label><input type="checkbox" id="show-gt" checked> gt</label>
+        <label><input type="checkbox" id="show-tp"> tp</label>
+        <label><input type="checkbox" id="show-fp"> fp</label>
+        <label><input type="checkbox" id="show-fn"> fn</label>
+        <label><input type="checkbox" id="show-trail" checked> trail</label>
+        <label><input type="checkbox" id="show-prior" checked> prior heat</label>
+        <label>α <input id="overlay-alpha" type="range" min="0" max="1" step="0.05" value="0.5"></label>
+      </div>
+      <div id="image-grid" class="image-grid"></div>
+    </div>
   </div>
 </div>
 
@@ -488,10 +500,12 @@ function lsSet(key, value) {
 function hashGet() {
   const h = (location.hash || '').replace(/^#/, '');
   const params = new URLSearchParams(h);
-  const r = (params.get('runs')    || '').split(',').filter(Boolean);
-  const s = (params.get('scalars') || '').split(',').filter(Boolean);
-  const k = (params.get('known')   || '').split(',').filter(Boolean);
-  return {runs: r, scalars: s, known: k};
+  const r = (params.get('runs')        || '').split(',').filter(Boolean);
+  const s = (params.get('scalars')     || '').split(',').filter(Boolean);
+  const k = (params.get('known')       || '').split(',').filter(Boolean);
+  const o = (params.get('openGroups')  || '').split(',').filter(Boolean);
+  const t = params.get('tab') || 'charts';
+  return {runs: r, scalars: s, known: k, openGroups: o, tab: t};
 }
 function hashSet(runs, scalars, known) {
   const params = new URLSearchParams();
@@ -505,10 +519,12 @@ function hashSet(runs, scalars, known) {
 }
 function persistedGet(kind) {
   const h = hashGet();
-  if (h[kind].length) return h[kind];
-  if (kind === 'runs')    return lsGet(LS_RUNS, []);
-  if (kind === 'scalars') return lsGet(LS_SCALARS, []);
-  if (kind === 'known')   return lsGet(LS_KNOWN, []);
+  if (kind === 'tab')         return h.tab || 'charts';
+  if (kind === 'openGroups')  return h.openGroups.length ? h.openGroups : (lsGet('opndet:openGroups', []) || []);
+  if (h[kind] && h[kind].length) return h[kind];
+  if (kind === 'runs')        return lsGet(LS_RUNS, []);
+  if (kind === 'scalars')     return lsGet(LS_SCALARS, []);
+  if (kind === 'known')       return lsGet(LS_KNOWN, []);
   return [];
 }
 function persistedSet(runs, scalars, known) {
@@ -612,68 +628,98 @@ async function refreshAll() {
   }
   const tags = await api('/api/tags?run=' + encodeURIComponent(primaryRun())) || {scalars: [], images: []};
   scalarTags = tags.scalars; imageTags = tags.images;
-  renderScalarTags();
-  renderImageTags();
-  // pre-check from persisted state (URL hash > localStorage) if present,
-  // else common defaults. Call addChart directly because dispatching a
-  // synthetic 'change' event doesn't bubble to the parent listener by
-  // default.
-  if (Object.keys(charts).length === 0) {
-    let toCheck = persistedGet('scalars');
-    if (!Array.isArray(toCheck) || toCheck.length === 0) {
-      toCheck = ['val/f1', 'val/f1_opt', 'val_cold/f1_opt', 'prior_lift/val/f1_opt', 'val_cal/f1', 'train/loss'];
-    }
-    for (const t of toCheck) {
-      const el = document.querySelector(`input[data-scalar="${CSS.escape(t)}"]`);
-      if (el) {
-        el.checked = true;
-        addChart(t);
-      }
-    }
-    persistedSet(selectedRuns, Object.keys(charts), persistedGet('known'));
-  } else {
-    // re-fetch existing charts with the new run selection
-    for (const tag of Object.keys(charts)) {
-      removeChart(tag);
-      addChart(tag);
-    }
-  }
+  await renderAllCharts();
+  renderImageTagDropdown();
   if (imageTags.length && !document.getElementById('img-tag').value) {
     document.getElementById('img-tag').value = imageTags[0];
     await loadImageEpochs();
   }
 }
 
-function renderScalarTags() {
-  const root = document.getElementById('scalar-tags');
-  root.innerHTML = '';
-  for (const tag of scalarTags) {
-    const id = 'sc_' + tag.replace(/[^a-z0-9]/gi, '_');
-    const lbl = document.createElement('label');
-    lbl.innerHTML = `<input type="checkbox" data-scalar="${tag}" id="${id}"> ${tag}`;
-    root.appendChild(lbl);
-  }
-  root.onchange = e => {
-    if (e.target.matches('input[data-scalar]')) {
-      const tag = e.target.dataset.scalar;
-      if (e.target.checked) addChart(tag); else removeChart(tag);
-      persistedSet(selectedRuns, Object.keys(charts), persistedGet('known'));
-    }
-  };
+// Group key = first slash component of the tag (e.g. "val/f1" → "val",
+// "prior_lift/val/f1_opt" → "prior_lift"). Default-open whitelist for
+// the most-watched groups.
+const GROUP_OPEN_DEFAULT = new Set(['val', 'val_cal', 'test', 'prior_lift', 'train']);
+const GROUP_ORDER = ['train', 'val', 'val_cal', 'val_cold', 'test', 'test_cold',
+                      'prior_lift', 'eval', 'time', 'lr', 'misc'];
+
+function groupKey(tag) {
+  const slash = tag.indexOf('/');
+  return slash === -1 ? 'misc' : tag.slice(0, slash);
+}
+function groupSort(a, b) {
+  const ai = GROUP_ORDER.indexOf(a), bi = GROUP_ORDER.indexOf(b);
+  if (ai >= 0 && bi >= 0) return ai - bi;
+  if (ai >= 0) return -1;
+  if (bi >= 0) return 1;
+  return a.localeCompare(b);
 }
 
-function renderImageTags() {
-  const root = document.getElementById('image-tags');
+async function renderAllCharts() {
+  // tear down any existing charts; we rebuild from the current scalarTags
+  for (const tag of Object.keys(charts)) removeChart(tag);
+  const root = document.getElementById('chart-groups');
+  root.innerHTML = '';
+
+  if (scalarTags.length === 0 || selectedRuns.length === 0) return;
+
+  // bucket
+  const groups = {};
+  for (const tag of scalarTags) {
+    const g = groupKey(tag);
+    (groups[g] ||= []).push(tag);
+  }
+  const sortedGroups = Object.keys(groups).sort(groupSort);
+
+  // remember which groups the user collapsed/expanded across this session
+  const openSet = new Set(persistedGet('openGroups').length ? persistedGet('openGroups') : sortedGroups.filter(g => GROUP_OPEN_DEFAULT.has(g)));
+
+  for (const g of sortedGroups) {
+    const det = document.createElement('details');
+    det.className = 'chart-group';
+    det.dataset.group = g;
+    if (openSet.has(g)) det.open = true;
+    const sum = document.createElement('summary');
+    sum.innerHTML = `<span>${g}</span><span class="count">${groups[g].length}</span>`;
+    det.appendChild(sum);
+    const charts_div = document.createElement('div');
+    charts_div.className = 'charts';
+    det.appendChild(charts_div);
+    root.appendChild(det);
+    // only render charts when the group is open (saves bandwidth/rerender)
+    if (det.open) {
+      for (const tag of groups[g]) await addChart(tag, charts_div);
+    }
+    // lazy-load on first expand
+    det.addEventListener('toggle', async () => {
+      saveOpenGroups();
+      if (det.open && charts_div.childElementCount === 0) {
+        for (const tag of groups[g]) await addChart(tag, charts_div);
+      }
+    });
+  }
+}
+
+function saveOpenGroups() {
+  const open = [...document.querySelectorAll('.chart-group[open]')].map(d => d.dataset.group);
+  // store via persistedSet — extends the existing hash with an openGroups field
+  const params = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+  if (open.length) params.set('openGroups', open.join(','));
+  else params.delete('openGroups');
+  history.replaceState(null, '', location.pathname + location.search + '#' + params.toString());
+  try { localStorage.setItem('opndet:openGroups', JSON.stringify(open)); } catch {}
+}
+
+function renderImageTagDropdown() {
   const sel = document.getElementById('img-tag');
-  root.innerHTML = ''; sel.innerHTML = '';
+  const prev = sel.value;
+  sel.innerHTML = '';
   for (const tag of imageTags) {
-    const lbl = document.createElement('label');
-    lbl.textContent = tag;
-    root.appendChild(lbl);
     const opt = document.createElement('option');
     opt.value = opt.textContent = tag;
     sel.appendChild(opt);
   }
+  if (prev && imageTags.includes(prev)) sel.value = prev;
 }
 
 // EMA smoothing — alpha closer to 1 = heavier smoothing. Returns a new
@@ -692,14 +738,14 @@ function currentSmoothing() {
   return parseFloat(document.getElementById('smooth-slider').value);
 }
 
-async function addChart(tag) {
+async function addChart(tag, parent) {
   if (charts[tag]) return;
   if (selectedRuns.length === 0) return;
   const card = document.createElement('div');
   card.className = 'chart-card';
   card.id = 'card_' + tag.replace(/[^a-z0-9]/gi, '_');
   card.innerHTML = `<div class="title">${tag}</div><canvas></canvas>`;
-  document.getElementById('charts').appendChild(card);
+  (parent || document.querySelector('#chart-groups .chart-group[open] .charts') || document.getElementById('chart-groups')).appendChild(card);
 
   const perRun = await api(`/api/scalars/runs?tag=${encodeURIComponent(tag)}&runs=${selectedRuns.map(encodeURIComponent).join(',')}`) || {};
   const alpha = currentSmoothing();
@@ -772,12 +818,12 @@ async function addChart(tag) {
   });
 }
 
-function reapplySmoothing() {
+async function reapplySmoothing() {
   const alpha = currentSmoothing();
   document.getElementById('smooth-val').textContent = alpha.toFixed(2);
-  // Re-fetch each chart so the raw + smoothed datasets are rebuilt.
-  // Cheap because data is small and the API serves directly from shadow db.
-  for (const tag of Object.keys(charts)) { removeChart(tag); addChart(tag); }
+  // Re-render the entire group structure so chart cards land back in
+  // their correct group accordion.
+  await renderAllCharts();
 }
 
 function removeChart(tag) {
@@ -938,6 +984,19 @@ document.getElementById('smooth-slider').addEventListener('input', () => {
   document.getElementById('smooth-val').textContent = currentSmoothing().toFixed(2);
 });
 document.getElementById('smooth-slider').addEventListener('change', reapplySmoothing);
+
+// Tabs
+function activateTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.dataset.panel === name));
+  const params = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+  if (name === 'charts') params.delete('tab'); else params.set('tab', name);
+  history.replaceState(null, '', location.pathname + location.search + '#' + params.toString());
+}
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => activateTab(t.dataset.tab));
+});
+activateTab(persistedGet('tab') || 'charts');
 
 refreshAll();
 setInterval(async () => {
