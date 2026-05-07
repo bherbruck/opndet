@@ -596,7 +596,9 @@ async function refreshAll() {
   renderScalarTags();
   renderImageTags();
   // pre-check from persisted state (URL hash > localStorage) if present,
-  // else common defaults
+  // else common defaults. Call addChart directly because dispatching a
+  // synthetic 'change' event doesn't bubble to the parent listener by
+  // default.
   if (Object.keys(charts).length === 0) {
     let toCheck = persistedGet('scalars');
     if (!Array.isArray(toCheck) || toCheck.length === 0) {
@@ -604,8 +606,12 @@ async function refreshAll() {
     }
     for (const t of toCheck) {
       const el = document.querySelector(`input[data-scalar="${CSS.escape(t)}"]`);
-      if (el) { el.checked = true; el.dispatchEvent(new Event('change')); }
+      if (el) {
+        el.checked = true;
+        addChart(t);
+      }
     }
+    persistedSet(selectedRuns, Object.keys(charts), persistedGet('known'));
   } else {
     // re-fetch existing charts with the new run selection
     for (const tag of Object.keys(charts)) {
