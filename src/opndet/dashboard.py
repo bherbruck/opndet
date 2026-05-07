@@ -383,7 +383,11 @@ _INDEX_HTML = """<!doctype html>
     .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 10px; }
     .chart-card { background: #0e1116; border: 1px solid #30363d; border-radius: 4px; padding: 8px; }
     .chart-card .title { font-size: 12px; color: #c9d1d9; margin-bottom: 4px; }
-    .chart-card canvas { width: 100% !important; height: 180px !important; }
+    /* explicit fixed-height canvas wrapper so Chart.js can't stretch the
+       canvas to fill arbitrary parent height (was causing image-tall charts) */
+    .chart-card .canvas-wrap { position: relative; width: 100%; height: 180px; }
+    .chart-card canvas { position: absolute !important; inset: 0; width: 100% !important; height: 100% !important; }
+    .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
     .chart-group { background: #161b22; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 12px; }
     .chart-group > summary { cursor: pointer; padding: 8px 12px; font-size: 13px; color: #f0f6fc; font-weight: 600; user-select: none; list-style: none; display: flex; align-items: center; gap: 8px; }
     .chart-group > summary::before { content: "▸"; transition: transform 0.15s; color: #7d8590; font-weight: normal; }
@@ -589,7 +593,11 @@ async function refreshRuns() {
     const id = 'run_' + r.name.replace(/[^a-z0-9]/gi, '_');
     const lbl = document.createElement('label');
     lbl.title = `${r.path}\n${new Date(r.mtime * 1000).toString()}`;
-    lbl.innerHTML = `<input type="checkbox" data-run="${r.name}" id="${id}"${sel.has(r.name) ? ' checked' : ''}> <span style="font-weight:500">${r.name}</span> <span style="color:#7d8590;font-size:11px">${dt}</span>`;
+    // color swatch matches the chart's line color for this run (only for
+    // selected runs — unselected get a neutral dot)
+    const idx = selectedRuns.indexOf(r.name);
+    const color = idx >= 0 ? RUN_COLORS[idx % RUN_COLORS.length] : '#30363d';
+    lbl.innerHTML = `<input type="checkbox" data-run="${r.name}" id="${id}"${sel.has(r.name) ? ' checked' : ''}><span class="swatch" style="background:${color}"></span><span style="font-weight:500">${r.name}</span> <span style="color:#7d8590;font-size:11px">${dt}</span>`;
     list.appendChild(lbl);
   }
   if (runs.length === 0) {
@@ -743,7 +751,7 @@ async function addChart(tag, parent) {
   const card = document.createElement('div');
   card.className = 'chart-card';
   card.id = 'card_' + tag.replace(/[^a-z0-9]/gi, '_');
-  card.innerHTML = `<div class="title">${tag}</div><canvas></canvas>`;
+  card.innerHTML = `<div class="title">${tag}</div><div class="canvas-wrap"><canvas></canvas></div>`;
   (parent || document.querySelector('#chart-groups .chart-group[open] .charts') || document.getElementById('chart-groups')).appendChild(card);
 
   const perRun = await api(`/api/scalars/runs?tag=${encodeURIComponent(tag)}&runs=${selectedRuns.map(encodeURIComponent).join(',')}`) || {};
@@ -782,19 +790,16 @@ async function addChart(tag, parent) {
     options: {
       animation: false,
       parsing: false,
+      responsive: true,
+      maintainAspectRatio: false,
       // index mode = vertical crosshair, all runs' values at the hovered
       // epoch shown together. intersect:false so you don't have to land
       // on a point.
       interaction: { mode: 'index', intersect: false, axis: 'x' },
       plugins: {
-        legend: {
-          display: selectedRuns.length > 1,
-          labels: {
-            color: '#c9d1d9', boxWidth: 12,
-            // hide the "(raw)" entries from the legend
-            filter: (item) => !item.text.endsWith('(raw)'),
-          },
-        },
+        // Per-chart legend off — run color is shown beside each run in the
+        // left sidebar, so the same legend on every chart is just noise.
+        legend: { display: false },
         tooltip: {
           mode: 'index', intersect: false,
           backgroundColor: '#0e1116', borderColor: '#30363d', borderWidth: 1,
@@ -998,13 +1003,42 @@ document.querySelectorAll('.tab').forEach(t => {
 activateTab(persistedGet('tab') || 'charts');
 
 refreshAll();
-setInterval(async () => {
+
+// Background poll: incrementally update existing charts (append-only) +
+// redraw run list. Cheap; doesn't tear down charts so no flicker between
+// epochs. If a new run appeared, do a full re-render so the new run's
+// line is added to every chart.
+async function pollUpdate() {
   const autoAdded = await refreshRuns();
-  // re-fetch charts only when something actually changed
   if (autoAdded > 0) {
-    for (const tag of Object.keys(charts)) { removeChart(tag); addChart(tag); }
+    await renderAllCharts();
+    return;
   }
-}, 30000);
+  if (Object.keys(charts).length === 0 || selectedRuns.length === 0) return;
+  // For each existing chart, fetch latest series and append new points.
+  const tags = Object.keys(charts);
+  const runs = selectedRuns;
+  for (const tag of tags) {
+    const chart = charts[tag];
+    const perRun = await api(`/api/scalars/runs?tag=${encodeURIComponent(tag)}&runs=${runs.map(encodeURIComponent).join(',')}`) || {};
+    const alpha = currentSmoothing();
+    runs.forEach((run, i) => {
+      const seriesRaw = (perRun[run] || []).map(d => ({ x: d.ep, y: d.value }));
+      // Datasets are interleaved when smoothing is on (raw, smoothed, raw,
+      // smoothed, …). Find this run's smoothed dataset by label match.
+      const smoothedDS = chart.data.datasets.find(d => d.label === run);
+      const rawDS = chart.data.datasets.find(d => d.label === `${run} (raw)`);
+      const smoothed = alpha > 0 ? emaSmooth(seriesRaw, alpha) : seriesRaw;
+      // Replace data wholesale if length differs by more than just an append
+      // — handles edge cases like calibrate emitting a different metric set.
+      if (!smoothedDS) return;
+      smoothedDS.data = smoothed;
+      if (rawDS) rawDS.data = seriesRaw;
+    });
+    chart.update('none');
+  }
+}
+setInterval(pollUpdate, 10000);
 </script>
 </body>
 </html>
