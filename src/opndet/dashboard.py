@@ -269,9 +269,14 @@ def spawn_background(
     host: str = "127.0.0.1",
     port: int = 5000,
     wait_for_ready: float = 1.5,
+    quiet: bool = False,
 ):
-    """Spawn the dashboard as a child process. Prints localhost:port so the
-    URL is visible in any cell/log. Returns the subprocess.Popen."""
+    """Spawn the dashboard as a child process. Prints localhost:port to
+    stdout so the URL is visible in any cell/log. Returns subprocess.Popen.
+
+    quiet=False (default): subprocess stderr inherits the parent so errors
+    are visible. Pass quiet=True to silence completely.
+    """
     import subprocess
     import sys
     import time
@@ -279,7 +284,12 @@ def spawn_background(
         sys.executable, "-m", "opndet.cli", "dashboard",
         "--root", str(root_dir), "--host", host, "--port", str(port),
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if quiet:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # stdout silenced (uvicorn startup banner is noisy), stderr inherits
+        # so tracebacks reach the cell — most common debug path.
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL)
     print(f"opndet dashboard: http://localhost:{port}", flush=True)
     if wait_for_ready > 0:
         time.sleep(wait_for_ready)
