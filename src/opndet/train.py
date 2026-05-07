@@ -855,7 +855,26 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         if cur > best_metric:
             best_metric = cur
             best_epoch = ep
-            torch.save(ckpt, out_dir / "best.pt")
+            # Deployment-clean ckpt: model weights + temperature + config +
+            # metadata. NO optimizer/scaler (~3-4× smaller, ready to upload
+            # without exposing training state). Filename includes the run
+            # name so multiple runs' bests can sit in one folder without
+            # clobbering each other.
+            slim = {
+                "model": deployed_state,
+                "ema": ema.shadow.state_dict() if ema is not None else None,
+                "epoch": ep,
+                "step": step,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "metric_for_best": metric_for_best,
+                "metrics": m,
+                "metrics_cal": m_cal,
+                "temperature": float(cur_T),
+                "config": c,
+            }
+            torch.save(slim, out_dir / "best.pt")
+            torch.save(slim, out_dir / f"{out_dir.name}_best.pt")
             print(f"  -> saved best ({metric_for_best}={best_metric:.3f}, T={cur_T:.3f})  (save {time.time() - _t_phase:.1f}s)")
 
         if patience > 0:
