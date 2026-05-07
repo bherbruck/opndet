@@ -186,6 +186,10 @@ def spawn_background(
     """Spawn the dashboard as a child process and (when in Colab and
     embed_iframe=True) auto-embed it as an iframe in the calling notebook
     cell. Returns the subprocess.Popen so callers can terminate() at exit.
+
+    Prints the URL from the parent process so it shows in the notebook cell
+    output even when invoked from inside a `!opndet train` bash subprocess
+    (where the child's stdout would otherwise be lost).
     """
     import subprocess
     import sys
@@ -195,6 +199,7 @@ def spawn_background(
         "--run", str(run_dir), "--host", host, "--port", str(port),
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"opndet dashboard: http://{host}:{port}", flush=True)
     if wait_for_ready > 0:
         time.sleep(wait_for_ready)
     if embed_iframe:
