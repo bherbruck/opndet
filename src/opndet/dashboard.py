@@ -438,7 +438,13 @@ _INDEX_HTML = """<!doctype html>
   </div>
 
   <div class="pane">
-    <h3>charts</h3>
+    <h3 style="display:flex;justify-content:space-between;align-items:center">
+      <span>charts</span>
+      <span style="font-size:11px;color:#7d8590;text-transform:none;letter-spacing:0">
+        smoothing <input id="smooth-slider" type="range" min="0" max="0.99" step="0.01" value="0" style="vertical-align:middle">
+        <span id="smooth-val">0.00</span>
+      </span>
+    </h3>
     <div id="charts" class="charts"></div>
 
     <h3 style="margin-top:18px">images</h3>
@@ -670,6 +676,22 @@ function renderImageTags() {
   }
 }
 
+// EMA smoothing — alpha closer to 1 = heavier smoothing. Returns a new
+// array of {x, y} points with debiased EMA (TB-style).
+function emaSmooth(points, alpha) {
+  if (alpha <= 0 || points.length === 0) return points;
+  let last = 0, debias = 0;
+  return points.map((p, i) => {
+    last = last * alpha + (1 - alpha) * p.y;
+    debias = debias * alpha + (1 - alpha) * 1;
+    return { x: p.x, y: last / Math.max(debias, 1e-9) };
+  });
+}
+
+function currentSmoothing() {
+  return parseFloat(document.getElementById('smooth-slider').value);
+}
+
 async function addChart(tag) {
   if (charts[tag]) return;
   if (selectedRuns.length === 0) return;
@@ -679,20 +701,35 @@ async function addChart(tag) {
   card.innerHTML = `<div class="title">${tag}</div><canvas></canvas>`;
   document.getElementById('charts').appendChild(card);
 
-  // multi-run: hit the per-run endpoint
   const perRun = await api(`/api/scalars/runs?tag=${encodeURIComponent(tag)}&runs=${selectedRuns.map(encodeURIComponent).join(',')}`) || {};
-  const datasets = selectedRuns.map((run, i) => {
-    const series = perRun[run] || [];
+  const alpha = currentSmoothing();
+  const datasets = [];
+  selectedRuns.forEach((run, i) => {
+    const series = (perRun[run] || []).map(d => ({ x: d.ep, y: d.value }));
     const color = RUN_COLORS[i % RUN_COLORS.length];
-    return {
+    if (alpha > 0) {
+      // raw line, faint dashed (kept for reference)
+      datasets.push({
+        label: `${run} (raw)`,
+        data: series,
+        borderColor: color + '66',
+        borderDash: [3, 3],
+        borderWidth: 1,
+        pointRadius: 0,
+        tension: 0,
+      });
+    }
+    datasets.push({
       label: run,
-      data: series.map(d => ({ x: d.ep, y: d.value })),
+      data: alpha > 0 ? emaSmooth(series, alpha) : series,
       borderColor: color,
       backgroundColor: color + '22',
+      borderWidth: 2,
       tension: 0.2,
       pointRadius: 1,
-    };
+    });
   });
+
   const ctx = card.querySelector('canvas').getContext('2d');
   charts[tag] = new Chart(ctx, {
     type: 'line',
@@ -700,13 +737,47 @@ async function addChart(tag) {
     options: {
       animation: false,
       parsing: false,
-      plugins: { legend: { display: selectedRuns.length > 1, labels: { color: '#c9d1d9', boxWidth: 12 } } },
+      // index mode = vertical crosshair, all runs' values at the hovered
+      // epoch shown together. intersect:false so you don't have to land
+      // on a point.
+      interaction: { mode: 'index', intersect: false, axis: 'x' },
+      plugins: {
+        legend: {
+          display: selectedRuns.length > 1,
+          labels: {
+            color: '#c9d1d9', boxWidth: 12,
+            // hide the "(raw)" entries from the legend
+            filter: (item) => !item.text.endsWith('(raw)'),
+          },
+        },
+        tooltip: {
+          mode: 'index', intersect: false,
+          backgroundColor: '#0e1116', borderColor: '#30363d', borderWidth: 1,
+          titleColor: '#f0f6fc', bodyColor: '#c9d1d9',
+          callbacks: {
+            // skip "(raw)" entries in the tooltip
+            beforeBody: () => null,
+            label: (ctx) => {
+              if (ctx.dataset.label.endsWith('(raw)')) return null;
+              return `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(4)}  @ep ${ctx.parsed.x}`;
+            },
+          },
+        },
+      },
       scales: {
-        x: { type: 'linear', ticks: { color: '#7d8590' }, grid: { color: '#21262d' } },
+        x: { type: 'linear', ticks: { color: '#7d8590' }, grid: { color: '#21262d' }, title: { display: false } },
         y: { ticks: { color: '#7d8590' }, grid: { color: '#21262d' } },
       },
     },
   });
+}
+
+function reapplySmoothing() {
+  const alpha = currentSmoothing();
+  document.getElementById('smooth-val').textContent = alpha.toFixed(2);
+  // Re-fetch each chart so the raw + smoothed datasets are rebuilt.
+  // Cheap because data is small and the API serves directly from shadow db.
+  for (const tag of Object.keys(charts)) { removeChart(tag); addChart(tag); }
 }
 
 function removeChart(tag) {
@@ -863,6 +934,10 @@ document.getElementById('score-thresh').addEventListener('input', e => {
 });
 document.getElementById('show-prior').addEventListener('change', rerenderOverlays);
 document.getElementById('overlay-alpha').addEventListener('input', rerenderOverlays);
+document.getElementById('smooth-slider').addEventListener('input', () => {
+  document.getElementById('smooth-val').textContent = currentSmoothing().toFixed(2);
+});
+document.getElementById('smooth-slider').addEventListener('change', reapplySmoothing);
 
 refreshAll();
 setInterval(async () => {
