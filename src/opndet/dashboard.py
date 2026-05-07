@@ -509,7 +509,7 @@ _INDEX_HTML = """<!doctype html>
     .tab.active { color: #f0f6fc; border-bottom-color: #58a6ff; }
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
-    .image-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; font-size: 12px; }
+    .image-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; padding: 10px 0; position: sticky; top: 0; background: #161b22; z-index: 5; border-bottom: 1px solid #21262d; margin-bottom: 8px; }
     .image-controls select, .image-controls input[type=range] { background: #0e1116; color: #d6dee6; border: 1px solid #30363d; border-radius: 3px; padding: 3px 6px; }
     .image-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
     .img-card { position: relative; background: #0e1116; border: 1px solid #30363d; border-radius: 4px; overflow: hidden; }
@@ -1300,37 +1300,55 @@ function rerenderOverlays() {
   });
 }
 
-// Lightbox: clone the clicked card into a fixed-position fullscreen modal.
+// Lightbox: build fresh stage with explicit sizing so the canvas + overlays
+// scale exactly with the base img (cloning the grid card lost the .img-card
+// CSS rules, leaving the canvas at its natural-pixel size while the img was
+// scaled — boxes drew off the image).
 function openLightbox(card) {
   const lb = document.getElementById('lightbox');
   const stage = document.getElementById('lightbox-stage');
   const cap = document.getElementById('lightbox-caption');
   stage.innerHTML = '';
-  // Clone the stage so any layer toggles stay in sync with the grid copy.
-  const orig = card.querySelector('.stage');
-  const clone = orig.cloneNode(true);
-  clone.style.cursor = 'default';
-  // Re-bind canvas: cloned canvas is empty — we need to re-draw at full res.
-  const cv = clone.querySelector('canvas.boxes');
-  const baseImg = clone.querySelector('img.base');
-  // Make the clone fill the lightbox stage
-  clone.style.maxWidth = '96vw';
-  clone.style.maxHeight = '90vh';
-  clone.style.width = 'auto';
-  clone.style.height = 'auto';
-  baseImg.style.maxWidth = '96vw';
-  baseImg.style.maxHeight = '90vh';
-  baseImg.style.width = 'auto';
-  baseImg.style.height = 'auto';
-  baseImg.style.display = 'block';
-  stage.appendChild(clone);
-  cap.textContent = `${card._runName || ''} sample ${card._sample.sample_idx}`;
-  baseImg.onload = () => {
+
+  const s = card._sample;
+
+  // Wrapper sizes itself to the loaded image's natural aspect ratio. Setting
+  // max-w/max-h on the BASE image is what determines the displayed size;
+  // the wrapper inherits it via inline-block layout. Overlays + canvas use
+  // width/height: 100% so they always match the base image's display box,
+  // regardless of zoom/window size.
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:relative;display:inline-block;line-height:0';
+
+  const baseImg = document.createElement('img');
+  baseImg.src = s.rgb_url;
+  baseImg.style.cssText = 'display:block;max-width:98vw;max-height:92vh;width:auto;height:auto';
+  wrap.appendChild(baseImg);
+
+  for (const ov of s.overlays) {
+    const img = document.createElement('img');
+    img.src = ov.url;
+    img.dataset.kind = ov.kind;
+    img.className = 'overlay';
+    img.style.cssText = `position:absolute;inset:0;width:100%;height:100%;opacity:${overlayOpacityFor(ov.kind)};pointer-events:none`;
+    wrap.appendChild(img);
+  }
+
+  const cv = document.createElement('canvas');
+  cv.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:auto';
+  wrap.appendChild(cv);
+
+  stage.appendChild(wrap);
+  cap.textContent = `${card._runName || ''} sample ${s.sample_idx} — esc / click outside to close`;
+
+  const draw = () => {
     cv.width = baseImg.naturalWidth;
     cv.height = baseImg.naturalHeight;
-    drawBoxes(cv, card._sample.boxes);
+    drawBoxes(cv, s.boxes);
   };
-  if (baseImg.complete) baseImg.onload();
+  baseImg.onload = draw;
+  if (baseImg.complete && baseImg.naturalWidth) draw();
+
   lb.style.display = 'flex';
 }
 
