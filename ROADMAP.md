@@ -134,6 +134,10 @@ Standard detection losses optimize per-cell BCE/focal + per-cell box regression.
 
 **Definition of done**: count-aware loss is opt-in via YAML and validated to improve count accuracy without hurting mAP. Asymmetric count loss is documented with example use cases. Per-domain balancing is a config option. Curriculum mode is an opt-in flag with prescribed phase configs in each preset.
 
+### 1.6 OBB / oriented-ellipse output — see [§2.1](#21-obb--oriented-ellipse-output-format--high-priority)
+
+Listed under Part 2 architecturally but elevated to high priority. Pluggable label loaders (the `format:` field in `data.sources`) ship as the foundation; `opndet sam-obb` CLI generates labels from any AABB-annotated dataset; `opndet-bbox-x-obb` preset trains the rotated-output variant. AABB → OBB unblocks fair mAP@.5:.95 evaluation on rotated convex objects and replaces convexity loss with shape-aware heatmap supervision. Full plan in 2.1.
+
 ---
 
 ## Part 2 — The convex prior (the differentiator)
@@ -142,21 +146,57 @@ The single biggest architectural insight for opndet's actual application domain 
 
 If opndet commits to "convex objects only" as a positioning choice, several optimizations become available that would be wrong for general detection.
 
-### 2.1 Ellipse output format (alternative to AABB)
+### 2.1 OBB / oriented-ellipse output format — **HIGH PRIORITY**
 
-For convex objects, the bounding ellipse is a *better* shape descriptor than the bounding box. It captures size and orientation honestly, doesn't include the empty corners that bounding boxes add, and makes downstream measurement (sizing, grading, weight estimation) more accurate.
+For convex objects, the oriented bounding box (OBB) — equivalently the bounding ellipse — is a *strictly better* shape descriptor than AABB. AABB at 45° rotation has up to 60%+ background pixels in the box; OBB cuts this to near zero. Ellipse heatmap targets become egg-tight (no background lit), making peak supervision shape-aware and convexity loss redundant. Sizing, grading, weight estimation all become accurate measurements rather than approximations.
 
-**Plan**:
+**Why this is high priority now (was not before):**
+- SAM-driven OBB labeling is solved. User has working code (`mask_to_obb_corners` via `cv2.fitEllipse` with aspect-ratio fallback for round objects, `corners_to_yolo_obb_line` for YOLOv8-OBB output). One Colab cell, ~minutes per 1000 images.
+- AABB at rotation is the dominant unfairness in current mAP@.5:.95 — model can nail orientation but get penalized on IoU because GT is AABB.
+- Heatmap target as actual egg shape (rotated elliptical Gaussian) replaces the convexity loss with stronger, denser supervision.
 
-1. **Add a `--shape ellipse` mode** to model export. Output channels become `(obj, cx, cy, r_major, r_minor, sin_2θ, cos_2θ)` — 7 channels instead of 5. The 2θ encoding handles the π-periodicity of orientation correctly. Bounding box can be computed from ellipse parameters at decode time for compatibility with downstream code.
+**Plan:**
 
-2. **Loss for ellipse mode**: L1 on (r_major, r_minor), cosine distance on (sin 2θ, cos 2θ), gated by aspect ratio (no orientation supervision when r_major / r_minor < 1.15, since orientation is undefined for circles).
+1. **Pluggable label loaders** (foundation, ships first). Generalize `data.sources` to dispatch on a `format:` field:
+   ```yaml
+   data:
+     sources:
+       - format: coco                        # AABB (default; existing behavior)
+         json: ..., images: ...
+       - format: yolo_obb                    # OBB; *.txt next to images
+         labels: <dir>, images: <dir>
+       - format: coco_obb                    # COCO + segmentation-as-4-vertex-polygon
+         json: ..., images: ...
+   ```
+   Each loader yields a normalized internal struct `{boxes_xyxy, boxes_obb_or_None}`. AABB models ignore the OBB field; OBB models use it. Backwards-compat is automatic — existing yamls without `format:` default to `coco`.
 
-3. **Decoder**: client-side decode produces both AABB (for backwards compatibility) and ellipse parameters (for accurate measurement). The browser demo gets a "show ellipses" toggle.
+2. **OBB output head**: `[1, 7, H/4, W/4]` = `(obj, cx_rel, cy_rel, w_major, h_minor, sin_2θ, cos_2θ)`. The 2θ encoding handles the π-periodicity of orientation cleanly; tanh activations on the trig channels. Decode: `θ = 0.5 * atan2(sin_2θ, cos_2θ) % π`. ONNX opset-13 safe — sin/cos used only in client-side decode, not in the inference graph.
 
-4. **GT encoding** for ellipse mode: fit an ellipse to each GT bounding box (assuming the bbox is tight to a convex object, the inscribed ellipse is a reasonable proxy). For datasets with mask annotations, fit ellipse directly to mask. Document both paths.
+3. **Loss for OBB**: L1 on `(cx, cy, w, h)`, cosine distance on `(sin 2θ, cos 2θ)`, gated by aspect ratio (no orientation supervision when `w / h < 1.15` — orientation undefined for round objects, matches the user's `ROUNDNESS_THRESHOLD` fallback). Optional probabilistic IoU (PIoU2) once L1 baseline works, for tighter convergence.
 
-**Definition of done**: bbox-s and bbox-m support `output_format: ellipse` in YAML. Loss handles both cases. Export and decode tested. Validation on the egg dataset shows that ellipse output reduces sizing error compared to AABB-derived size estimates.
+4. **Rotated elliptical Gaussian heatmap target** (kills the AABB-shape pollution):
+   ```python
+   xp =  (xs - cx) * cos(θ) + (ys - cy) * sin(θ)
+   yp = -(xs - cx) * sin(θ) + (ys - cy) * cos(θ)
+   g = exp(-(xp²/(2σ_w²) + yp²/(2σ_h²)))
+   ```
+   Heatmap is now the actual egg shape, oriented correctly. Convexity loss can be retired; supervision IS the convex prior.
+
+5. **Decoder**: client-side decode produces both OBB params and an inferred AABB (axis-aligned bounding box of the rotated rectangle) for backwards-compatibility with downstream consumers. Browser demo gets a "show OBB" toggle.
+
+6. **Augmentation**: geometric ops update θ. `hflip → θ = π - θ`, `vflip → θ = -θ`, `rotate90(k) → θ += k * π/2`. Translate/scale leave θ alone. Mosaic concatenates after rotating each tile's θ values.
+
+7. **SAM preprocessing pipeline** as a CLI subcommand: `opndet sam-obb --coco <json> --images <dir> --out <dir>`. Wraps the user's existing notebook code: SAM2 from AABB prompt → mask → fitEllipse → 4-corner OBB → YOLOv8-OBB `*.txt` files. One-shot per dataset, idempotent (skip files that exist).
+
+8. **New preset**: `opndet-bbox-x-obb.yaml`. Output 7ch, otherwise mirrors bbox-x. Curriculum mirrors kitchen-sink: pure-center → boxes → angle → repulsion. Train and benchmark vs AABB bbox-x on the egg dataset.
+
+**Definition of done**:
+- Pluggable label loaders ship with `coco` and `yolo_obb` adapters
+- `opndet sam-obb` CLI generates labels from any AABB-annotated dataset
+- `opndet-bbox-x-obb` preset trains end-to-end and produces tight OBB output
+- Validation on egg dataset shows mAP@.5:.95 vs OBB GT ≥ 5pp higher than bbox-x AABB vs AABB GT, **AND** subjective viz: boxes hug eggs at all rotations
+- ONNX export round-trips cleanly with parity test
+- Browser demo renders rotated rectangles via `cv2.boxPoints`-equivalent
 
 ### 2.2 Distance-transform output (replaces or augments objectness heatmap)
 
