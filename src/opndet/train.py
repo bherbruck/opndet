@@ -465,8 +465,13 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                                      cache_images=cache, in_ch=in_ch, prior_synth=None, stride=stride)
     nw = int(c.get("num_workers", 2))
     pf = int(c.get("prefetch_factor", 4)) if nw > 0 else None
+    # persistent_workers: keep worker procs alive between epochs (default true,
+    # faster but cv2/numpy heaps in workers slowly accumulate over many epochs
+    # on long runs — set persistent_workers: false in train.yaml to bounce
+    # workers each iter and trade ~few seconds/epoch for guaranteed RAM release).
+    persist = bool(c.get("persistent_workers", True)) and nw > 0
     train_kw = dict(num_workers=nw, collate_fn=collate, pin_memory=device.type == "cuda",
-                    persistent_workers=nw > 0, prefetch_factor=pf)
+                    persistent_workers=persist, prefetch_factor=pf)
     eval_kw = {**train_kw, "pin_memory": False}  # val/test don't need pinned memory
     train_kw = {k: v for k, v in train_kw.items() if v is not None}
     eval_kw = {k: v for k, v in eval_kw.items() if v is not None}

@@ -545,7 +545,22 @@ _INDEX_HTML = """<!doctype html>
 <script>
 const charts = {};
 let selectedRuns = [], scalarTags = [], imageTags = [];
-const RUN_COLORS = ['#58a6ff', '#39c860', '#ff6b35', '#ffb86c', '#bd93f9', '#ff79c6', '#8be9fd', '#f1fa8c'];
+// Perceptually-distinct hue-cycled palette. Replaces the old palette where
+// orange + amber + yellow were too close, and blue + cyan blurred together.
+// 10 hues evenly spaced around the wheel at high saturation; readable on
+// dark bg.
+const RUN_COLORS = [
+  '#ef4444',  // red
+  '#f97316',  // orange
+  '#eab308',  // yellow
+  '#84cc16',  // lime
+  '#10b981',  // emerald
+  '#06b6d4',  // cyan
+  '#3b82f6',  // blue
+  '#8b5cf6',  // violet
+  '#d946ef',  // fuchsia
+  '#ec4899',  // pink
+];
 
 // Deterministic color per run name — same run always renders in the same
 // color regardless of selection order. djb2-ish string hash → palette idx.
