@@ -138,6 +138,66 @@ def size_mask(boxes: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def center_match(
+    pred_boxes: np.ndarray,
+    gt_boxes: np.ndarray,
+    dist_frac: float = 0.5,
+    min_dist_px: float = 8.0,
+) -> dict:
+    """IoU-free matcher: pair preds to GTs by center distance only.
+
+    A pred matches a GT if its center is within R pixels of GT center,
+    where R = max(min_dist_px, dist_frac × min(gt_w, gt_h)). Hungarian
+    assignment over the distance cost matrix; pairs above R are forbidden.
+
+    Why this exists: mAP@.5:.95 punishes box-shape errors hard. A model
+    placing the center perfectly but predicting wh ±20% off scores poorly
+    on IoU-based F1 even though "did we find the object" is yes. This
+    metric answers the deployment question: was the detection close to
+    where the object actually is, regardless of box shape?
+
+    Defaults: dist_frac=0.5 (half the smaller GT side) means a 40px egg
+    is matched if the predicted center is within 20px. min_dist_px=8
+    floors that for tiny GTs so single-pixel offsets don't fail at
+    stride=4 quantization.
+
+    Returns:
+        recall, precision, f1, n_match, distances_px (per matched pair),
+        radii_px (the per-GT R used).
+    """
+    n_pred = int(pred_boxes.shape[0])
+    n_gt = int(gt_boxes.shape[0])
+    if n_pred == 0 or n_gt == 0:
+        return {"recall": 0.0, "precision": 0.0, "f1": 0.0, "n_match": 0,
+                "n_pred": n_pred, "n_gt": n_gt,
+                "distances_px": np.zeros(0, dtype=np.float32),
+                "radii_px": np.zeros(0, dtype=np.float32)}
+    pcx = (pred_boxes[:, 0] + pred_boxes[:, 2]) * 0.5
+    pcy = (pred_boxes[:, 1] + pred_boxes[:, 3]) * 0.5
+    gcx = (gt_boxes[:, 0] + gt_boxes[:, 2]) * 0.5
+    gcy = (gt_boxes[:, 1] + gt_boxes[:, 3]) * 0.5
+    gw = np.clip(gt_boxes[:, 2] - gt_boxes[:, 0], 1.0, None)
+    gh = np.clip(gt_boxes[:, 3] - gt_boxes[:, 1], 1.0, None)
+    radii = np.maximum(min_dist_px, dist_frac * np.minimum(gw, gh)).astype(np.float32)
+    dx = pcx[:, None] - gcx[None, :]
+    dy = pcy[:, None] - gcy[None, :]
+    dist = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+    cost = dist.copy()
+    forbidden = dist > radii[None, :]
+    cost[forbidden] = 1e9
+    from scipy.optimize import linear_sum_assignment
+    row, col = linear_sum_assignment(cost)
+    valid = cost[row, col] < 1e8
+    n_match = int(valid.sum())
+    matched_d = dist[row[valid], col[valid]]
+    p = n_match / max(1, n_pred)
+    r = n_match / max(1, n_gt)
+    f1 = 2 * p * r / max(1e-9, p + r)
+    return {"recall": float(r), "precision": float(p), "f1": float(f1),
+            "n_match": n_match, "n_pred": n_pred, "n_gt": n_gt,
+            "distances_px": matched_d, "radii_px": radii}
+
+
 def loc_bias(matched_pred: np.ndarray, matched_gt: np.ndarray) -> dict:
     """Per-matched-pair localization stats. Both inputs [K,4] xyxy aligned by index."""
     if matched_pred.shape[0] == 0:

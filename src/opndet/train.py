@@ -223,6 +223,41 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
     recall = tp / max(1, tp + fn)
     f1 = 2 * precision * recall / max(1e-9, precision + recall)
 
+    # IoU-free "did we find it close to center?" pass. Uses the same
+    # score-thresh-filtered preds as P/R so it reflects deployment detections.
+    # Hungarian-matches by center distance with R = max(8 px, 0.5 × min(GT_w,
+    # GT_h)) — generous on shape, strict on locality. Surfaces:
+    #   center_recall, center_precision, center_f1
+    #   center_dist_mean_px, center_dist_p50_px, center_dist_p95_px
+    #   count_off_by_le1: fraction of images where |n_pred - n_gt| <= 1
+    from opndet.metrics import center_match
+    cm_match_total = cm_pred_total = cm_gt_total = 0
+    cm_dists: list[np.ndarray] = []
+    cnt_off_le1 = 0
+    cnt_total = len(per_image)
+    for scores_full, boxes_full, gt in per_image:
+        keep = scores_full >= score_thresh
+        pb = boxes_full[keep]
+        if abs(int(pb.shape[0]) - int(gt.shape[0])) <= 1:
+            cnt_off_le1 += 1
+        m = center_match(pb, gt)
+        cm_match_total += m["n_match"]
+        cm_pred_total += m["n_pred"]
+        cm_gt_total   += m["n_gt"]
+        if m["distances_px"].size > 0:
+            cm_dists.append(m["distances_px"])
+    center_recall    = cm_match_total / max(1, cm_gt_total)
+    center_precision = cm_match_total / max(1, cm_pred_total)
+    center_f1 = 2 * center_recall * center_precision / max(1e-9, center_recall + center_precision)
+    if cm_dists:
+        d = np.concatenate(cm_dists)
+        center_dist_mean = float(d.mean())
+        center_dist_p50  = float(np.percentile(d, 50))
+        center_dist_p95  = float(np.percentile(d, 95))
+    else:
+        center_dist_mean = center_dist_p50 = center_dist_p95 = 0.0
+    count_off_le1_frac = cnt_off_le1 / max(1, cnt_total)
+
     iouv = np.arange(0.5, 1.0, 0.05, dtype=np.float64)
     all_scores, all_correct, total_gt = _accumulate_correct(per_image, iouv)
     aps = _ap_from_correct(all_scores, all_correct, total_gt)
@@ -254,7 +289,14 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
 
     return {"precision": precision, "recall": recall, "f1": f1, "map50": map50, "map_50_95": map_50_95,
             "f1_opt": f1_opt, "threshold_opt": threshold_opt,
-            "n_pred": float(n_pred), "n_gt": float(n_gt)}
+            "n_pred": float(n_pred), "n_gt": float(n_gt),
+            "center_recall": float(center_recall),
+            "center_precision": float(center_precision),
+            "center_f1": float(center_f1),
+            "center_dist_mean_px": center_dist_mean,
+            "center_dist_p50_px": center_dist_p50,
+            "center_dist_p95_px": center_dist_p95,
+            "count_off_le1_frac": float(count_off_le1_frac)}
 
 
 def _bundle_run(out_dir: Path, include_tb: bool = False) -> Path | None:
@@ -605,7 +647,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     metric_for_best = str(c.get("metric_for_best", "f1"))
     valid_metrics = ("f1", "map50", "map_50_95", "f1_opt",
-                     "f1_cal", "map50_cal", "map_50_95_cal", "f1_opt_cal")
+                     "f1_cal", "map50_cal", "map_50_95_cal", "f1_opt_cal",
+                     "center_f1", "center_recall")
     if metric_for_best not in valid_metrics:
         raise ValueError(f"metric_for_best must be one of {valid_metrics}, got {metric_for_best}")
     metric_is_cal = metric_for_best.endswith("_cal")
@@ -689,6 +732,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         _t_val = time.time() - _t_phase
         cur_lr = opt.param_groups[0]["lr"]
         print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  (train {dt:.1f}s val {_t_val:.1f}s)")
+        print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} F1={m['center_f1']:.3f}  dist(px) mean={m['center_dist_mean_px']:.1f} p50={m['center_dist_p50_px']:.1f} p95={m['center_dist_p95_px']:.1f}  count±1={m['count_off_le1_frac']:.1%}")
 
         ep = epoch + 1
         writer.add_scalar("lr", cur_lr, ep)
