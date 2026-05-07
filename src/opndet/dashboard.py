@@ -451,18 +451,52 @@ const charts = {};
 let selectedRuns = [], scalarTags = [], imageTags = [];
 const RUN_COLORS = ['#58a6ff', '#39c860', '#ff6b35', '#ffb86c', '#bd93f9', '#ff79c6', '#8be9fd', '#f1fa8c'];
 
-// Persist selection across reloads. Auto-add freshly-discovered runs so a
-// new training run shows up checked the first time you open the page after
-// it appears, but a run you explicitly unchecked stays unchecked.
+// Persist selection across reloads. URL hash is primary (works inside
+// Colab's sandboxed iframe where localStorage is blocked, and makes the
+// view shareable). localStorage is a fallback for fresh URL visits.
 const LS_RUNS = 'opndet:selectedRuns';
 const LS_KNOWN = 'opndet:knownRuns';
 const LS_SCALARS = 'opndet:selectedScalars';
+
 function lsGet(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
   catch { return fallback; }
 }
 function lsSet(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
+
+function hashGet() {
+  const h = (location.hash || '').replace(/^#/, '');
+  const params = new URLSearchParams(h);
+  const r = (params.get('runs')    || '').split(',').filter(Boolean);
+  const s = (params.get('scalars') || '').split(',').filter(Boolean);
+  const k = (params.get('known')   || '').split(',').filter(Boolean);
+  return {runs: r, scalars: s, known: k};
+}
+function hashSet(runs, scalars, known) {
+  const params = new URLSearchParams();
+  if (runs.length)    params.set('runs', runs.join(','));
+  if (scalars.length) params.set('scalars', scalars.join(','));
+  if (known.length)   params.set('known', known.join(','));
+  const newHash = '#' + params.toString();
+  if (location.hash !== newHash) {
+    history.replaceState(null, '', location.pathname + location.search + newHash);
+  }
+}
+function persistedGet(kind) {
+  const h = hashGet();
+  if (h[kind].length) return h[kind];
+  if (kind === 'runs')    return lsGet(LS_RUNS, []);
+  if (kind === 'scalars') return lsGet(LS_SCALARS, []);
+  if (kind === 'known')   return lsGet(LS_KNOWN, []);
+  return [];
+}
+function persistedSet(runs, scalars, known) {
+  hashSet(runs, scalars, known);
+  lsSet(LS_RUNS, runs);
+  lsSet(LS_SCALARS, scalars);
+  lsSet(LS_KNOWN, known);
 }
 
 const primaryRun = () => selectedRuns[0] || null;
@@ -483,13 +517,12 @@ async function refreshRuns() {
   const list = document.getElementById('run-list');
   list.innerHTML = '';
 
-  // Load prior selection + run set from localStorage on first call;
-  // subsequent calls reuse the in-memory state.
+  // Load prior selection from URL hash + localStorage on first call.
   if (selectedRuns.length === 0 && list.dataset.bootstrapped !== '1') {
-    selectedRuns = lsGet(LS_RUNS, []);
+    selectedRuns = persistedGet('runs');
     list.dataset.bootstrapped = '1';
   }
-  const known = new Set(lsGet(LS_KNOWN, []));
+  const known = new Set(persistedGet('known'));
   const currentNames = new Set(runs.map(r => r.name));
 
   // Auto-select runs that have appeared since our last visit. A run the
@@ -510,8 +543,7 @@ async function refreshRuns() {
     selectedRuns.push(runs[0].name);
   }
 
-  lsSet(LS_KNOWN, [...currentNames]);
-  lsSet(LS_RUNS, selectedRuns);
+  persistedSet(selectedRuns, Object.keys(charts), [...currentNames]);
 
   const sel = new Set(selectedRuns);
   const fmt = new Intl.DateTimeFormat(undefined, {
@@ -539,7 +571,7 @@ async function refreshRuns() {
 function syncSelectedRuns() {
   selectedRuns = [...document.querySelectorAll('#run-list input[data-run]:checked')].map(el => el.dataset.run);
   document.getElementById('runs-count').textContent = `${selectedRuns.length} selected`;
-  lsSet(LS_RUNS, selectedRuns);
+  persistedSet(selectedRuns, Object.keys(charts), persistedGet('known'));
 }
 
 function toggleAllRuns(on) {
@@ -563,9 +595,10 @@ async function refreshAll() {
   scalarTags = tags.scalars; imageTags = tags.images;
   renderScalarTags();
   renderImageTags();
-  // pre-check from localStorage if present, else common defaults
+  // pre-check from persisted state (URL hash > localStorage) if present,
+  // else common defaults
   if (Object.keys(charts).length === 0) {
-    let toCheck = lsGet(LS_SCALARS, null);
+    let toCheck = persistedGet('scalars');
     if (!Array.isArray(toCheck) || toCheck.length === 0) {
       toCheck = ['val/f1', 'val/f1_opt', 'val_cold/f1_opt', 'prior_lift/val/f1_opt', 'val_cal/f1', 'train/loss'];
     }
@@ -599,7 +632,7 @@ function renderScalarTags() {
     if (e.target.matches('input[data-scalar]')) {
       const tag = e.target.dataset.scalar;
       if (e.target.checked) addChart(tag); else removeChart(tag);
-      lsSet(LS_SCALARS, Object.keys(charts));
+      persistedSet(selectedRuns, Object.keys(charts), persistedGet('known'));
     }
   };
 }
