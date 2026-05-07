@@ -24,6 +24,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+import traceback
 
 
 def _discover_runs(root: Path) -> dict[str, Path]:
@@ -64,6 +65,28 @@ def build_app(root_dir: Path) -> FastAPI:
     # chance to create anything. Empty discovery returns [] from /api/runs;
     # the frontend polls every 30s and picks up new runs automatically.
     app = FastAPI(title=f"opndet · {root_dir.name}", version="0.2.0")
+
+    @app.exception_handler(Exception)
+    async def _all_errors(request: Request, exc: Exception):
+        """Return the full traceback in the response. The dashboard isn't
+        public-facing — verbose errors > silent 500s."""
+        tb = traceback.format_exc()
+        # Also print to server stderr so the cell shows it
+        print(f"\n[dashboard 500] {request.method} {request.url.path}\n{tb}", flush=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(exc), "type": type(exc).__name__, "traceback": tb,
+                     "path": str(request.url.path)},
+        )
+
+    @app.get("/api/health")
+    def api_health() -> dict:
+        return {
+            "ok": True,
+            "root": str(root_dir),
+            "exists": root_dir.exists(),
+            "n_runs": len(_discover_runs(root_dir)),
+        }
 
     def _resolve_run(name: str | None) -> Path | None:
         """Returns None if no runs exist yet — endpoints handle that as
@@ -416,11 +439,14 @@ async function refreshRuns() {
   const list = document.getElementById('run-list');
   const prev = new Set(selectedRuns);
   list.innerHTML = '';
+  const fmt = new Intl.DateTimeFormat(undefined, {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
   for (const r of runs) {
-    const dt = new Date(r.mtime * 1000).toISOString().slice(5, 16).replace('T', ' ');
+    const dt = fmt.format(new Date(r.mtime * 1000));
     const id = 'run_' + r.name.replace(/[^a-z0-9]/gi, '_');
     const lbl = document.createElement('label');
-    lbl.title = r.path;
+    lbl.title = `${r.path}\n${new Date(r.mtime * 1000).toString()}`;
     lbl.innerHTML = `<input type="checkbox" data-run="${r.name}" id="${id}"${prev.has(r.name) ? ' checked' : ''}> <span style="font-weight:500">${r.name}</span> <span style="color:#7d8590;font-size:11px">${dt}</span>`;
     list.appendChild(lbl);
   }
