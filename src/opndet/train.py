@@ -434,14 +434,13 @@ def _bundle_run(out_dir: Path, include_tb: bool = False) -> Path | None:
         print(f"bundle failed: {e}")
         return None
 
-    try:
-        from google.colab import files  # type: ignore
-        print(f"colab detected — triggering download of {bundle.name}")
-        files.download(str(bundle))
-    except ImportError:
-        pass  # not on Colab, skip auto-download
-    except Exception as e:
-        print(f"colab download failed (zip is still at {bundle}): {e}")
+    # Auto-download from a subprocess (`!opndet train ...`) doesn't work — the
+    # subprocess has no IPython kernel context, so files.download() fails with
+    # 'NoneType' object has no attribute 'kernel'. Detect Colab env and print a
+    # one-liner the user runs in a separate cell instead.
+    if Path("/content").exists() or "COLAB_GPU" in os.environ:
+        print(f"colab: download from a new cell with:")
+        print(f"    from google.colab import files; files.download('{bundle}')")
     return bundle
 
 
@@ -776,6 +775,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     # Trajectory-patience: stop only when ALL key metrics' slopes flatten over a window.
     # Beats best-not-improved when one metric saturates while another is still climbing.
+    # Curriculum-aware patience floor: don't fire trajectory-patience until all
+    # curriculum stages have finished + a full window has passed. Prevents stops
+    # like "ep 55 — flat" when a curriculum loss is mid-ramp at ep 50-90 (the new
+    # signal hasn't kicked in yet but the existing metrics have plateaued).
+    _last_curriculum_ep = 0
+    if isinstance(curriculum_cfg, dict) and curriculum_schedule:
+        for spec in curriculum_schedule.values():
+            _last_curriculum_ep = max(_last_curriculum_ep, int(spec.get("end_epoch", 0)))
     patience_trajectory = bool(c.get("patience_trajectory", False))
     patience_window = int(c.get("patience_window", 15))
     patience_min_slope = float(c.get("patience_min_slope", 0.001))  # relative slope/epoch
@@ -789,8 +796,10 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     }))
     metric_history: list[dict[str, float]] = []  # one dict per evaluated epoch
     if patience_trajectory:
+        _floor = max(int(c.get("patience", 0)), _last_curriculum_ep + patience_window)
         print(f"trajectory-patience: window={patience_window} rule={patience_rule} "
-              f"min_slope={patience_min_slope}  metrics={patience_metrics_cfg}")
+              f"min_slope={patience_min_slope}  metrics={patience_metrics_cfg}  "
+              f"earliest-fire-epoch={_floor} (curriculum_end={_last_curriculum_ep}+window)")
 
     n_vis = int(c.get("vis_samples", 4))
     vis_every = int(c.get("vis_every", 5))
@@ -1144,8 +1153,12 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             metric_history.append(snap)
 
         if patience > 0 and patience_trajectory:
-            # Floor: never stop before `patience` epochs OR before window full.
-            if ep >= patience and len(metric_history) >= patience_window:
+            # Floor: never stop before `patience` epochs, before window full, OR
+            # while curriculum is still ramping in new losses (would stop on
+            # already-trained metrics flattening before late-stage signals kick in).
+            _curriculum_floor = _last_curriculum_ep + patience_window
+            if (ep >= patience and len(metric_history) >= patience_window
+                    and ep > _curriculum_floor):
                 window = metric_history[-patience_window:]
                 xs = np.arange(patience_window, dtype=np.float64)
                 slopes_rel: dict[str, float] = {}
