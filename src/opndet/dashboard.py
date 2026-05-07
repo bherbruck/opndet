@@ -276,9 +276,22 @@ def build_app(root_dir: Path) -> FastAPI:
                 cols = [d[0] for d in con.description] if con.description else []
             except Exception as e:
                 return JSONResponse({"columns": [], "rows": [], "truncated": False, "error": f"SQL error: {e}"})
+
+        def _coerce(v):
+            # JSON can't carry datetime/Decimal/bytes/etc — stringify those.
+            if v is None or isinstance(v, (str, int, float, bool, list, dict)):
+                return v
+            try:
+                import datetime as _dt
+                if isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
+                    return v.isoformat()
+            except Exception:
+                pass
+            return str(v)
+
         return JSONResponse({
             "columns": cols,
-            "rows": [list(r) for r in rows[:1000]],
+            "rows": [[_coerce(v) for v in r] for r in rows[:1000]],
             "truncated": len(rows) > 1000,
         })
 

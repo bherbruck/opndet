@@ -82,6 +82,13 @@ class MetricsDB:
             self._scalar_buf,
         )
         self._scalar_buf.clear()
+        # Push WAL contents into the main .duckdb file so the file is
+        # self-sufficient if the user copies it without the .wal sidecar.
+        # Cheap for small metrics dbs.
+        try:
+            self.con.execute("CHECKPOINT")
+        except Exception:
+            pass
 
     def add_image(self, ep: int, tag: str, sample_idx: int, base_path: str | Path) -> None:
         bp = self._rel(base_path)
