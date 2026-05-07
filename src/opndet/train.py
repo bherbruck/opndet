@@ -251,18 +251,32 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
     center_recall    = cm_match_total / max(1, cm_gt_total)
     center_precision = cm_match_total / max(1, cm_pred_total)
     center_f1 = 2 * center_recall * center_precision / max(1e-9, center_recall + center_precision)
+    # Noise-floor-aware tier rates. The model can only place a center at a
+    # stride-cell, with sub-cell offset regression — so anything within
+    # stride/2 px of GT center IS already "perfectly on cell" given the
+    # model's output resolution. Reading 2.1 px at stride=4 as "off by 2 px"
+    # is misleading; it's actually as tight as the architecture allows.
+    stride = int(cfg_shim.stride)
+    perfect_thresh_px = stride * 0.5     # half-cell — fundamental quantization floor
+    within_1cell_px   = float(stride)    # 1 cell — practical localization noise
+    within_2cell_px   = stride * 2.0     # 2 cells — "in the neighborhood"
     if cm_dists_px:
         d_px = np.concatenate(cm_dists_px)
         d_fr = np.concatenate(cm_dists_frac)
+        n = len(d_px)
         center_dist_mean_px = float(d_px.mean())
         center_dist_p50_px  = float(np.percentile(d_px, 50))
         center_dist_p95_px  = float(np.percentile(d_px, 95))
         center_dist_mean    = float(d_fr.mean())
         center_dist_p50     = float(np.percentile(d_fr, 50))
         center_dist_p95     = float(np.percentile(d_fr, 95))
+        center_perfect_rate    = float((d_px <= perfect_thresh_px).sum()) / n
+        center_within_1cell    = float((d_px <= within_1cell_px).sum()) / n
+        center_within_2cell    = float((d_px <= within_2cell_px).sum()) / n
     else:
         center_dist_mean_px = center_dist_p50_px = center_dist_p95_px = 0.0
         center_dist_mean = center_dist_p50 = center_dist_p95 = 0.0
+        center_perfect_rate = center_within_1cell = center_within_2cell = 0.0
     count_off_le1_frac = cnt_off_le1 / max(1, cnt_total)
 
     iouv = np.arange(0.5, 1.0, 0.05, dtype=np.float64)
@@ -311,6 +325,12 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
             "center_dist_mean_px": center_dist_mean_px,
             "center_dist_p50_px": center_dist_p50_px,
             "center_dist_p95_px": center_dist_p95_px,
+            # Stride-quantization-aware rates. perfect = within stride/2 of
+            # GT center (= as tight as the architecture can place a peak).
+            # within_1cell = within one stride cell. within_2cell = neighbor.
+            "center_perfect_rate": float(center_perfect_rate),
+            "center_within_1cell": float(center_within_1cell),
+            "center_within_2cell": float(center_within_2cell),
             "count_off_le1_frac": float(count_off_le1_frac)}
 
 
@@ -784,7 +804,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         _t_val = time.time() - _t_phase
         cur_lr = opt.param_groups[0]["lr"]
         print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  (train {dt:.1f}s val {_t_val:.1f}s)")
-        print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} F1={m['center_f1']:.3f}  dist(frac) mean={m['center_dist_mean']:.3f} p50={m['center_dist_p50']:.3f} p95={m['center_dist_p95']:.3f}  (px p50={m['center_dist_p50_px']:.1f})  count±1={m['count_off_le1_frac']:.1%}")
+        print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} F1={m['center_f1']:.3f}  hit-rate(perfect/1cell/2cell)={m['center_perfect_rate']:.1%}/{m['center_within_1cell']:.1%}/{m['center_within_2cell']:.1%}  dist(frac p50={m['center_dist_p50']:.3f} p95={m['center_dist_p95']:.3f})  count±1={m['count_off_le1_frac']:.1%}")
 
         ep = epoch + 1
         writer.add_scalar("lr", cur_lr, ep)
