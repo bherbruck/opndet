@@ -515,9 +515,30 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     seed = int(c.get("seed", 0))
     torch.manual_seed(seed); np.random.seed(seed)
 
-    from torch.utils.tensorboard import SummaryWriter
-    writer = SummaryWriter(log_dir=str(tb_dir))
-    print(f"tensorboard: {tb_dir}")
+    # Tensorboard is optional. Colab occasionally ships a numpy/tensorboard
+    # version mismatch (tensorboard's compat layer references private numpy
+    # symbols that newer numpy removes). Fall back to a no-op writer when
+    # import fails — scalars still flow to DuckDB and the dashboard via the
+    # add_scalar wrapper below; only the .tfevents files are skipped.
+    class _NoOpWriter:
+        def add_scalar(self, *a, **kw): pass
+        def add_images(self, *a, **kw): pass
+        def add_image(self, *a, **kw): pass
+        def add_histogram(self, *a, **kw): pass
+        def add_text(self, *a, **kw): pass
+        def flush(self, *a, **kw): pass
+        def close(self, *a, **kw): pass
+    if bool(c.get("tensorboard", True)):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            writer = SummaryWriter(log_dir=str(tb_dir))
+            print(f"tensorboard: {tb_dir}")
+        except Exception as e:
+            writer = _NoOpWriter()
+            print(f"tensorboard disabled ({type(e).__name__}: {e}); scalars still flow to DB / dashboard")
+    else:
+        writer = _NoOpWriter()
+        print("tensorboard: off (per config)")
 
     # DuckDB metrics store (queryable companion to TB). Writes alongside TB —
     # both stay in the run dir. Default on; opt out with `metrics_db: false`.
