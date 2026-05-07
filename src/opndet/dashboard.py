@@ -513,9 +513,12 @@ _INDEX_HTML = """<!doctype html>
     .image-controls select, .image-controls input[type=range] { background: #0e1116; color: #d6dee6; border: 1px solid #30363d; border-radius: 3px; padding: 3px 6px; }
     .image-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
     .img-card { position: relative; background: #0e1116; border: 1px solid #30363d; border-radius: 4px; overflow: hidden; }
-    .img-card .stage { position: relative; }
-    .img-card .stage img { display: block; width: 100%; }
-    .img-card canvas.boxes { position: absolute; inset: 0; pointer-events: auto; }
+    .img-card .stage { position: relative; line-height: 0; }
+    /* base RGB scales the stage's width; overlays + canvas must MATCH that
+       displayed size (not their natural res) so the box-coord mapping holds. */
+    .img-card .stage > img.base { display: block; width: 100%; height: auto; }
+    .img-card .stage > img.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .img-card canvas.boxes { position: absolute; inset: 0; width: 100% !important; height: 100% !important; pointer-events: auto; }
     .layer-toggles { padding: 6px 8px; font-size: 11px; color: #7d8590; display: flex; gap: 8px; flex-wrap: wrap; }
     button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 3px; padding: 4px 10px; cursor: pointer; font-family: inherit; font-size: 12px; }
     button:hover { background: #2d333b; }
@@ -1093,12 +1096,16 @@ function renderSample(grid, s) {
   stage.className = 'stage';
   card.appendChild(stage);
   const baseImg = document.createElement('img');
+  baseImg.className = 'base';
+  baseImg.loading = 'lazy';   // browser-managed lazy fetch on scroll
   baseImg.src = s.rgb_url;
   stage.appendChild(baseImg);
   for (const ov of s.overlays) {
     const img = document.createElement('img');
-    img.src = ov.url; img.className = 'overlay'; img.dataset.kind = ov.kind;
-    img.style.position = 'absolute'; img.style.inset = '0';
+    img.className = 'overlay';
+    img.loading = 'lazy';
+    img.src = ov.url;
+    img.dataset.kind = ov.kind;
     img.style.opacity = (document.getElementById('show-prior').checked ? document.getElementById('overlay-alpha').value : 0);
     stage.appendChild(img);
   }
