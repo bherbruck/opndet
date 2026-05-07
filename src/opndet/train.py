@@ -124,16 +124,63 @@ def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return inter / union
 
 
+def _iou_ceiling_per_gt(gt_boxes: np.ndarray, noise_px: float) -> np.ndarray:
+    """Architectural IoU ceiling per GT: best achievable IoU when the model places
+    centers/edges within `noise_px` of GT (worst case in both axes). Below this, no
+    architecturally-fair model could score, so mAP thresholds above the ceiling are
+    requirement-impossible at current stride/resolution.
+
+    Approximation: GT box shrunk by noise_px on each side vs. expanded by noise_px,
+    intersection-over-union of the two.
+    """
+    gw = np.maximum(1.0, gt_boxes[:, 2] - gt_boxes[:, 0])
+    gh = np.maximum(1.0, gt_boxes[:, 3] - gt_boxes[:, 1])
+    inter = np.maximum(0.0, gw - noise_px) * np.maximum(0.0, gh - noise_px)
+    union = 2.0 * gw * gh - inter
+    return (inter / np.maximum(1e-9, union)).astype(np.float64)
+
+
+def _center_aligned_iou(pred_boxes: np.ndarray, gt_boxes: np.ndarray) -> np.ndarray:
+    """IoU between pred and GT after translating pred so its center matches GT's.
+    Measures bbox SHAPE quality only — decouples mAP from center precision. Right
+    metric when center accuracy is bounded by stride (model can't physically beat
+    sub-cell precision under sigmoid saturation), and what we care about is "if the
+    cell is right, how good is the box shape?"
+
+    Both rectangles share a center, so:
+      inter = min(pw, gw) * min(ph, gh)
+      union = pw*ph + gw*gh - inter
+    """
+    pw = np.maximum(0.0, pred_boxes[:, None, 2] - pred_boxes[:, None, 0])
+    ph = np.maximum(0.0, pred_boxes[:, None, 3] - pred_boxes[:, None, 1])
+    gw = np.maximum(1.0, gt_boxes[None, :, 2] - gt_boxes[None, :, 0])
+    gh = np.maximum(1.0, gt_boxes[None, :, 3] - gt_boxes[None, :, 1])
+    inter = np.minimum(pw, gw) * np.minimum(ph, gh)
+    union = pw * ph + gw * gh - inter
+    return (inter / np.maximum(1e-9, union)).astype(np.float64)
+
+
 def _accumulate_correct(
     per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
     iouv: np.ndarray,
+    mode: str = "standard",
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """For each image: compute IoU once, greedy-match by score desc per IoU threshold (vectorized over thresholds).
-    Concatenate. Returns (all_scores [N], all_correct [N, n_iouv], total_n_gt)."""
+    Concatenate. Returns (all_scores [N], all_correct [N, n_iouv], total_n_gt).
+
+    mode = "standard": classic IoU (matches COCO mAP semantics).
+    mode = "shape":    center-aligned IoU — pred translated to share GT's center
+                       before IoU. Decouples mAP from sub-pixel center precision.
+                       Honest "if the cell is right, how good is the box?" metric;
+                       useful when stride limits center precision (small objects
+                       at stride=4 can't physically clear mAP@.95 even with perfect
+                       w/h). Ours, not standard. Always reported alongside.
+    """
     n_t = iouv.shape[0]
     parts_scores: list[np.ndarray] = []
     parts_correct: list[np.ndarray] = []
     total_gt = 0
+    iou_fn = _center_aligned_iou if mode == "shape" else _iou_xyxy
     for scores, boxes, gt_boxes in per_image:
         total_gt += int(gt_boxes.shape[0])
         if boxes.shape[0] == 0:
@@ -144,7 +191,7 @@ def _accumulate_correct(
         if gt_boxes.shape[0] == 0:
             parts_correct.append(np.zeros((boxes.shape[0], n_t), dtype=bool))
             continue
-        iou = _iou_xyxy(boxes[order], gt_boxes)  # [n_p, n_g]
+        iou = iou_fn(boxes[order], gt_boxes)  # [n_p, n_g]
         correct = np.zeros((boxes.shape[0], n_t), dtype=bool)
         avail = np.ones((n_t, gt_boxes.shape[0]), dtype=bool)
         for i in range(boxes.shape[0]):
@@ -292,10 +339,18 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
     count_off_le1_frac = cnt_off_le1 / max(1, cnt_total)
 
     iouv = np.arange(0.5, 1.0, 0.05, dtype=np.float64)
-    all_scores, all_correct, total_gt = _accumulate_correct(per_image, iouv)
+    all_scores, all_correct, total_gt = _accumulate_correct(per_image, iouv, mode="standard")
     aps = _ap_from_correct(all_scores, all_correct, total_gt)
     map50 = float(aps[0])
     map_50_95 = float(aps.mean())
+    # Shape-mAP: center-aligned IoU. Decouples from sub-pixel center precision so
+    # the metric is honest at small object sizes / large strides. Self-converges
+    # with standard mAP as image resolution grows (eggs bigger in px → ceiling
+    # rises → no clipping vs standard). Documented as ours, not COCO-standard.
+    all_scores_s, all_correct_s, _ = _accumulate_correct(per_image, iouv, mode="shape")
+    aps_s = _ap_from_correct(all_scores_s, all_correct_s, total_gt)
+    map50_shape = float(aps_s[0])
+    map_50_95_shape = float(aps_s.mean())
 
     # F1 sweep across thresholds. Uses the iou=0.5 correctness column we already computed.
     # Picks best operating point automatically — robust to over-prediction at score_thresh=0.2.
@@ -321,6 +376,7 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
         threshold_opt = float(score_thresh)
 
     return {"precision": precision, "recall": recall, "f1": f1, "map50": map50, "map_50_95": map_50_95,
+            "map50_shape": map50_shape, "map_50_95_shape": map_50_95_shape,
             "f1_opt": f1_opt, "threshold_opt": threshold_opt,
             "n_pred": float(n_pred), "n_gt": float(n_gt),
             "center_recall": float(center_recall),
@@ -796,6 +852,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     if eval_threshold_auto:
         print(f"eval_threshold: auto (EMA α={eval_threshold_ema_alpha}, "
               f"bootstrap={eval_threshold_min})")
+
     step = 0
     start_epoch = 0
     if resume_state is not None:
@@ -868,7 +925,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         m = evaluate(eval_model, val_loader, cfg_shim, device, score_thresh=cur_eval_threshold)
         _t_val = time.time() - _t_phase
         cur_lr = opt.param_groups[0]["lr"]
-        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5={m['map50']:.3f} mAP@.5:.95={m['map_50_95']:.3f}  (train {dt:.1f}s val {_t_val:.1f}s)")
+        print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5/.95={m['map50']:.3f}/{m['map_50_95']:.3f}  shape=.{int(m['map50_shape']*1000):03d}/.{int(m['map_50_95_shape']*1000):03d}  (train {dt:.1f}s val {_t_val:.1f}s)")
         print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} (lenient {m['center_precision_lenient']:.3f}) F1={m['center_f1']:.3f} (lenient {m['center_f1_lenient']:.3f})  ghost={m['center_ghost_rate']:.1%} dup={m['center_dup_rate']:.1%}  hit(perf/1c/2c)={m['center_perfect_rate']:.1%}/{m['center_within_1cell']:.1%}/{m['center_within_2cell']:.1%}  count±1={m['count_off_le1_frac']:.1%}")
 
         ep = epoch + 1
