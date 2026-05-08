@@ -10,15 +10,15 @@ dependencies = [
     # block a specific bad release below the next-major boundary.
     # See docs/engineering-decisions.md "Dep pinning" for the why.
     "torch >= 2.0, < 2.12",            # 2.11 current; block 2.12 until validated
-    "numpy >= 1.24, < 2.3",            # 2.3+ broke `_blas_supports_fpe` interop with scipy
-    "scipy ~= 1.10",                   # >= 1.10, < 2
+    "numpy >= 1.24, < 3",              # lap supports both 1.x and 2.x; no scipy chain
+    "lap >= 0.5.13",                   # tiny C-compiled Hungarian; replaces scipy
     "onnx ~= 1.14",                    # >= 1.14, < 2
     "onnxruntime ~= 1.16",             # >= 1.16, < 2
     "onnxscript >= 0.1, < 2",
     "pillow >= 10.0, < 12",            # 12+ broke gradio + others; not worth chasing
     "opencv-python-headless ~= 4.8",   # >= 4.8, < 5
     "pyyaml ~= 6.0",                   # >= 6.0, < 7
-    "tensorboard >= 2.13, < 2.20",     # 2.20+ restructured `compat.notf` import path
+    "tensorboard >= 2.13",             # train.py falls back to no-op writer if import fails
     "tqdm ~= 4.65",                    # >= 4.65, < 5
     "matplotlib ~= 3.6",               # >= 3.6, < 4
 ]

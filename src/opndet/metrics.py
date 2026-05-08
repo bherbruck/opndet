@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
+from opndet._optim import linear_sum_assignment
 
 
 def iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -202,7 +202,7 @@ def center_match(
     cost = dist.copy()
     forbidden = dist > radii[None, :]
     cost[forbidden] = 1e9
-    from scipy.optimize import linear_sum_assignment
+    from opndet._optim import linear_sum_assignment
     row, col = linear_sum_assignment(cost)
     valid = cost[row, col] < 1e8
     n_match = int(valid.sum())

@@ -158,6 +158,40 @@ Training continues even if tensorboard import fails. Scalars still flow to DuckD
 
 ---
 
+## NO scipy. Use `lap` + `_optim.py` instead. — **HARD RULE**
+
+opndet **does not depend on scipy**. Specifically: do NOT add `from scipy.optimize import ...` (or any other scipy import) to opndet code, even if it's "just one function" or "the standard way." Reasons, painful and concrete:
+
+**Why scipy was removed (April 2026 incident):**
+- scipy reaches deep into numpy's PRIVATE API (`numpy._core.umath._center`, `numpy.testing._private.utils.BLAS_SUPPORTS_FPE`, etc.)
+- numpy bumps INTERNAL APIs without major-version-bumping (e.g. removed `_center` between 2.3 → 2.4)
+- scipy then breaks. Their pyproject says `numpy>=2.0.0` (no upper bound), which is a lie about what their code actually requires
+- Colab silently rolls numpy versions on a daily-ish cadence. We hit broken-scipy → broken-opndet ~weekly
+- Forced explicit `numpy<2.3` pins in user notebooks AS A WORKAROUND. Each Colab session needed manual version-fighting.
+
+**The fix:**
+- `src/opndet/_optim.py` exposes `linear_sum_assignment` (wraps `lap.lapjv`) and `minimize_scalar_bounded` (pure-numpy golden-section search). scipy-compatible signatures so call sites are unchanged.
+- `lap` (gatagat/lap) is a tiny C-compiled Hungarian solver. Talks to numpy via the public ndarray interface only — numpy private-API churn cannot reach it. Install footprint ~1 MB vs scipy's ~70 MB.
+- `minimize_scalar_bounded` is ~30 LOC of pure Python. Zero external deps. Cannot break.
+
+**Rule for future contributors / agents:**
+1. Never add `import scipy` or `from scipy...` to opndet source. If a scipy function looks tempting, check if `_optim.py` already wraps an equivalent.
+2. If you need a NEW optim/numerics primitive, prefer (in order):
+   - Pure-numpy implementation in `_optim.py` (~30-150 LOC, zero risk)
+   - A small specialized library with NARROW numpy surface (like `lap` for assignment)
+   - NEVER scipy. Even for "just one call" — the dep cascades.
+3. The replacements are scipy-compatible by signature so refactoring back/forth is cheap. Don't accept "I'll just use scipy for now and refactor later" — `_optim.py` already has the function you need.
+
+**Same rule applies to other research-coded sprawling libs:**
+- `pandas` — same offenders, large numpy private-API surface. Avoid for opndet.
+- `xarray` — same.
+- `statsmodels` — same.
+- `sklearn` — bigger surface than scipy, but at least mostly stable. Hard ask before adding.
+
+**OK to use:** torch, torchvision, numpy (public API), opencv-python-headless, onnx, onnxruntime, pyyaml, pillow, matplotlib, tqdm, tensorboard. All in pyproject.toml — that list is not aspirational, it's the entire dep set.
+
+---
+
 ## Dep pinning (pyproject.toml has upper bounds)
 
 opndet's `pyproject.toml` uses major-pin upper bounds (`<2.12`, `< 2.3`, `~=4.8`) on every dep, NOT the more common `>=` floors-only style. This is intentional.

@@ -150,6 +150,7 @@ All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except h
 - **Code style**: terse, no docstrings unless the WHY is non-obvious, no comments explaining the obvious. Match existing.
 - **No emojis** in code or commits.
 - **Conventional Commits format** (`feat:`, `fix:`, `perf:`, `chore:`).
+- **DO NOT ADD `scipy` to opndet.** Removed in April 2026 after numpy 2.4 broke scipy 1.17's private-API chain on Colab. Use `src/opndet/_optim.py` (`linear_sum_assignment` wraps `lap.lapjv`; `minimize_scalar_bounded` is a 30-LOC golden-section search). Same rule applies to `pandas`, `xarray`, `statsmodels`, `sklearn` — sprawling research libs with huge numpy private-API surface. See `docs/engineering-decisions.md` "NO scipy" section for the why.
 - **Bundled YAML** lives at `src/opndet/configs/` and ships with the wheel via `[tool.setuptools.package-data]`. The CLI's `--model` flag resolves preset names against this dir via `src/opndet/presets.py::resolve()`.
 - **train.yaml is a *template*** — `init-config` dumps the bundled one for users to edit. Never assume specific paths in it.
 - **Optimizer choice**: AdamW is the default for every preset. `optimizer: musgd` in the training yaml opts into MuSGD (Muon for hidden conv weights + AdamW for biases / BN / narrow heads, per YOLO26). It is intended for server-tier `-pro` presets only; train.py warns but does not block on edge-tier presets. Vision-side wins are unproven — validate on your own dataset before promoting. See `docs/engineering-decisions.md` "Optimizer choice".

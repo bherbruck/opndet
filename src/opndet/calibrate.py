@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from scipy.optimize import minimize_scalar
+from opndet._optim import minimize_scalar_bounded
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -54,8 +54,7 @@ def fit_temperature(logits: np.ndarray, labels: np.ndarray) -> float:
         log_1msig = -np.logaddexp(0.0, z)
         return float(-np.mean(labels * log_sig + (1.0 - labels) * log_1msig))
 
-    res = minimize_scalar(nll, bounds=(0.05, 20.0), method="bounded", options={"xatol": 1e-4})
-    return float(res.x)
+    return float(minimize_scalar_bounded(nll, 0.05, 20.0, xatol=1e-4))
 
 
 def _logit_from_score(s: np.ndarray, eps: float = 1e-6) -> np.ndarray:
