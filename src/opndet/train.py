@@ -828,6 +828,15 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     if assigner_cfg is not None and _assign_mode is None:
         print(f"  WARN: assigner: '{assigner_cfg}' set but head is not ltrb/obb; ignoring")
         assigner = None
+    elif has_obb and assigner_cfg not in (None, "peak"):
+        # Direct cxywhθ head (post ProbIoU refactor) is fundamentally
+        # single-positive: cx_off ∈ [0, 1] is the cell-relative offset, only
+        # one cell can naturally encode it. TAL/STAL (multi-positive) breaks
+        # the encoding. Fall back to peak with a warning.
+        print(f"  WARN: assigner: '{assigner_cfg}' is incompatible with the direct "
+              f"cxywhθ OBB head — falling back to peak (single-positive). "
+              f"TAL/STAL only works with ltrb regression.")
+        assigner = None
     else:
         assigner = build_assigner(assigner_cfg, mode=_assign_mode or "ltrb",
                                   img_h=img_h, img_w=img_w, stride=cfg_shim.stride)
