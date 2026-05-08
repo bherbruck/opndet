@@ -203,6 +203,55 @@ let layerNames = [];          // diagnostic layer names (excludes "output")
 let activeOverlay = null;     // ImageData of overlay heatmap, or null
 let attribBusy = false;
 
+// attribution worker state — moves occlusion forwards off the main thread so
+// the page stays responsive during the 16-pass sweep. Lazy-init on first
+// click; dispose on ONNX reload.
+let currentOnnxBytes = null;       // ArrayBuffer of currently-loaded ONNX
+let attribWorker = null;
+let attribWorkerReady = false;
+const workerCallbacks = new Map();
+let workerMsgId = 0;
+
+function disposeAttribWorker() {
+  if (attribWorker) {
+    try { attribWorker.terminate(); } catch (_) {}
+    attribWorker = null;
+  }
+  attribWorkerReady = false;
+  workerCallbacks.clear();
+}
+
+function workerCall(msg, transfers) {
+  const id = ++workerMsgId;
+  return new Promise((resolve, reject) => {
+    workerCallbacks.set(id, { resolve, reject });
+    attribWorker.postMessage({ ...msg, id }, transfers || []);
+  });
+}
+
+async function ensureAttribWorker() {
+  if (attribWorkerReady) return;
+  if (!currentOnnxBytes) throw new Error("no ONNX loaded yet");
+  attribWorker = new Worker("./ort-worker.js");
+  attribWorker.onmessage = (e) => {
+    const m = e.data;
+    const cb = workerCallbacks.get(m.id);
+    if (cb) {
+      workerCallbacks.delete(m.id);
+      if (m.type === "error") cb.reject(new Error(m.error));
+      else cb.resolve(m);
+    }
+  };
+  attribWorker.onerror = (err) => {
+    console.error("attribution worker error", err);
+    disposeAttribWorker();
+  };
+  // Send a copy of the bytes (transfer ownership of the dup, retain main copy)
+  const dup = currentOnnxBytes.slice(0);
+  await workerCall({ type: "init", bytes: dup, providers: ["wasm"] }, [dup]);
+  attribWorkerReady = true;
+}
+
 const IMAGENET_MEAN = [0.485, 0.456, 0.406];
 const IMAGENET_STD  = [0.229, 0.224, 0.225];
 
@@ -264,6 +313,12 @@ els.onnxFile.onchange = async (e) => {
   els.modelInfo.textContent = "Loading...";
   try {
     const buf = await f.arrayBuffer();
+    // Retain a copy for the attribution worker (lazy-init on first click).
+    // We dup it because the worker may transfer-out its copy and we still
+    // need the bytes if the user reloads / re-clicks attribution after a
+    // worker dispose.
+    currentOnnxBytes = buf.slice(0);
+    disposeAttribWorker();   // re-loading invalidates any prior worker session
     const providers = await pickProviders();
     session = await ort.InferenceSession.create(buf, {
       executionProviders: providers,
@@ -651,16 +706,23 @@ function tensorWithOcclusion(srcImg, px, py, pw, ph) {
 async function runOcclusionAttribution(clickX, clickY) {
   if (!session || !lastDecodeArgs || !lastImage || attribBusy) return;
   attribBusy = true;
-  els.attribStatus.innerHTML = `<span class="warn">computing occlusion attribution...</span>`;
+  els.attribStatus.innerHTML = `<span class="warn">spinning up attribution worker...</span>`;
+
+  try {
+    await ensureAttribWorker();
+  } catch (err) {
+    els.attribStatus.innerHTML = `<span class="err">worker init failed: ${err.message}</span>`;
+    attribBusy = false;
+    return;
+  }
 
   const { o, C, H, W } = lastDecodeArgs;
   const stride = parseInt(els.stride.value, 10) || 4;
   // Map the clicked canvas pixel to a target output cell.
   const cellX = Math.max(0, Math.min(W - 1, Math.floor(clickX / stride)));
   const cellY = Math.max(0, Math.min(H - 1, Math.floor(clickY / stride)));
-  const planeSize = H * W;
-  const baseScore = o.data[cellY * W + cellX];
-  // If the clicked cell isn't a peak, attribution can still work but is less interpretable.
+  const targetIdx = cellY * W + cellX;
+  const baseScore = o.data[targetIdx];
 
   // Snapshot the current letterboxed canvas pixels (before any overlays).
   // The canvas might have an overlay from layer mode — re-letterbox first.
@@ -669,13 +731,12 @@ async function runOcclusionAttribution(clickX, clickY) {
 
   // Build a coarse grid of patches over the whole image.
   // 4x4 = 16 patches: enough resolution to localize the cause, ~3-5s on
-  // typical phones / laptops via WASM. 5x5 (25) was 50% slower for marginal
-  // resolution gain.
+  // typical phones / laptops via WASM. The worker runs each forward off
+  // the main thread, so the page stays responsive throughout.
   const gridN = 4;
   const patchH = Math.ceil(inputH / gridN);
   const patchW = Math.ceil(inputW / gridN);
 
-  // Score-drop heatmap at output (H, W) resolution, but we accumulate at grid resolution then upsample.
   const gridScores = new Float32Array(gridN * gridN);
   const t0 = performance.now();
 
@@ -684,17 +745,14 @@ async function runOcclusionAttribution(clickX, clickY) {
       const py = gy * patchH;
       const px = gx * patchW;
       const tensor = tensorWithOcclusion(snap, px, py, patchW, patchH);
-      const out = await session.run({ [modelInputName]: tensor });
-      const oName = ("output" in out) ? "output" : Object.keys(out)[0];
-      const od = out[oName].data;
-      const s = od[cellY * W + cellX];
-      gridScores[gy * gridN + gx] = Math.max(0, baseScore - s);
+      // Transfer the Float32Array buffer to the worker (zero-copy). The
+      // worker only sends back a single scalar so the round trip is cheap.
+      const m = await workerCall(
+        { type: "run", data: tensor.data, shape: [1, 3, inputH, inputW], targetIdx },
+        [tensor.data.buffer]
+      );
+      gridScores[gy * gridN + gx] = Math.max(0, baseScore - m.value);
       els.attribStatus.textContent = `occluding patch ${gy * gridN + gx + 1} / ${gridN * gridN}...`;
-      // Yield to the browser event loop so the page can repaint the status
-      // text and stay responsive. Without this, ORT's WASM-single-thread
-      // backend keeps the main thread busy across awaits and the page
-      // freezes for the full ~5-10s sweep.
-      await new Promise(r => setTimeout(r, 0));
     }
   }
   const dt = (performance.now() - t0) / 1000;
