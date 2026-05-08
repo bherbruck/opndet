@@ -23,18 +23,23 @@ opndet info bbox-s                     # inspect a preset
 opndet init-config --out my.yaml       # dump training config template
 opndet train --config my.yaml [--run-name <name>] [--resume <path>]
 opndet predict --image foo.jpg --model bbox-s --ckpt best.pt --save vis.jpg
-opndet export --model bbox-s --ckpt best.pt --out opndet.onnx
+opndet export --model bbox-s --ckpt best.pt --out opndet.onnx [--bake-input-norm]
 opndet export --model bbox-s --ckpt best.pt --out diag.onnx --diagnostic   # +named-layer outputs for the webui's explain mode
+opndet quantize --onnx opndet.onnx --calib data/imgs --out opndet_int8.onnx [--verify]
 opndet calibrate --ckpt best.pt --config train.yaml                         # bake Platt T into the ckpt
 opndet eval --ckpt best.pt --config train.yaml [--stability]                # full report; --stability runs perturbation flapping check
 opndet analyze --ckpt best.pt --model bbox-s --image egg.jpg                # interpretability: per-layer slider + Grad-CAM HTML
 opndet dashboard --root /path/to/runs                                        # DuckDB-backed live training dashboard
 
 # Tests
-.venv/bin/pytest tests/                # full suite (sparse — most coverage is via integration tests)
+.venv/bin/pytest tests/                                  # full suite (sparse — most coverage is via integration tests)
+.venv/bin/pytest tests/test_temporal_prior.py -xvs       # single test file
+.venv/bin/pytest tests/test_temporal_prior.py::TestName::test_method -xvs   # single test method
 ```
 
 The `--model` flag accepts a **bundled preset name** (`bbox-f`, `bbox-p`, `bbox-n`, `bbox-s`, `bbox-m`, `bbox-l`, `bbox-x`, plus variants `-dist`, `-hm2`, `-flow`, `-tp`) OR a path to a YAML.
+
+**In-browser tester**: drop any exported ONNX into [bherbruck.github.io/opndet](https://bherbruck.github.io/opndet) (lives in `docs/index.html`, deployed via GH Pages). Runs entirely client-side via onnxruntime-web. The "explain mode" toggle requires an ONNX exported with `--diagnostic`.
 
 ## Architecture (big picture)
 
