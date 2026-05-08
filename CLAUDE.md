@@ -24,12 +24,17 @@ opndet init-config --out my.yaml       # dump training config template
 opndet train --config my.yaml [--run-name <name>] [--resume <path>]
 opndet predict --image foo.jpg --model bbox-s --ckpt best.pt --save vis.jpg
 opndet export --model bbox-s --ckpt best.pt --out opndet.onnx
+opndet export --model bbox-s --ckpt best.pt --out diag.onnx --diagnostic   # +named-layer outputs for the webui's explain mode
+opndet calibrate --ckpt best.pt --config train.yaml                         # bake Platt T into the ckpt
+opndet eval --ckpt best.pt --config train.yaml [--stability]                # full report; --stability runs perturbation flapping check
+opndet analyze --ckpt best.pt --model bbox-s --image egg.jpg                # interpretability: per-layer slider + Grad-CAM HTML
+opndet dashboard --root /path/to/runs                                        # DuckDB-backed live training dashboard
 
 # Tests
 .venv/bin/pytest tests/                # full suite (sparse — most coverage is via integration tests)
 ```
 
-The `--model` flag accepts a **bundled preset name** (`bbox-f`, `bbox-p`, `bbox-n`, `bbox-s`, `bbox-m`) OR a path to a YAML.
+The `--model` flag accepts a **bundled preset name** (`bbox-f`, `bbox-p`, `bbox-n`, `bbox-s`, `bbox-m`, `bbox-l`, `bbox-x`, plus variants `-dist`, `-hm2`, `-flow`, `-tp`) OR a path to a YAML.
 
 ## Architecture (big picture)
 
@@ -41,7 +46,11 @@ When adding any new op or block, add a roundtrip parity test: build the model, e
 
 ### The "no NMS" trick
 
-`PeakSuppress` (in `src/opndet/primitives.py` and `src/opndet/model.py`) is the centerpiece. It runs `mask = (hm + eps >= MaxPool3x3(hm))` then `out = hm * mask` inside the graph. This is local-max suppression that's ONNX-friendly. The **eps is critical** (currently 1e-3): without it, FP precision differences between PyTorch and ORT flip mask cells at boundaries and break parity. Don't remove it. Don't lower it without re-running parity tests across all model sizes.
+`PeakSuppress` (in `src/opndet/primitives.py` and `src/opndet/model.py`) is the centerpiece. It runs `mask = clip((hm + eps - MaxPoolKxK(hm)) * BIG, 0, 1)` (arith mode, default) or `(hm + eps >= MaxPool(hm))` (compare mode, smaller graph but breaks on Myriad VPU). Then `out = hm * mask` inside the graph. Local-max suppression that's ONNX-friendly. The **eps is critical** (currently 5e-3 for fp16 tolerance): without it, FP precision differences between PyTorch and ORT flip mask cells at boundaries and break parity. Don't remove it. Don't lower it without re-running parity tests across all model sizes.
+
+**Per-preset peak_kernel:** most presets use `k=5` (radius 2, 8-px min spacing at stride=4). `bbox-x` uses `k=7` (radius 3, 12-px min spacing) since it targets quality-first deployment with more bbox-shape headroom — the wider window suppresses near-tie adjacent duplicates that the smaller kernel lets through. Each preset's `SigmoidPeakSuppress` block sets the `k` arg explicitly in `src/opndet/configs/opndet-bbox-*.yaml`.
+
+**Two-cell ties survive any kernel size.** If two adjacent cells round to identical sigmoid output (common at saturation in fp16), they BOTH pass `>= MaxPool` since each IS the local max. The repulsion loss (training-side) is the soft pressure to avoid creating these ties in the first place. If duplicates persist after training, the data layer (hard-negative mining; see ROADMAP §1.7) is the next attack surface — pruning or larger kernels won't fix tied-pair survival.
 
 ### Two ways to define a model
 
@@ -97,8 +106,16 @@ Client decoding (`src/opndet/decode.py`): threshold + `np.nonzero` + index gathe
 | bbox-n | 0.31M  | Edge SoC                |
 | bbox-s | 1.27M  | Default, strong quality |
 | bbox-m | 2.37M  | Quality-first, ≈YOLOv8n FLOPs |
+| bbox-l | ~5M    | Mid-range server        |
+| bbox-x | 10.4M  | Quality-first, server / Colab; uses `peak_kernel=7` |
 
-All produce identical output layout. Differ only in backbone widths/depths and neck/head channels.
+Plus variants:
+- `-dist` (e.g. `bbox-x-dist`) — distillation-aware student trained from a larger teacher
+- `bbox-x-hm2` — 2-channel heatmap variant (obj + radius), opset-13 clean (see `docs/det-hm-variants.md`)
+- `bbox-x-flow` — 4-channel CellPose-style flow head, NOT opset-constrained (server-only); planned, design doc only
+- `-tp` (e.g. `bbox-f-tp`) — temporal-prior input variant, 4-channel input
+
+All produce the same `[1, 5, H/4, W/4]` output layout (except hm2 / flow variants which have different output shape). Differ in backbone widths/depths and neck/head channels.
 
 ## Conventions
 
@@ -111,15 +128,27 @@ All produce identical output layout. Differ only in backbone widths/depths and n
 ## Files at a glance
 
 - `cli.py` — argparse subcommand router; entry point for the `opndet` script.
-- `train.py` — training loop. Lazy imports tensorboard and silences TF/oneDNN env noise. Handles auto-increment `out_dir`, resume, patience, cosine LR + warmup.
+- `train.py` — training loop. Lazy imports tensorboard with no-op fallback when import fails (Colab numpy/tensorboard mismatches). Auto-increment `out_dir`, resume, trajectory-patience, curriculum w/ alias map, cosine LR + warmup, in-process Colab `files.download()`.
 - `model.py` / `blocks.py` — hand-coded reference model (kept for parity tests).
 - `primitives.py` / `registry.py` / `yaml_build.py` — YAML DSL system.
 - `encode.py` — Gaussian heatmap GT encoder (CornerNet σ heuristic).
-- `loss.py` — focal heatmap + L1 size + L1 cxy losses.
+- `loss.py` — focal/VFL heatmap + L1/CIoU/DIoU/NWD wh + L1 cxy + repulsion (baseline-subtracted) + count + convexity.
 - `decode.py` — client-side bbox decoder (no NMS).
 - `dataset.py` — COCO loader, OpndetDataset, mosaic, collate.
 - `augment.py` — photometric + geometric + cutout, with min_visible_frac filter.
-- `visualize.py` — render predictions onto images for TensorBoard.
-- `export.py` — torch.onnx.export(opset=13, dynamo=False) + opset-safety check + parity test.
-- `predict.py` — single-image inference + visualization.
+- `visualize.py` — render predictions onto images for TensorBoard / DuckDB / dashboard.
+- `export.py` — torch.onnx.export(opset=13, dynamo=False) + opset-safety check + parity test. `--diagnostic` mode adds all named-layer outputs for the webui's explain mode.
+- `predict.py` — single-image / video inference + visualization.
+- `analyze.py` — postmortem CLI: per-layer activation slider + Grad-CAM HTML report on saved ckpts.
+- `metrics.py` — Hungarian + IoU-free center matching with cell-window radius, ghost/duplicate split.
+- `metrics_db.py` — DuckDB writer per-run for queryable training history.
+- `dashboard.py` — FastAPI dashboard reading the DuckDB stores; multi-run, accordion-grouped charts, lightbox viz.
+- `calibrate.py` — Platt-scale T fit on val, baked into ckpt.
+- `eval.py` — full validation report + perturbation stability proxy.
 - `presets.py` — preset name resolution (`bbox-s` → bundled YAML path).
+
+## See also
+
+- `docs/engineering-decisions.md` — non-obvious choices and gotchas (cls_loss=focal cold-start safety, peak_kernel=7 in bbox-x, curriculum aliases, shape-mAP, trajectory-patience). Read this before changing training defaults.
+- `ROADMAP.md` — plan + SHIPPED tags. Current high-priority: §2.1 OBB output, §1.7 Grad-CAM hard-negative mining.
+- `docs/det-hm-variants.md` — hm2 / flow heatmap variant designs.

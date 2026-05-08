@@ -6,6 +6,38 @@ This is not a research wishlist. It is an engineering plan organized so that eac
 
 ---
 
+## Recently shipped (May 2026 session)
+
+A focused round of training-stability + interpretability work landed. Each item below has a commit hash for traceability and is documented in `docs/engineering-decisions.md` for the why. Listed here so future LLMs see the moving target.
+
+**Training infra:**
+- ✅ Trajectory-patience (`55bf3c4`) — slope-based stopping over a window across multiple metrics; replaces best-not-improved when one metric saturates while another still climbs. Curriculum-aware floor (`caadfc5`) prevents firing while curriculum is still ramping in new losses.
+- ✅ `eval_threshold: auto` (`1024c21`) — EMA over per-epoch `threshold_opt`; operating threshold self-tunes to where F1 actually peaks given current calibration.
+- ✅ Curriculum alias map (`0f90448`) — fixes silent no-op bug where curriculum targeting `repulsion_weight` etc. didn't match loss attrs (`rep_w`); added long→short alias map.
+- ✅ Tensorboard optional (`df11e83`) — falls back to no-op writer on import failure (Colab numpy mismatches kill tensorboard regularly); scalars still flow to DuckDB + dashboard.
+- ✅ In-process Colab download (`17c77fe`) — `from opndet.train import train; train(cfg)` triggers `files.download()` correctly; subprocess invocations don't have IPython kernel context.
+
+**Loss correctness:**
+- ✅ Repulsion baseline-subtraction (`296acf4`) — penalty is now (IoA(pred, neighbor_GT) − IoA(GT, neighbor_GT)). Perfect prediction = 0 penalty even when GTs overlap.
+- ✅ bbox-x peak_kernel 5 → 7 (`8b08c50`) — kills near-tie adjacent duplicates by extending suppression window. Other presets stay at k=5.
+
+**Metrics:**
+- ✅ `center_match` matcher: cell-window radius (4×4 cells default), no bbox-containment leniency, ghost vs duplicate split. (`1ec5f2c` superseded the earlier `6e38b1d` which had containment-related false positives.)
+- ✅ Shape-mAP companion metric (`00365bb`) — `map_50_95_shape`. Center-aligned IoU; honest read at small-object/stride scales where standard mAP@.95 is architecturally near-impossible.
+
+**Interpretability:**
+- ✅ `opndet analyze` CLI (`d28474e`) — postmortem on saved ckpt: per-layer activation slider + Grad-CAM (input-gradient saliency) per detection, rendered as standalone HTML. Works on images or video frames.
+- ✅ `opndet export --diagnostic` flag — exposes all named-layer outputs in the ONNX. Production graph unchanged when flag absent.
+- ✅ Webui explain mode (`ee4887a`) — `docs/index.html` adds layer slider + click-to-attribute via occlusion (no autograd in ORT Web). Loads diagnostic ONNX.
+
+**Roadmap additions:**
+- §1.6 OBB cross-reference + §2.1 elevated to HIGH PRIORITY (SAM-driven labels solved, just need opndet-side wiring; user has notebook code).
+- §1.7 NEW + HIGH PRIORITY — Grad-CAM-driven hard-negative mining: mine FPs from val, cluster their attribution patches, inject as labeled-bg augmentation. Targets the residual ~1-2% ghost rate that architectural fixes are exhausted on.
+
+**The current kitchen-sink yaml** (`scratch/train_bbox_x.yaml`) bundles: `cls_loss: focal` (vfl had cold-start zero-IoU collapse), `peak_kernel=7` (via bbox-x preset), DIoU box loss, bf16 AMP, curriculum 4-stage (centers → boxes → convexity → repulsion → count), trajectory-patience with curriculum-aware floor, auto threshold. Reference for the converged-good training recipe; copy into scratch and edit paths.
+
+---
+
 ## Context: what already exists
 
 Before proposing changes, the working state as of this writing:
@@ -365,7 +397,7 @@ Single-scale H/4 is a real limitation for scenes with high size variance. The cl
 
 **Definition of done**: bbox-s and bbox-m have `multi_scale` variants. Test on a dataset with bimodal size distribution shows that multi-scale variants outperform single-scale by ≥5 mAP on small objects without hurting large-object performance.
 
-### 3.4 Larger preset(s): bbox-l and bbox-x
+### 3.4 Larger preset(s): bbox-l and bbox-x — **SHIPPED**
 
 Discussed in conversation. The current lineup tops out at 2.4M params (bbox-m), which is appropriate for MCU deployment but leaves a gap for OAK / Hailo / Jetson / desktop users.
 
