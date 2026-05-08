@@ -122,7 +122,7 @@ def test_make_augment_with_pool_invokes_paste(tmp_path):
     aug = make_augment(cfg, hn_pool=pool)
     img = np.full((100, 100, 3), 128, dtype=np.uint8)
     boxes = np.zeros((0, 4), dtype=np.float32)
-    out, _ = aug(img, boxes)
+    out, _, _ = aug(img, boxes)
     red_mask = (out[..., 0] == 255) & (out[..., 1] == 0) & (out[..., 2] == 0)
     assert red_mask.sum() == 16 * 16
 

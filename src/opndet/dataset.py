@@ -296,8 +296,12 @@ class OpndetDataset(Dataset):
 
     def __getitem__(self, idx: int):
         # _cur_obbs: when set, passed to encode_fn alongside boxes (OBB head only).
-        # Aug paths zero this out — AABB augmenter doesn't carry orientation, so
-        # the OBB encoder falls back to zero-θ derived from the augmented AABB.
+        # Two paths preserve orientation:
+        #   - no augmentation at all (val/test or train w/ aug disabled)
+        #   - augmentation pipeline declares itself orient_safe (only photometric
+        #     + cutout, no hflip/vflip/rotate90). The aug callable carries an
+        #     `orient_safe` attr; OBBs are threaded through and cutout's keep
+        #     mask is applied to them in lockstep with boxes.
         self._cur_obbs = None
         if self.mosaic_prob > 0 and random.random() < self.mosaic_prob:
             img, boxes = self._mosaic(idx)
@@ -307,8 +311,14 @@ class OpndetDataset(Dataset):
         if self.cache_images:
             img = img.copy()
         boxes = s.boxes.copy()
-        if self.aug is None and getattr(s, "obbs", None) is not None:
-            self._cur_obbs = s.obbs.copy()
+        sample_obbs = s.obbs.copy() if getattr(s, "obbs", None) is not None else None
+        if self.aug is not None:
+            img, boxes, sample_obbs = self.aug(img, boxes, sample_obbs)
+            if sample_obbs is not None:
+                self._cur_obbs = sample_obbs
+            return self._finish(img, boxes, do_letterbox=False)
+        if sample_obbs is not None:
+            self._cur_obbs = sample_obbs
         return self._finish(img, boxes, do_letterbox=True)
 
 

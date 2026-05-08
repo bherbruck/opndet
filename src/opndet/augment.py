@@ -101,12 +101,18 @@ def _filter_visible(boxes: np.ndarray, orig_areas: np.ndarray, min_frac: float) 
     return boxes[keep]
 
 
-def _cutout(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+def _cutout(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator,
+            obbs: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Paste random rectangles of mean-gray over the image, then drop boxes whose
     visible area falls below cfg.min_visible_frac. Visibility is computed
     analytically as 1 - sum(box-hole intersections) / box_area; assumes holes
     don't overlap each other significantly within any single box (true for the
     typical small N_holes regime).
+
+    obbs: optional [N, 5] (cx, cy, w, h, θ) OBB GT — same N as boxes. The keep
+    mask applied to boxes is also applied to obbs (since obbs[i] corresponds to
+    boxes[i]). Cutout occludes pixels but doesn't change orientation, so OBB
+    angle/dim values pass through unchanged for surviving rows.
     """
     h, w = img.shape[:2]
     pad_value = 114
@@ -121,7 +127,7 @@ def _cutout(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.G
         holes[k] = (x0, y0, x0 + cw, y0 + ch)
 
     if boxes.shape[0] == 0:
-        return img, boxes
+        return img, boxes, obbs
 
     bx = boxes
     bw = (bx[:, 2] - bx[:, 0]).clip(min=0)
@@ -137,10 +143,21 @@ def _cutout(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.G
     obscured = inter.sum(axis=1)
     visible_frac = np.where(box_area > 0, 1.0 - obscured / np.maximum(box_area, 1e-9), 1.0)
     keep = visible_frac >= cfg.min_visible_frac
-    return img, boxes[keep]
+    obbs_out = obbs[keep] if obbs is not None and obbs.shape[0] == boxes.shape[0] else obbs
+    return img, boxes[keep], obbs_out
 
 
-def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator,
+               obbs: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Geometric augmentation. Transforms boxes AND OBBs through hflip/vflip/rotate90.
+
+    OBB θ transforms (rectangle has π-symmetry, so we wrap mod π):
+      - hflip: θ → (π - θ) mod π   (mirror reflects major-axis direction)
+      - vflip: θ → (π - θ) mod π   (same as hflip — mirror is the same up to rect symmetry)
+      - rot90 CCW (k times): θ → (θ + k·π/2) mod π
+    OBB w, h are unchanged by all three (rotation/mirror preserves intrinsic dims).
+    """
+    import math
     h, w = img.shape[:2]
 
     if rng.random() < cfg.hflip_prob:
@@ -149,6 +166,10 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
             x1 = w - boxes[:, 2]
             x2 = w - boxes[:, 0]
             boxes = np.stack([x1, boxes[:, 1], x2, boxes[:, 3]], axis=1)
+        if obbs is not None and obbs.shape[0]:
+            obbs = obbs.copy()
+            obbs[:, 0] = w - obbs[:, 0]
+            obbs[:, 4] = (math.pi - obbs[:, 4]) % math.pi
 
     if rng.random() < cfg.vflip_prob:
         img = img[::-1].copy()
@@ -156,25 +177,43 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
             y1 = h - boxes[:, 3]
             y2 = h - boxes[:, 1]
             boxes = np.stack([boxes[:, 0], y1, boxes[:, 2], y2], axis=1)
+        if obbs is not None and obbs.shape[0]:
+            obbs = obbs.copy()
+            obbs[:, 1] = h - obbs[:, 1]
+            obbs[:, 4] = (math.pi - obbs[:, 4]) % math.pi
 
     if rng.random() < cfg.rotate90_prob:
         k = int(rng.choice([1, 2, 3]))
         img = np.rot90(img, k=k).copy()
+        cur_w, cur_h = w, h
         if boxes.shape[0]:
             cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
             cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
             bw = boxes[:, 2] - boxes[:, 0]
             bh = boxes[:, 3] - boxes[:, 1]
-            for _ in range(k):
-                cx, cy = cy, w - cx
+        obb_cx = obb_cy = obb_theta = None
+        if obbs is not None and obbs.shape[0]:
+            obb_cx = obbs[:, 0].copy()
+            obb_cy = obbs[:, 1].copy()
+            obb_theta = obbs[:, 4].copy()
+        for _ in range(k):
+            if boxes.shape[0]:
+                cx, cy = cy, cur_w - cx
                 bw, bh = bh, bw
-                w, h = h, w
+            if obb_cx is not None:
+                obb_cx, obb_cy = obb_cy, cur_w - obb_cx
+                obb_theta = (obb_theta + math.pi / 2) % math.pi
+            cur_w, cur_h = cur_h, cur_w
+        if boxes.shape[0]:
             boxes = np.stack([cx - bw * 0.5, cy - bh * 0.5, cx + bw * 0.5, cy + bh * 0.5], axis=1)
-        else:
-            for _ in range(k):
-                w, h = h, w
+        if obb_cx is not None:
+            obbs = obbs.copy()
+            obbs[:, 0] = obb_cx
+            obbs[:, 1] = obb_cy
+            obbs[:, 4] = obb_theta
+        w, h = cur_w, cur_h
 
-    return img, boxes
+    return img, boxes, obbs
 
 
 def _hard_negative_paste(
@@ -229,14 +268,15 @@ def make_augment(cfg: AugConfig, hn_pool: list[np.ndarray] | None = None):
 
     pool = hn_pool or []
 
-    def aug(img: np.ndarray, boxes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def aug(img: np.ndarray, boxes: np.ndarray,
+            obbs: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
         rng = np.random.default_rng()
         img = _photometric(img, cfg, rng)
-        img, boxes = _geometric(img, boxes, cfg, rng)
+        img, boxes, obbs = _geometric(img, boxes, cfg, rng, obbs=obbs)
         if cfg.cutout_prob > 0 and rng.random() < cfg.cutout_prob:
-            img, boxes = _cutout(img, boxes, cfg, rng)
+            img, boxes, obbs = _cutout(img, boxes, cfg, rng, obbs=obbs)
         if pool and cfg.hard_negative_prob > 0 and rng.random() < cfg.hard_negative_prob:
             img = _hard_negative_paste(img, boxes, pool, cfg, rng)
-        return img, boxes
+        return img, boxes, obbs
 
     return aug
