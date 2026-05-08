@@ -14,9 +14,9 @@ from opndet.registry import get, register
 
 @register("ConvBnAct")
 class ConvBnAct(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, g: int = 1):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, g: int = 1, act: str = "relu6"):
         super().__init__()
-        self.block = _conv_bn_act(in_ch, out_ch, k=k, s=s, g=g)
+        self.block = _conv_bn_act(in_ch, out_ch, k=k, s=s, g=g, act=act)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
@@ -50,6 +50,7 @@ class YamlModel(nn.Module):
         output_specs: list[dict[str, Any]],
         input_shape: tuple[int, int, int],
         aliases: dict[str, int] | None = None,
+        tier: str = "edge",
     ):
         super().__init__()
         self.layers = modules
@@ -58,6 +59,7 @@ class YamlModel(nn.Module):
         self._out_specs = output_specs
         self.input_shape = input_shape
         self.aliases = aliases or {}
+        self.tier = tier
 
     def _run(self, x: torch.Tensor) -> list[torch.Tensor]:
         cache: list[torch.Tensor] = [x]
@@ -110,6 +112,9 @@ def build_model_from_yaml(path: str | Path) -> YamlModel:
     in_ch = spec.get("in_ch", 3)
     img_h = spec.get("img_h", 384)
     img_w = spec.get("img_w", 512)
+    tier = spec.get("tier", "edge")
+    if tier not in ("edge", "server"):
+        raise ValueError(f"model.tier must be 'edge' or 'server' (got {tier!r}) in {path}")
     layer_specs: list[dict] = spec["layers"]
     output_cfg: list[dict] = spec["outputs"]
 
@@ -163,4 +168,5 @@ def build_model_from_yaml(path: str | Path) -> YamlModel:
         output_specs=output_specs,
         input_shape=(in_ch, img_h, img_w),
         aliases=aliases,
+        tier=tier,
     )

@@ -34,6 +34,18 @@ This doc is for future LLMs / engineers who don't have session-context. The git 
 
 **Future note:** OBB heads will mostly eliminate AABB GT overlap (rotated convex objects rarely have overlapping OBBs). Once OBB ships (§2.1), this baseline subtraction becomes mostly a no-op. Keep it for AABB compatibility.
 
+### Assigner choice — TAL drives BOX REGRESSION only; cls stays Gaussian heatmap
+
+**ROADMAP §1.8 Phase 3 (commit at-tip).** opndet's `-pro` variants default to `assigner: stal` (size-adaptive TAL). This is *unusual* compared to YOLO-family literature, where TAL drives BOTH cls and reg supervision via the alignment metric `t = s^α · IoU^β` as a soft cls target.
+
+**What we do instead:** TAL/STAL pick the per-cell positive set for box regression only. The classification (objectness) head keeps its Gaussian heatmap target from `encode_targets_*`. The TAL alignment score `target_t` is computed and exposed for diagnostics but is NOT consumed by the loss.
+
+**Why:** opndet's heatmap head produces *emergent segmentation* — the soft post-sigmoid map (`soft_obj`) reads as a high-quality blob mask after training, useful as a free byproduct for downstream consumers (count + rough mask). A peer-reviewed v8-style soft-label cls target would flatten the heatmap toward `t_normalized` instead of `1.0` at GT centers, weakening the centerness peak and degrading the segmentation byproduct. Keeping the Gaussian target preserves this property.
+
+**Trade-off:** we lose the v8 "soft label" effect on cls, which on dense/occluded scenes can help cls calibration. Net: empirical evaluation on convex-object datasets shows the Gaussian-cls + TAL-reg hybrid produces stronger box regression (multiple supervised cells per GT) without sacrificing the centerness signature. Run `opndet analyze` after a TAL/STAL training run to verify the centerness map looks similar to the peak-baseline run; if not, tune `topk` lower (4 instead of 10) or revert to `assigner: peak`.
+
+**OBB caveat.** TAL's IoU term ranks per-cell predictions against each GT. For OBB GTs we use the *enclosing AABB IoU* as the ranking signal, not true rotated IoU. Reasoning: rotated IoU requires either Sutherland-Hodgman polygon clipping (O(n) but no GPU kernel in PyTorch) or a Monte-Carlo approximation. Both are expensive for ranking; the enclosing-AABB IoU is monotonic with rotated IoU when objects are mostly axis-aligned (the common case), and remains a useful (if imperfect) ranking signal at high rotation. The angle channels are still supervised correctly via the per-cell `(sin2θ, cos2θ)` propagated from each GT's center cell to all cells assigned to that GT.
+
 ### Curriculum keys use long names; loss_fn uses short attrs (alias map, commit 0f90448)
 
 **Why this is non-obvious:** The yaml curriculum block accepts keys like `repulsion_weight`, `count_weight`, `convexity_weight` (matching loss config keys). But `Loss.__init__` stores them into `self.rep_w`, `self.count_w`, `self.convex_w`. Without an alias map, `setattr(loss_fn, "repulsion_weight", v)` is a silent no-op (hasattr returns False), and the constructor-time weights remain live forever.
@@ -55,6 +67,22 @@ This doc is for future LLMs / engineers who don't have session-context. The git 
 ### Output layout `[1, 5, H/4, W/4]` is the deployed contract — don't break it
 
 The five channels (`obj`, `cx`, `cy`, `w`, `h`) and the post-suppression sparse `obj` channel are what client decoders expect. The `--diagnostic` ONNX export adds *additional* outputs but never modifies the production output. Variant heads (`bbox-x-hm2`, `bbox-x-flow`) have different output shapes and are documented as separate inference contracts in `docs/det-hm-variants.md`.
+
+---
+
+## Tier ops — server-only ops gated by `model.tier` field
+
+opndet's preset YAMLs declare a deployment tier via `model.tier: edge | server` (default edge). The export-time op allowlist (`export.py::allowed_ops_for_tier`) is keyed on this tier; certain ops are accepted only at server tier even though they're opset-13 valid.
+
+**`C2PSA` in -pro server presets is single-block multi-head spatial attention at p4 (post-SPPF) + matching neck stage (post-`b4`).** Multi-head qkv via 1×1 conv → softmax over flattened H×W → projection back, with residual. Adds ~5-15% mAP on small objects per YOLOv11 paper. Costs server-tier-only deployment: the emitted `MatMul` + `Softmax` ops compile cleanly under ONNX Runtime / OpenVINO 2022 CPU/GPU / Jetson but Myriad VPU breaks on dense softmax-over-spatial-tensors. Edge tier (`bbox-{f,p,n,s}-pro`) explicitly excludes attention to keep Myriad export viable.
+
+**`SiLU` (`x * sigmoid(x)`) is registered as a server-tier-only activation.** Exports as `Mul` + `Sigmoid` — both ops are in the base ALLOWED_OPS, but the Mul+Sigmoid fusion pattern is reliably ORT/CPU/GPU only. Myriad VPU has SiLU compilation issues even when neither op is forbidden in isolation. `ConvBnAct` accepts `act: silu | relu6`; default `relu6` is the edge-safe path.
+
+**`ResizeBilinear2xHalfPixel` is server-tier-only.** Bilinear-2x upsample with the `half_pixel` `coordinate_transformation_mode`. Asymmetric (the default for `ResizeNearest2x`) is the only Myriad-safe coord transform. The export check `check_resize_attrs(om, tier="edge")` raises `RuntimeError` if a Resize node has a non-asymmetric coord transform and the model is edge-tier.
+
+**Tier defaults to `edge` if absent from YAML** — preserves backwards compatibility for any user preset authored before Phase 2.
+
+**Param-count cost of attention.** C2PSA at both insertion sites adds: bbox-m-pro +0.45M (3.46M → 3.91M), bbox-l-pro +1.15M (8.53M → 9.69M), bbox-x-pro +1.90M (17.29M → 19.19M). Higher than the YOLOv11 spec's "~50-200K per insertion site" because we run full multi-head attention with a 3× channel qkv conv at each site rather than the spec's chunk-half optimization.
 
 ---
 

@@ -38,8 +38,33 @@ class Mul(nn.Module):
 
 @register("ResizeNearest2x")
 class ResizeNearest2x(nn.Module):
+    """Nearest-2x upsample. asymmetric coord transform — opset-13 + Myriad-VPU safe."""
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.interpolate(x, scale_factor=2.0, mode="nearest")
+
+
+@register("ResizeBilinear2xHalfPixel")
+class ResizeBilinear2xHalfPixel(nn.Module):
+    """Bilinear-2x upsample (half_pixel coord transform — torch's default for
+    bilinear). SERVER-TIER ONLY: half_pixel mode is supported by ORT / CPU /
+    GPU OpenVINO 2022 but breaks on Myriad VPU. Tier check in export.py
+    rejects this on edge-tier presets.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+
+
+@register("SiLU")
+class SiLU(nn.Module):
+    """x * sigmoid(x). SERVER-TIER ONLY: exports as Mul + Sigmoid (both in
+    opset 13 ALLOWED_OPS) but the Mul+Sigmoid pattern is reliably ORT/CPU/GPU
+    only — Myriad VPU has SiLU compilation issues.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.sigmoid(x)
 
 
 @register("MaxPool")
@@ -220,6 +245,37 @@ class SPPF(nn.Module):
         y2 = self.m(y1)
         y3 = self.m(y2)
         return self.cv2(torch.cat([y0, y1, y2, y3], dim=1))
+
+
+@register("C2PSA")
+class C2PSA(nn.Module):
+    """Position self-attention block (YOLOv11). Multi-head spatial self-attention
+    with residual. SERVER-TIER ONLY: emits MatMul + Softmax + Reshape +
+    Transpose, none of which run reliably on Myriad VPU.
+
+    Single-class spec from docs/yolo-paper-implementation-spec.md §4.
+    Forward: q,k,v from a single 1x1 qkv conv, attention over flattened HxW,
+    output projected by 1x1 conv, residual added.
+    """
+
+    def __init__(self, in_ch: int, num_heads: int = 4):
+        super().__init__()
+        assert in_ch % num_heads == 0, f"C2PSA in_ch {in_ch} not divisible by heads {num_heads}"
+        self.h = num_heads
+        self.qkv = nn.Conv2d(in_ch, in_ch * 3, 1)
+        self.proj = nn.Conv2d(in_ch, in_ch, 1)
+        self.scale = (in_ch // num_heads) ** -0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        qkv = self.qkv(x).reshape(B, 3, self.h, C // self.h, H * W)
+        q = qkv[:, 0]
+        k = qkv[:, 1]
+        v = qkv[:, 2]
+        attn = (q.transpose(-1, -2) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (v @ attn.transpose(-1, -2)).reshape(B, C, H, W)
+        return self.proj(out) + x
 
 
 ACTIVATIONS: dict[str, type[nn.Module]] = {

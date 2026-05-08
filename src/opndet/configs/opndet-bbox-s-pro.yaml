@@ -12,6 +12,7 @@
 # Tier: edge. opset-13 + Myriad-VPU safe. NO SiLU, NO attention, NO half_pixel resize.
 
 model:
+  tier: edge
   in_ch: 3
   img_h: 384
   img_w: 512

@@ -10,9 +10,11 @@
 # are sigmoid distances to the OBB-enclosing AABB; sin2θ/cos2θ are
 # tanh-bounded angle channels. Use decode_obb() at inference.
 #
-# Tier: server. Free to use SiLU, attention, half-pixel resize (Phase 2).
+# Tier: server. Phase 2: C2PSA at p4 (post-SPPF) + matching neck (b4) stage.
+# Free to use SiLU, attention, half-pixel resize.
 
 model:
+  tier: server
   in_ch: 3
   img_h: 384
   img_w: 512
@@ -26,8 +28,11 @@ model:
     # SPPF: widen receptive field at the deepest stage (opset-13 safe: Conv+MaxPool+Concat).
     - {name: p4s,  from: p4,   module: SPPF,      args: {in_ch: 640, out_ch: 640, k: 5}}
 
+    # C2PSA: position self-attention on the deepest backbone stage. Server-tier only.
+    - {name: p4_attn, from: p4s, module: C2PSA,    args: {in_ch: 640, num_heads: 4}}
+
     # Top-down lateral 1x1s (project all stages to neck width).
-    - {name: lat4, from: p4s,  module: ConvBnAct, args: {in_ch: 640, out_ch: 256, k: 1}}
+    - {name: lat4, from: p4_attn, module: ConvBnAct, args: {in_ch: 640, out_ch: 256, k: 1}}
     - {name: lat3, from: p3,   module: ConvBnAct, args: {in_ch: 512, out_ch: 256, k: 1}}
     - {name: lat2, from: p2,   module: ConvBnAct, args: {in_ch: 320, out_ch: 256, k: 1}}
     - {name: lat1, from: p1,   module: ConvBnAct, args: {in_ch: 160, out_ch: 256, k: 1}}
@@ -54,9 +59,11 @@ model:
     - {name: d3,   from: b3,          module: ConvBnAct,       args: {in_ch: 256, out_ch: 256, k: 3, s: 2}}
     - {name: ab4,  from: [d3, t4],    module: Add,             args: {}}
     - {name: b4,   from: ab4,         module: ConvBnAct,       args: {in_ch: 256, out_ch: 256, k: 3}}
+    # C2PSA on the matching neck stage at p4 stride. Server-tier only.
+    - {name: b4_attn, from: b4,       module: C2PSA,           args: {in_ch: 256, num_heads: 4}}
 
     # Bring b4 back to stride 4 via three nearest-2x upsamples and fuse with t1.
-    - {name: b4u1, from: b4,          module: ResizeNearest2x, args: {}}
+    - {name: b4u1, from: b4_attn,     module: ResizeNearest2x, args: {}}
     - {name: b4u2, from: b4u1,        module: ResizeNearest2x, args: {}}
     - {name: b4u3, from: b4u2,        module: ResizeNearest2x, args: {}}
     - {name: nadd, from: [t1, b4u3],  module: Add,             args: {}}

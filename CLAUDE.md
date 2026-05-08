@@ -114,11 +114,15 @@ opndet's presets split into two tiers based on deployment-target opset constrain
 
 **Server tier** (`bbox-m`, `bbox-l`, `bbox-x`):
 - Targets Jetson / RTX / server CPU / Colab GPU. No Myriad commitment.
-- Free to use SiLU, attention, half-pixel resize, multi-output tensors, dynamic shapes.
+- Free to use SiLU, attention (C2PSA), half-pixel resize, multi-output tensors, dynamic shapes. These add `MatMul` + `Softmax` to the graph (server-tier-allowlist additions in `export.py::SERVER_TIER_EXTRA_OPS`).
 - Still maintains opset-13 export for ONNX Runtime + OpenVINO 2022 CPU/GPU compatibility.
 - `bbox-x` uses `peak_kernel=7` (vs k=5 elsewhere) for tighter duplicate suppression.
 
+**Tier is declared in YAML.** Each preset's `model.tier: edge | server` field gates the op allowlist. Default if absent: `edge`. The export-time check `allowed_ops_for_tier(tier)` rejects server-only ops (MatMul, Softmax) when tier=edge; `check_resize_attrs(model, tier)` rejects half-pixel Resize on edge tier.
+
 **`-pro` variants** (see ROADMAP §1.8) layer the YOLO-family + OBB + hard-negative-mining wins on top of each base size. Edge-tier `-pro` keeps opset-13 compat; server-tier `-pro` adds attention / SiLU / half-pixel resize. **Phase 1 shipped:** SPPF at p4, PAFPN neck (top-down + bottom-up + fuse-back-to-stride-4), decoupled head (parallel cls + reg branches off `nout`), and ltrb regression. The output tensor stays `[1, 5, H/4, W/4]` but channel semantics change to `(obj_peak, l, t, r, b)` — image-normalized cell-center-to-edge distances. Use `decode_ltrb()` (in `decode.py`) at inference. Encoded targets via `encode_targets_ltrb()` (in `encode.py`); train with `wh_loss: ltrb` in `OpndetBboxLoss` (DIoU on reconstructed boxes).
+
+**Phase 2 (Server-tier op upgrades) shipped:** server-tier `-pro` (`m/l/x-pro`) presets now ship `C2PSA` position self-attention at p4 (post-SPPF) and at the matching neck stage (post-`b4`). New primitives: `SiLU` (`x * sigmoid(x)`, exports as Mul+Sigmoid), `ResizeBilinear2xHalfPixel` (bilinear upsample with half_pixel coord transform), and `C2PSA` (single-block multi-head spatial self-attention with residual). YAMLs declare their tier via `model.tier: edge|server` (default edge). Tier-aware export check: `allowed_ops_for_tier()` and `check_resize_attrs()` in `export.py` reject `MatMul`/`Softmax` and half_pixel Resize on edge tier. `ConvBnAct` accepts `act: silu` (default `relu6`). Edge `-pro` (`f/p/n/s-pro`) is unchanged — still 100% opset-13 + Myriad-VPU safe.
 
 ### Bundled presets and size points
 
@@ -155,6 +159,7 @@ All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except h
 - `cli.py` — argparse subcommand router; entry point for the `opndet` script.
 - `train.py` — training loop. Lazy imports tensorboard with no-op fallback when import fails (Colab numpy/tensorboard mismatches). Auto-increment `out_dir`, resume, trajectory-patience, curriculum w/ alias map, cosine LR + warmup, in-process Colab `files.download()`. Reads `optimizer: adamw|musgd` from config (default adamw).
 - `optim_muon.py` — Muon + MuSGD optimizers (ROADMAP §1.8 Phase 6). Opt-in via `optimizer: musgd`; routes >=2D-flattenable conv weights to Muon, everything else to AdamW.
+- `assigner.py` — TAL / STAL task-aligned per-cell positive assigner for box regression (ROADMAP §1.8 Phase 3). Opt-in via `assigner: tal|stal` in train.yaml; default `peak` keeps the existing single-positive-per-GT path. Drives REGRESSION-side assignment only — cls supervision stays Gaussian heatmap (see docs/engineering-decisions.md "Assigner choice"). Default for `-pro` presets is `stal` + `curriculum: progloss` (auto-balancing loss weights).
 - `model.py` / `blocks.py` — hand-coded reference model (kept for parity tests).
 - `primitives.py` / `registry.py` / `yaml_build.py` — YAML DSL system.
 - `encode.py` — Gaussian heatmap GT encoder (CornerNet σ heuristic).

@@ -58,7 +58,24 @@ def _cmd_export(args: argparse.Namespace) -> int:
                           input_names=["image"], output_names=output_names,
                           opset_version=args.opset, do_constant_folding=True,
                           dynamic_axes=None, dynamo=False)
-        suffix_parts = []
+        # Tier-aware op allowlist check (Phase 2). The underlying YamlModel
+        # carries .tier; for _DiagnosticWrapper / _InputNormalizer wrappers we
+        # resolve through the inner model.
+        from opndet.export import allowed_ops_for_tier, check_resize_attrs
+        import onnx as _onnx
+        inner = m
+        while hasattr(inner, "model") and not hasattr(inner, "tier"):
+            inner = inner.model
+        tier = getattr(inner, "tier", "edge")
+        om = _onnx.load(str(out_path))
+        ops = {n.op_type for n in om.graph.node}
+        forbidden = ops - allowed_ops_for_tier(tier)
+        if forbidden:
+            print(f"FAIL: {out_path} (tier={tier}) has forbidden ops: {sorted(forbidden)}",
+                  file=sys.stderr)
+            return 3
+        check_resize_attrs(om, tier=tier)
+        suffix_parts = [f"tier={tier}"]
         if args.bake_input_norm:
             suffix_parts.append("with input norm baked in: expects raw 0-255")
         if args.diagnostic:

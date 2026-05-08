@@ -192,11 +192,12 @@ The kitchen-sink-of-everything variants. One per size point (`bbox-{f,p,n,s,m,l,
 - `ltrb` regression: 4 channels (left/top/right/bottom distances to box edges) replacing `(cx, cy, w, h)`. New encode/decode in `encode.py` / `decode.py`. Keeps single output tensor `[1, 5, H/4, W/4]` shape; semantics change from `(cx, cy, w, h)` to `(l, t, r, b)`
 - A/B target: ≥+1 mAP@.5 over current bbox-x at the same param count
 
-**Phase 2: Server-tier op upgrades** (~3-4 days, server-tier only)
-- New primitive: `SiLU` activation (registered, opt-in via YAML)
-- Allow `Resize` with `coordinate_transformation_mode=half_pixel`
-- New primitive: `C2PSA` position self-attention block (insert at p3 + p4 in server-tier presets only)
-- These primitives ARE NOT registered for edge-tier presets (a YAML check in `yaml_build.py` rejects them if the preset is in the edge tier)
+**Phase 2: Server-tier op upgrades** (~3-4 days, server-tier only) — **shipped**
+- New primitive: `SiLU` activation (registered; ConvBnAct accepts `act: silu`)
+- New primitive: `ResizeBilinear2xHalfPixel` for half-pixel coord-transform Resize
+- New primitive: `C2PSA` multi-head position self-attention with residual; inserted at p4 (post-SPPF) + matching neck stage (post-`b4`) in server-tier `-pro` presets
+- YAML declares `model.tier: edge | server` (default edge). `export.py::allowed_ops_for_tier(tier)` and `check_resize_attrs()` enforce the split at export time; edge tier rejects MatMul/Softmax/half_pixel-Resize
+- Param-count cost: bbox-m-pro +0.45M, bbox-l-pro +1.15M, bbox-x-pro +1.90M
 
 **Phase 3: Loss & training upgrades** (~1-2 weeks, all sizes)
 - New assigner: TAL (Task-Aligned Learning) for *regression-side* assignment. Each GT picks the most-aligned positive cell to handle its box regression; cls supervision stays Gaussian heatmap (preserves emergent segmentation)

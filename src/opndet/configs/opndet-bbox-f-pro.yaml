@@ -14,6 +14,7 @@
 # NO attention, NO half_pixel resize.
 
 model:
+  tier: edge
   in_ch: 3
   img_h: 384
   img_w: 512

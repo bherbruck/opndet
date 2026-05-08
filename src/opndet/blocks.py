@@ -4,11 +4,23 @@ import torch
 from torch import nn
 
 
-def _conv_bn_act(in_ch: int, out_ch: int, k: int = 3, s: int = 1, g: int = 1) -> nn.Sequential:
+def _conv_bn_act(
+    in_ch: int, out_ch: int, k: int = 3, s: int = 1, g: int = 1, act: str = "relu6"
+) -> nn.Sequential:
+    if act == "relu6":
+        a: nn.Module = nn.ReLU6(inplace=True)
+    elif act == "silu":
+        # decomposed as Mul+Sigmoid via custom module so opset-13 export is clean.
+        # nn.SiLU also exports as Mul+Sigmoid but only on opset>=14 in some torch
+        # versions. Use the explicit decomposition for safety.
+        from opndet.primitives import SiLU
+        a = SiLU()
+    else:
+        raise ValueError(f"unknown activation {act!r}; expected 'relu6' or 'silu'")
     return nn.Sequential(
         nn.Conv2d(in_ch, out_ch, k, s, k // 2, groups=g, bias=False),
         nn.BatchNorm2d(out_ch),
-        nn.ReLU6(inplace=True),
+        a,
     )
 
 

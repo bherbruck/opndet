@@ -222,7 +222,7 @@ def test_pro_preset_builds_obb(preset: str):
 
 @pytest.mark.parametrize("preset", PRO_PRESETS)
 def test_pro_preset_obb_exports_opset13(preset: str):
-    from opndet.export import ALLOWED_OPS
+    from opndet.export import allowed_ops_for_tier
     from opndet.presets import resolve
     from opndet.yaml_build import build_model_from_yaml
 
@@ -234,8 +234,9 @@ def test_pro_preset_obb_exports_opset13(preset: str):
         _export(m, x, path)
         om = onnx.load(path)
         ops = {n.op_type for n in om.graph.node}
-        forbidden = ops - ALLOWED_OPS
-        assert not forbidden, f"{preset} forbidden ops: {forbidden}"
+        # Phase 2: server-tier presets may use MatMul / Softmax via C2PSA.
+        forbidden = ops - allowed_ops_for_tier(m.tier)
+        assert not forbidden, f"{preset} (tier={m.tier}) forbidden ops: {forbidden}"
         assert "Tanh" in ops, f"{preset} expected Tanh in graph"
 
         with torch.no_grad():

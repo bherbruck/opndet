@@ -19,6 +19,42 @@ ALLOWED_OPS = {
     "Unsqueeze", "Squeeze", "Where", "Pad",
 }
 
+# Server-tier additions: ops that are opset-13 + ORT/CPU/GPU/Jetson safe but
+# NOT Myriad-VPU compatible. Allowed only when the model declares tier: server.
+SERVER_TIER_EXTRA_OPS = {
+    "MatMul", "Softmax",
+}
+
+
+def allowed_ops_for_tier(tier: str) -> set[str]:
+    if tier == "server":
+        return ALLOWED_OPS | SERVER_TIER_EXTRA_OPS
+    if tier == "edge":
+        return set(ALLOWED_OPS)
+    raise ValueError(f"unknown tier {tier!r}")
+
+
+def check_resize_attrs(onnx_model, tier: str) -> None:
+    """Reject half_pixel coord-transform Resize on edge tier.
+
+    Resize is in the base ALLOWED_OPS, but the half_pixel mode is server-tier
+    only (Myriad VPU breaks on it; asymmetric mode is the safe one).
+    """
+    if tier == "server":
+        return
+    for n in onnx_model.graph.node:
+        if n.op_type != "Resize":
+            continue
+        for a in n.attribute:
+            if a.name == "coordinate_transformation_mode":
+                mode = a.s.decode("utf-8") if isinstance(a.s, bytes) else str(a.s)
+                if mode and mode != "asymmetric":
+                    raise RuntimeError(
+                        f"edge-tier model has Resize coord_transform '{mode}'; "
+                        f"only 'asymmetric' is Myriad-safe. Set tier: server in YAML or "
+                        f"use ResizeNearest2x (asymmetric)."
+                    )
+
 
 def build_pt_model(ckpt_path: str | None, cfg: ModelConfig) -> OpndetBbox:
     m = OpndetBbox(cfg).eval()
@@ -112,15 +148,17 @@ def export_onnx(
     return str(out_path_p)
 
 
-def verify_onnx(model_path: str, pt_model: OpndetBbox, atol: float = 1e-4) -> dict:
+def verify_onnx(model_path: str, pt_model: OpndetBbox, atol: float = 1e-4, tier: str = "edge") -> dict:
     cfg = pt_model.cfg
     onnx_model = onnx.load(model_path)
     onnx.checker.check_model(onnx_model)
 
+    allowed = allowed_ops_for_tier(tier)
     used_ops = {n.op_type for n in onnx_model.graph.node}
-    forbidden = used_ops - ALLOWED_OPS
+    forbidden = used_ops - allowed
     if forbidden:
-        raise RuntimeError(f"forbidden ops in graph: {sorted(forbidden)}")
+        raise RuntimeError(f"forbidden ops in graph (tier={tier}): {sorted(forbidden)}")
+    check_resize_attrs(onnx_model, tier)
 
     x = torch.randn(1, cfg.in_ch, cfg.img_h, cfg.img_w)
     with torch.no_grad():
