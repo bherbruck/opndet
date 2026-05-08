@@ -381,10 +381,19 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
 
         if ((chunk_start // BATCH) + 1) % max(1, progress_every // BATCH) == 0:
             elapsed = time.time() - t_inf
-            rate = stats.n_images_processed / max(elapsed, 1e-6)
+            avg_rate = stats.n_images_processed / max(elapsed, 1e-6)
+            # Track instantaneous rate (recent BATCH images) — cumulative average
+            # is misleading on heterogeneous datasets (dense scenes drag it down
+            # for tens of slots after they've passed).
+            if not hasattr(run, "_last_t"):
+                run._last_t, run._last_n = elapsed, stats.n_images_processed   # type: ignore[attr-defined]
+                inst_rate = avg_rate
+            else:
+                inst_rate = (stats.n_images_processed - run._last_n) / max(elapsed - run._last_t, 1e-6)   # type: ignore[attr-defined]
+                run._last_t, run._last_n = elapsed, stats.n_images_processed   # type: ignore[attr-defined]
             print(f"  [{stats.n_images_processed}/{len(todo)}] obb={stats.n_obb_extracted} "
                   f"round={stats.n_aabb_fallback} drop={stats.n_invalid_dropped} "
-                  f"({rate:.1f} img/s, batch={BATCH})")
+                  f"({inst_rate:.1f} img/s now, {avg_rate:.1f} avg, batch={BATCH})")
 
     stats.duration_seconds = round(time.time() - t0, 2)
     manifest = {k: v for k, v in asdict(stats).items()}
