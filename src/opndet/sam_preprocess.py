@@ -125,18 +125,23 @@ class RunStats:
     errors: list[str] = field(default_factory=list)
 
 
-def process_image(img_path: Path, annotations: list[dict], predictor) -> tuple[list[str], ImageStats]:
+def process_image(img_path: Path, annotations: list[dict], predictor,
+                  img_rgb: np.ndarray | None = None) -> tuple[list[str], ImageStats]:
     """Run SAM2 on one image; return (yolo_obb_lines, stats).
     `annotations` is the raw COCO ann list (each has a 'bbox' field [x,y,w,h]).
     `predictor` is a SAM2ImagePredictor (already moved to device).
+    `img_rgb` is an optional pre-loaded RGB ndarray; if None, loads from img_path.
+    Pre-loading lets the caller overlap disk I/O with the previous image's GPU
+    forward in a thread pool.
     """
     import torch  # local import — module imports stay light
 
     stats = ImageStats()
-    img = cv2.imread(str(img_path))
-    if img is None:
-        return [], stats
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if img_rgb is None:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            return [], stats
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     h, w = img_rgb.shape[:2]
 
     boxes_xyxy = np.array(
@@ -177,6 +182,50 @@ def process_image(img_path: Path, annotations: list[dict], predictor) -> tuple[l
         stats.n_obb += 1
         lines.append(corners_to_yolo_obb_line(corners, w, h, class_id=0))
     return lines, stats
+
+
+def _sam_batch_predict(predictor, images: list[np.ndarray],
+                       boxes_per_image: list[np.ndarray],
+                       has_batch_api: bool) -> list[np.ndarray]:
+    """Run SAM2 over a batch of images. Returns list of mask arrays of shape
+    (n_objs_i, H_i, W_i) per image. Falls back to set_image()+predict() loop
+    when set_image_batch isn't available.
+    """
+    import torch
+    use_cuda = torch.cuda.is_available()
+    autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16) if use_cuda
+                    else torch.autocast("cpu", dtype=torch.bfloat16, enabled=False))
+
+    masks_per: list[np.ndarray] = []
+    with torch.inference_mode(), autocast_ctx:
+        if has_batch_api and len(images) > 1:
+            predictor.set_image_batch(images)
+            results = predictor.predict_batch(
+                point_coords_batch=None,
+                point_labels_batch=None,
+                box_batch=boxes_per_image,
+                multimask_output=False,
+            )
+            # predict_batch returns (masks_list, scores_list, low_res_list)
+            masks_list = results[0] if isinstance(results, tuple) else results
+            for m in masks_list:
+                m = np.asarray(m)
+                if m.ndim == 4:
+                    m = m[:, 0]
+                elif m.ndim == 3 and m.shape[0] == 1:
+                    pass
+                masks_per.append(m)
+        else:
+            for img, boxes in zip(images, boxes_per_image):
+                predictor.set_image(img)
+                masks, _scores, _ = predictor.predict(
+                    point_coords=None, point_labels=None,
+                    box=boxes, multimask_output=False,
+                )
+                if masks.ndim == 4:
+                    masks = masks[:, 0]
+                masks_per.append(np.asarray(masks))
+    return masks_per
 
 
 def _load_predictor(sam_model: str, device: str):
@@ -236,8 +285,10 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
     if max_images is not None:
         items = items[:max_images]
 
-    predictor = None
-    for idx, (im_id, im) in enumerate(items):
+    # Filter+ classify items into "do" / "skip" / "no-anns" up front so the
+    # image-load thread doesn't waste time on items we won't process.
+    todo: list[tuple[Path, Path, list[dict]]] = []
+    for im_id, im in items:
         img_path = images_dir / im["file_name"]
         out_path = out_dir / (Path(im["file_name"]).stem + ".txt")
         if not img_path.exists():
@@ -248,33 +299,92 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
             continue
         anns = anns_by_image.get(im_id, [])
         if not anns:
-            # write empty file to mark "processed, no objects" so we skip on rerun
             out_path.write_text("")
             stats.n_images_processed += 1
             continue
+        todo.append((img_path, out_path, anns))
 
-        if predictor is None:
-            predictor = _load_predictor(sam_model, device)
+    if not todo:
+        stats.duration_seconds = round(time.time() - t0, 2)
+        manifest = {k: v for k, v in asdict(stats).items()}
+        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        return stats
+
+    predictor = _load_predictor(sam_model, device)
+
+    # Step 1: preload ALL images into RAM in parallel. ~3 GB for a 5000-image
+    # 384x512 dataset; fits comfortably on Colab. Eliminates the per-image
+    # disk-I/O wait that idles the GPU between SAM forwards.
+    print(f"  preloading {len(todo)} images into RAM...")
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        loaded = list(pool.map(
+            lambda item: (item, cv2.cvtColor(cv2.imread(str(item[0])), cv2.COLOR_BGR2RGB)
+                          if cv2.imread(str(item[0])) is not None else None),
+            todo,
+        ))
+    preload_dt = time.time() - t0
+    n_loaded = sum(1 for _, img in loaded if img is not None)
+    print(f"  preloaded {n_loaded}/{len(todo)} in {preload_dt:.1f}s "
+          f"({n_loaded / max(preload_dt, 1e-6):.0f} img/s disk read)")
+
+    # Step 2: batched SAM2 inference. set_image_batch runs the image encoder
+    # once over a batch (single big GPU forward); per-image predict() then
+    # only runs the cheap mask decoder. Net: GPU is busy ~100% of the time.
+    # Falls back to single-image set_image() if the SAM2 build doesn't expose
+    # set_image_batch.
+    has_batch_api = hasattr(predictor, "set_image_batch") and hasattr(predictor, "predict_batch")
+    BATCH = 8 if has_batch_api else 1
+
+    t_inf = time.time()
+    for chunk_start in range(0, len(loaded), BATCH):
+        chunk = loaded[chunk_start:chunk_start + BATCH]
+        valid = [(item, img) for (item, img) in chunk if img is not None]
+        if not valid:
+            continue
+        items_v = [v[0] for v in valid]
+        imgs_v = [v[1] for v in valid]
+        boxes_per = []
+        for img_path, _, anns in items_v:
+            bx = np.array(
+                [coco_bbox_to_xyxy(a["bbox"]) for a in anns if a.get("bbox") is not None],
+                dtype=np.float32,
+            )
+            boxes_per.append(bx)
 
         try:
-            lines, im_stats = process_image(img_path, anns, predictor)
-        except Exception as e:  # noqa: BLE001 — keep going on per-image faults
-            stats.errors.append(f"{img_path.name}: {e}")
+            masks_per = _sam_batch_predict(predictor, imgs_v, boxes_per, has_batch_api)
+        except Exception as e:  # noqa: BLE001
+            for (img_path, _, _) in items_v:
+                stats.errors.append(f"{img_path.name}: batch failed: {e}")
             continue
-        out_path.write_text("\n".join(lines) + ("\n" if lines else ""))
-        stats.n_images_processed += 1
-        stats.n_objects_processed += im_stats.n_objects
-        stats.n_obb_extracted += im_stats.n_obb
-        stats.n_aabb_fallback += im_stats.n_round_fallback
-        stats.n_invalid_dropped += im_stats.n_invalid
 
-        if (idx + 1) % progress_every == 0:
-            elapsed = time.time() - t0
-            rate = (stats.n_images_processed) / max(elapsed, 1e-6)
-            print(f"  [{idx + 1}/{len(items)}] processed={stats.n_images_processed} "
-                  f"skipped={stats.n_images_skipped} obb={stats.n_obb_extracted} "
+        for (img_path, out_path, anns), masks, boxes_xyxy in zip(items_v, masks_per, boxes_per):
+            lines: list[str] = []
+            im_stats = ImageStats(n_objects=len(boxes_xyxy))
+            for i, mask in enumerate(masks):
+                corners = mask_to_obb_corners(mask, fallback_bbox=boxes_xyxy[i])
+                if corners is None or not is_valid_rectangle(corners):
+                    im_stats.n_invalid += 1
+                    continue
+                if _is_round_via_corners(corners):
+                    im_stats.n_round_fallback += 1
+                im_stats.n_obb += 1
+                h, w = mask.shape[-2:]
+                lines.append(corners_to_yolo_obb_line(corners, w, h, class_id=0))
+            out_path.write_text("\n".join(lines) + ("\n" if lines else ""))
+            stats.n_images_processed += 1
+            stats.n_objects_processed += im_stats.n_objects
+            stats.n_obb_extracted += im_stats.n_obb
+            stats.n_aabb_fallback += im_stats.n_round_fallback
+            stats.n_invalid_dropped += im_stats.n_invalid
+
+        if ((chunk_start // BATCH) + 1) % max(1, progress_every // BATCH) == 0:
+            elapsed = time.time() - t_inf
+            rate = stats.n_images_processed / max(elapsed, 1e-6)
+            print(f"  [{stats.n_images_processed}/{len(todo)}] obb={stats.n_obb_extracted} "
                   f"round={stats.n_aabb_fallback} drop={stats.n_invalid_dropped} "
-                  f"({rate:.1f} img/s)")
+                  f"({rate:.1f} img/s, batch={BATCH})")
 
     stats.duration_seconds = round(time.time() - t0, 2)
     manifest = {k: v for k, v in asdict(stats).items()}
