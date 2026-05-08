@@ -1,19 +1,23 @@
-# opndet-bbox-f-tp: temporal-prior variant of bbox-f (femto). Identical
-# backbone/neck/head, but takes a 4th input channel: a stride-4 "prior"
-# heatmap (upsampled to input H/W in the dataloader before feeding the stem).
-# Adds 36 params to the stem (4 stem out_ch * 1 new in_ch * 3*3 kernel) on
-# top of bbox-f's 28,081. Output unchanged: [1, 5, 96, 128].
+# opndet-bbox-f-pro: kitchen-sink-of-everything flagship variant.
 #
-# Train this variant with TemporalPriorSynth wired into the dataset (auto-on
-# when in_ch==4). At deployment, host-side TailAccumulator (see opndet.temporal)
-# produces the prior frame-by-frame.
+# PHASE 0 STUB — currently a near-copy of opndet-bbox-f with soft_obj exposed as a
+# named tap point. Phases 1-6 (see ROADMAP §1.8) layer in YOLO-family
+# improvements: SPPF, PAFPN, decoupled head, ltrb regression, TAL/STAL/ProgLoss,
+# OBB output, hard-negative-mining augmentation, optionally MuSGD optimizer.
+#
+# Tier: edge. All upgrades respect opset-13 / Myriad-VPU compatibility.
+
+# opndet-bbox-f: femto variant. Targeting ~25K params for the smallest viable
+# detector that still actually detects. Honest take: quality drops noticeably
+# below pico — use only when memory is critical (sub-1MB int8 deployment).
+# Stride 4, output [1, 5, 96, 128].
 
 model:
-  in_ch: 4
+  in_ch: 3
   img_h: 384
   img_w: 512
   layers:
-    - {name: stem, from: 0,    module: ConvBnAct, args: {in_ch: 4,   out_ch: 4,  k: 3, s: 2}}
+    - {name: stem, from: 0,    module: ConvBnAct, args: {in_ch: 3,   out_ch: 4,  k: 3, s: 2}}
     - {name: p1,   from: stem, module: CSPBlock,  args: {in_ch: 4,   out_ch: 8,  n: 1, s: 2}}
     - {name: p2,   from: p1,   module: CSPBlock,  args: {in_ch: 8,   out_ch: 16, n: 1, s: 2}}
     - {name: p3,   from: p2,   module: CSPBlock,  args: {in_ch: 16,  out_ch: 24, n: 1, s: 2}}
@@ -38,6 +42,8 @@ model:
     - {name: raw,   from: trunk, module: Conv,      args: {in_ch: 16, out_ch: 5,  k: 1, bias_init: [-2.19, 0.0, 0.0, 0.0, 0.0]}}
 
     - {name: obj_r, from: raw,   module: SplitChannels,       args: {start: 0, end: 1}}
+    - {name: soft_obj, from: obj_r, module: Sigmoid,             args: {}}
+
     - {name: obj,   from: obj_r, module: SigmoidPeakSuppress, args: {k: 5, eps: 5.0e-3}}
     - {name: cxy_r, from: raw,   module: SplitChannels,       args: {start: 1, end: 3}}
     - {name: cxy,   from: cxy_r, module: Sigmoid,             args: {}}

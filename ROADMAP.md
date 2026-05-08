@@ -170,6 +170,75 @@ Standard detection losses optimize per-cell BCE/focal + per-cell box regression.
 
 Listed under Part 2 architecturally but elevated to high priority. Pluggable label loaders (the `format:` field in `data.sources`) ship as the foundation; `opndet sam-obb` CLI generates labels from any AABB-annotated dataset; `opndet-bbox-x-obb` preset trains the rotated-output variant. AABB → OBB unblocks fair mAP@.5:.95 evaluation on rotated convex objects and replaces convexity loss with shape-aware heatmap supervision. Full plan in 2.1.
 
+### 1.8 `bbox-*-pro` flagship variants — **HIGH PRIORITY**
+
+The kitchen-sink-of-everything variants. One per size point (`bbox-{f,p,n,s,m,l,x}-pro`). Combines opndet's centerness / no-NMS / emergent-segmentation identity with every YOLO-family idea worth porting (see `docs/yolo-paper-implementation-spec.md`), plus OBB output, plus hard-negative mining. The "industrial-grade flagship" tier — when you want every documented win baked in.
+
+**Tier split:**
+- **Edge tier** (`bbox-{f,p,n,s}-pro`): YOLO ideas that don't break opset-13 / Myriad. Decoupled head, PAFPN, ltrb, TAL-for-regression, ProgLoss, hard-negative mining, OBB. NO attention, NO SiLU, NO half-pixel resize.
+- **Server tier** (`bbox-{m,l,x}-pro`): all of the above PLUS attention (C2PSA), SiLU, half-pixel resize, optional MuSGD. Targets Jetson / RTX / server CPU; no Myriad commitments.
+
+**Phased delivery — each phase ships independently:**
+
+**Phase 0: Tier split + naming + soft_obj opt-in** (cheap, ~1 day)
+- Document edge vs server tier in `CLAUDE.md`
+- `bbox-*-pro` preset stubs (initially mirror current presets; phases 1-6 fill them in)
+- Make `soft_obj` named layer opt-in via a flag in the preset YAML (currently always-on across all presets, which is fine but not configurable)
+
+**Phase 1: Bedrock architecture refresh** (~1 week, all sizes)
+- New primitive: `SPPF` (spatial pyramid pooling fast). YAML-only addition at deepest backbone stage (p4)
+- New primitive: `PAFPN` neck pattern (top-down + bottom-up). Replaces current top-down-only FPN
+- Decoupled head: parallel cls + reg ConvBnAct branches off `nout`. YAML-only
+- `ltrb` regression: 4 channels (left/top/right/bottom distances to box edges) replacing `(cx, cy, w, h)`. New encode/decode in `encode.py` / `decode.py`. Keeps single output tensor `[1, 5, H/4, W/4]` shape; semantics change from `(cx, cy, w, h)` to `(l, t, r, b)`
+- A/B target: ≥+1 mAP@.5 over current bbox-x at the same param count
+
+**Phase 2: Server-tier op upgrades** (~3-4 days, server-tier only)
+- New primitive: `SiLU` activation (registered, opt-in via YAML)
+- Allow `Resize` with `coordinate_transformation_mode=half_pixel`
+- New primitive: `C2PSA` position self-attention block (insert at p3 + p4 in server-tier presets only)
+- These primitives ARE NOT registered for edge-tier presets (a YAML check in `yaml_build.py` rejects them if the preset is in the edge tier)
+
+**Phase 3: Loss & training upgrades** (~1-2 weeks, all sizes)
+- New assigner: TAL (Task-Aligned Learning) for *regression-side* assignment. Each GT picks the most-aligned positive cell to handle its box regression; cls supervision stays Gaussian heatmap (preserves emergent segmentation)
+- STAL extension: size-aware top-k boost for small-object cells
+- ProgLoss curriculum extension: auto-balances loss-term weights as training progresses (extends current `_apply_curriculum`)
+- A/B target: cumulative ≥+2-3 mAP@.5:.95 over phase-1 baseline
+
+**Phase 4: OBB output** (~2 weeks, all sizes)
+- See §2.1 for the full OBB plan; this phase ships the implementation as the `-pro` variants' output contract
+- New SAM preprocessing CLI (`opndet sam-obb`) generates per-image OBB labels from AABB + SAM
+- New encode: rotated elliptical Gaussian heatmap at OBB orientation; reg head outputs 6 channels: `(l, t, r, b, sin2θ, cos2θ)`
+- Output contract changes for `-pro`: `[1, 7, H/4, W/4] = (obj_peak, l, t, r, b, sin2θ, cos2θ)`. Production output also gains `soft_obj` as additional channel: `[1, 8, ...]` if `expose_soft_obj: true`
+- Decoder reconstructs OBB from `(cell + ltrb + θ)`; viz uses `cv2.boxPoints`
+
+**Phase 5: Hard-negative mining flywheel** (~1 week, all sizes)
+- See §1.7 for full plan; this phase ships the implementation as the `-pro` variants' default training augmentation
+- `opndet mine-negatives` CLI: runs val on a trained ckpt, computes Grad-CAM per ghost detection, clusters the high-attribution patches, dumps a hard-negative pool to disk
+- New augmentation: `hard_negative_pool: <dir>` config option in `augment:` block. With probability `p`, paste a random pool patch into a non-GT region of the training image (no label = explicit "don't fire on this")
+- A/B target: ≥40% reduction in `center_ghost_rate` vs same yaml without mining
+
+**Phase 6: MuSGD optimizer** (~1 week, server-tier only, opt-in)
+- Per YOLO26 paper: Muon for hidden conv layers + AdamW for input/output projections
+- Empirical wins less proven for vision than transformers; ship as opt-in `optimizer: musgd` config option
+- Validate on a single dataset before promoting to default
+
+**Definition of done (overall):**
+- All 7 `bbox-*-pro` presets exist and train end-to-end
+- Edge-tier `-pro` presets pass `verify_onnx()` with opset 13 (no Myriad regressions)
+- Server-tier `-pro` presets export cleanly to ONNX with attention + SiLU; tested on Jetson at minimum
+- Documentation in `CLAUDE.md` clearly distinguishes edge vs server tier; users know which to pick
+- Public benchmark on a convex-objects dataset shows `bbox-x-pro` outperforms current `bbox-x` by ≥3 mAP@.5:.95
+
+**ROI ranking** if you have to stop early:
+1. Phase 1 (architecture refresh) — biggest mAP-per-LOC, no new theory
+2. Phase 4 (OBB) — biggest deployment-quality win for rotated objects (most industrial scenes)
+3. Phase 3 (TAL/STAL/ProgLoss) — second-biggest mAP win, deeper code
+4. Phase 5 (hard-neg mining) — needed for last-mile precision; most useful AFTER convergence is good
+5. Phase 2 (attention) — small win, complicates the model
+6. Phase 6 (MuSGD) — speculative; only ship if validation wins
+
+---
+
 ### 1.7 Grad-CAM-driven hard-negative mining — **HIGH PRIORITY**
 
 A targeted attack on the residual ghost-rate. Instead of architectural changes (which `opndet analyze` already shows are doing fine), train DIRECTLY against the model's actual failure modes by mining its own false positives.

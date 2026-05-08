@@ -102,25 +102,44 @@ Single tensor `[1, 5, H/4, W/4]`:
 
 Client decoding (`src/opndet/decode.py`): threshold + `np.nonzero` + index gather. **No NMS step ever runs.** This is the deployed inference contract — don't break it.
 
+### Deployment tiers
+
+opndet's presets split into two tiers based on deployment-target opset constraints. Every architectural decision in a given preset must respect its tier's constraints.
+
+**Edge tier** (`bbox-f`, `bbox-p`, `bbox-n`, `bbox-s`):
+- **Hard constraint: opset-13 + Myriad VPU + Ethos-U + Neural-ART + RT1062 compatibility.**
+- ALLOWED ops: Conv, BN, ReLU/ReLU6 (Clip), Add/Mul/Sub, Concat, Resize-nearest-asymmetric, MaxPool, Sigmoid, Tanh, Equal, GreaterOrEqual, Cast, Slice/Split.
+- FORBIDDEN: GroupNorm, GridSample, ScatterND, SiLU as fused op, half_pixel Resize, dynamic shapes, attention (softmax + matmul + reshape can fail on Myriad), >1 output tensor.
+- This is checked in `src/opndet/export.py::ALLOWED_OPS`.
+
+**Server tier** (`bbox-m`, `bbox-l`, `bbox-x`):
+- Targets Jetson / RTX / server CPU / Colab GPU. No Myriad commitment.
+- Free to use SiLU, attention, half-pixel resize, multi-output tensors, dynamic shapes.
+- Still maintains opset-13 export for ONNX Runtime + OpenVINO 2022 CPU/GPU compatibility.
+- `bbox-x` uses `peak_kernel=7` (vs k=5 elsewhere) for tighter duplicate suppression.
+
+**`-pro` variants** (planned, see ROADMAP §1.8) layer the YOLO-family + OBB + hard-negative-mining wins on top of each base size. Edge-tier `-pro` keeps opset-13 compat; server-tier `-pro` adds attention / SiLU / half-pixel resize.
+
 ### Bundled presets and size points
 
-| Preset | Params | Use case |
-|--------|--------|----------|
-| bbox-f | 28K    | Sub-1MB int8, MCU stunt |
-| bbox-p | 92K    | TinyML / MCU            |
-| bbox-n | 0.31M  | Edge SoC                |
-| bbox-s | 1.27M  | Default, strong quality |
-| bbox-m | 2.37M  | Quality-first, ≈YOLOv8n FLOPs |
-| bbox-l | ~5M    | Mid-range server        |
-| bbox-x | 10.4M  | Quality-first, server / Colab; uses `peak_kernel=7` |
+| Preset | Params | Tier | Use case |
+|--------|--------|------|----------|
+| bbox-f | 28K    | edge   | Sub-1MB int8, MCU stunt |
+| bbox-p | 92K    | edge   | TinyML / MCU            |
+| bbox-n | 0.31M  | edge   | Edge SoC                |
+| bbox-s | 1.27M  | edge   | Default, strong quality |
+| bbox-m | 2.37M  | server | Quality-first, ≈YOLOv8n FLOPs |
+| bbox-l | ~5M    | server | Mid-range server        |
+| bbox-x | 10.4M  | server | Quality-first, server / Colab; uses `peak_kernel=7` |
 
 Plus variants:
 - `-dist` (e.g. `bbox-x-dist`) — distillation-aware student trained from a larger teacher
 - `bbox-x-hm2` — 2-channel heatmap variant (obj + radius), opset-13 clean (see `docs/det-hm-variants.md`)
-- `bbox-x-flow` — 4-channel CellPose-style flow head, NOT opset-constrained (server-only); planned, design doc only
+- `bbox-x-flow` — 4-channel CellPose-style flow head, server-only; planned, design doc only
 - `-tp` (e.g. `bbox-f-tp`) — temporal-prior input variant, 4-channel input
+- `-pro` (planned, see ROADMAP §1.8) — kitchen-sink-of-everything per size point
 
-All produce the same `[1, 5, H/4, W/4]` output layout (except hm2 / flow variants which have different output shape). Differ in backbone widths/depths and neck/head channels.
+All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except hm2 / flow / -pro variants which have different output shape). Differ in backbone widths/depths and neck/head channels.
 
 ## Conventions
 
