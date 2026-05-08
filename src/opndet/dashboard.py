@@ -220,7 +220,7 @@ def build_app(root_dir: Path) -> FastAPI:
                 [tag, ep],
             ).fetchall()
             boxes = con.execute(
-                "SELECT sample_idx, kind, x1, y1, x2, y2, score FROM boxes "
+                "SELECT sample_idx, kind, x1, y1, x2, y2, score, meta FROM boxes "
                 "WHERE tag = ? AND ep = ? ORDER BY sample_idx, kind",
                 [tag, ep],
             ).fetchall()
@@ -228,10 +228,26 @@ def build_app(root_dir: Path) -> FastAPI:
         for s, kind, path in overlays:
             ov_by_sample.setdefault(s, []).append({"kind": kind, "url": f"/files/{run_name}/{path}"})
         bx_by_sample: dict[int, list[dict[str, Any]]] = {}
-        for s, kind, x1, y1, x2, y2, score in boxes:
-            bx_by_sample.setdefault(s, []).append({
-                "kind": kind, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "score": score,
-            })
+        for s, kind, x1, y1, x2, y2, score, meta in boxes:
+            entry = {"kind": kind, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "score": score}
+            # OBB corners + θ live in meta. Pass through so the JS renderer can
+            # draw rotated polylines instead of axis-aligned rectangles.
+            if meta:
+                m = meta if isinstance(meta, dict) else None
+                if m is None:
+                    try:
+                        import json as _json
+                        m = _json.loads(meta)
+                    except Exception:
+                        m = None
+                if isinstance(m, dict):
+                    if "corners" in m:
+                        entry["corners"] = m["corners"]
+                    if "theta" in m:
+                        entry["theta"] = m["theta"]
+                    if "points" in m:
+                        entry["points"] = m["points"]
+            bx_by_sample.setdefault(s, []).append(entry)
         return [
             {
                 "sample_idx": s,
@@ -1253,11 +1269,43 @@ function drawBoxes(canvas, boxes) {
     if (b.kind === 'pred' && b.score != null && b.score < thresh) continue;
     ctx.strokeStyle = colorByKind[b.kind] || '#fff';
     ctx.lineWidth = 2;
-    ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+    if (b.corners && b.corners.length === 8) {
+      // OBB: 8 floats = [x1,y1,x2,y2,x3,y3,x4,y4] forming a rotated rectangle.
+      ctx.beginPath();
+      ctx.moveTo(b.corners[0], b.corners[1]);
+      ctx.lineTo(b.corners[2], b.corners[3]);
+      ctx.lineTo(b.corners[4], b.corners[5]);
+      ctx.lineTo(b.corners[6], b.corners[7]);
+      ctx.closePath();
+      ctx.stroke();
+    } else if (b.corners && Array.isArray(b.corners[0]) && b.corners.length === 4) {
+      // Same payload but stored as [[x,y],[x,y],[x,y],[x,y]] (Python list-of-pairs)
+      ctx.beginPath();
+      ctx.moveTo(b.corners[0][0], b.corners[0][1]);
+      for (let i = 1; i < 4; i++) ctx.lineTo(b.corners[i][0], b.corners[i][1]);
+      ctx.closePath();
+      ctx.stroke();
+    } else {
+      // AABB fallback (no rotation info)
+      ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+    }
     if (b.kind === 'pred' && b.score != null) {
       ctx.fillStyle = colorByKind[b.kind];
       ctx.font = '12px monospace';
-      ctx.fillText(b.score.toFixed(2), b.x1 + 2, b.y1 + 12);
+      // Anchor the score label at the top-left of the bounding AABB so it
+      // doesn't drift off-canvas for rotated boxes whose top-left corner
+      // depends on the rotation angle.
+      const lx = (b.corners && Array.isArray(b.corners[0])) ?
+                 Math.min(...b.corners.map(c => c[0])) :
+                 (b.corners && b.corners.length === 8) ?
+                 Math.min(b.corners[0], b.corners[2], b.corners[4], b.corners[6]) :
+                 b.x1;
+      const ly = (b.corners && Array.isArray(b.corners[0])) ?
+                 Math.min(...b.corners.map(c => c[1])) :
+                 (b.corners && b.corners.length === 8) ?
+                 Math.min(b.corners[1], b.corners[3], b.corners[5], b.corners[7]) :
+                 b.y1;
+      ctx.fillText(b.score.toFixed(2), lx + 2, ly + 12);
     }
   }
 }
