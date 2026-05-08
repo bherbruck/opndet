@@ -23,12 +23,42 @@ class Sample:
     boxes: np.ndarray  # [N, 4] xyxy in original pixel coords
     img_w: int
     img_h: int
+    obbs: np.ndarray | None = None  # [N, 5] (cx, cy, w, h, theta) in px+rad; None = AABB-only
 
 
-def load_coco_single_class(coco_path: str | Path, image_root: str | Path) -> list[Sample]:
-    """Load one COCO json + image dir; collapses all categories to a single class."""
+def _load_obbs_for_image(obb_dir: Path, image_path: Path, img_w: int, img_h: int) -> np.ndarray | None:
+    """Look up <obb_dir>/<basename>.txt; parse YOLOv8-OBB lines into [N,5] OBBs.
+    Returns None if the file doesn't exist (caller falls back to AABB).
+    """
+    from opndet.encode import yolo_obb_line_to_obb
+
+    txt = obb_dir / (image_path.stem + ".txt")
+    if not txt.exists():
+        return None
+    obbs: list[list[float]] = []
+    for line in txt.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parsed = yolo_obb_line_to_obb(line, img_w, img_h)
+        if parsed is None:
+            continue
+        _, cx, cy, w, h, theta = parsed
+        obbs.append([cx, cy, w, h, theta])
+    return np.array(obbs, dtype=np.float32) if obbs else np.zeros((0, 5), dtype=np.float32)
+
+
+def load_coco_single_class(coco_path: str | Path, image_root: str | Path,
+                            obb_dir: str | Path | None = None) -> list[Sample]:
+    """Load one COCO json + image dir; collapses all categories to a single class.
+
+    If obb_dir is given, also looks up YOLOv8-OBB sidecar `*.txt` files (one per
+    image, basename match) and attaches the parsed OBBs to each Sample. Per-image
+    fallback: missing .txt → Sample.obbs=None and downstream uses AABB.
+    """
     coco_path = Path(coco_path)
     image_root = Path(image_root)
+    obb_dir_p = Path(obb_dir) if obb_dir is not None else None
     with open(coco_path) as f:
         coco = json.load(f)
 
@@ -48,25 +78,32 @@ def load_coco_single_class(coco_path: str | Path, image_root: str | Path) -> lis
         if not path.exists():
             continue
         boxes = np.array(boxes_by_image[im_id], dtype=np.float32) if boxes_by_image[im_id] else np.zeros((0, 4), dtype=np.float32)
-        samples.append(Sample(image_path=path, boxes=boxes, img_w=int(im["width"]), img_h=int(im["height"])))
+        obbs = _load_obbs_for_image(obb_dir_p, path, int(im["width"]), int(im["height"])) if obb_dir_p is not None else None
+        samples.append(Sample(image_path=path, boxes=boxes,
+                              img_w=int(im["width"]), img_h=int(im["height"]),
+                              obbs=obbs))
     return samples
 
 
 def load_datasets(sources: list[dict] | list[tuple[str, str]]) -> list[Sample]:
     """Load and concatenate multiple COCO sources.
 
-    sources: list of either {"coco": path, "images": dir} dicts or (coco, dir) tuples.
-    Returns a single merged Sample list. Single-class collapse is per-source then merged.
+    sources: list of either {"coco": path, "images": dir, "obb_dir": dir?} dicts
+    or (coco, dir) tuples. Returns a single merged Sample list. Single-class
+    collapse is per-source then merged.
     """
     out: list[Sample] = []
     for src in sources:
         if isinstance(src, dict):
             coco, root = src["coco"], src["images"]
+            obb_dir = src.get("obb_dir")
         else:
             coco, root = src
+            obb_dir = None
         before = len(out)
-        out.extend(load_coco_single_class(coco, root))
-        print(f"  loaded {len(out) - before} samples from {coco}")
+        out.extend(load_coco_single_class(coco, root, obb_dir=obb_dir))
+        suffix = f" (+OBB from {obb_dir})" if obb_dir else ""
+        print(f"  loaded {len(out) - before} samples from {coco}{suffix}")
     return out
 
 
@@ -126,6 +163,10 @@ class OpndetDataset(Dataset):
         self.img_w = img_w
         self.aug = augment_fn
         self.encode = encode_fn
+        # Encoders that accept the optional `obbs=` kwarg (OBB head) opt in via
+        # an attr on the callable. Avoids fragile signature inspection.
+        self._encode_takes_obbs = bool(getattr(encode_fn, "_takes_obbs", False))
+        self._cur_obbs = None
         self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
         self.cache_images = cache_images
@@ -243,12 +284,21 @@ class OpndetDataset(Dataset):
             prior_t = torch.from_numpy(prior_full).unsqueeze(0).contiguous()
             img_t = torch.cat([img_t, prior_t], dim=0)
 
-        targets = self.encode(boxes) if self.encode is not None else None
+        if self.encode is None:
+            targets = None
+        elif self._cur_obbs is not None and self._encode_takes_obbs:
+            targets = self.encode(boxes, obbs=self._cur_obbs)
+        else:
+            targets = self.encode(boxes)
         if self._return_trails:
             return img_t, boxes, targets, trails or []
         return img_t, boxes, targets
 
     def __getitem__(self, idx: int):
+        # _cur_obbs: when set, passed to encode_fn alongside boxes (OBB head only).
+        # Aug paths zero this out — AABB augmenter doesn't carry orientation, so
+        # the OBB encoder falls back to zero-θ derived from the augmented AABB.
+        self._cur_obbs = None
         if self.mosaic_prob > 0 and random.random() < self.mosaic_prob:
             img, boxes = self._mosaic(idx)
             return self._finish(img, boxes, do_letterbox=False)
@@ -257,6 +307,8 @@ class OpndetDataset(Dataset):
         if self.cache_images:
             img = img.copy()
         boxes = s.boxes.copy()
+        if self.aug is None and getattr(s, "obbs", None) is not None:
+            self._cur_obbs = s.obbs.copy()
         return self._finish(img, boxes, do_letterbox=True)
 
 

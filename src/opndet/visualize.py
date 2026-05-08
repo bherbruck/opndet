@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import torch
 
-from opndet.decode import decode_batch
+from opndet.decode import decode_batch, decode_obb_batch
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -103,6 +103,20 @@ def _draw_pred(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, conf: float)
     cv2.putText(img, label, (x1 + 1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 0, 0), 1, cv2.LINE_AA)
 
 
+def _draw_obb_pred(img: np.ndarray, corners: np.ndarray, conf: float) -> None:
+    """Draw a rotated rectangle from 4 corners (px, [4,2]) with confidence label."""
+    color = _conf_color(conf)
+    thick = 2 if conf >= 0.5 else 1
+    pts = corners.astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thick, lineType=cv2.LINE_AA)
+    label = f"{conf:.2f}"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
+    x0, y0 = int(corners[:, 0].min()), int(corners[:, 1].min())
+    ty = y0 - 2 if y0 - 2 - th >= 0 else y0 + th + 2
+    cv2.rectangle(img, (x0, ty - th - 1), (x0 + tw + 2, ty + 1), color, -1)
+    cv2.putText(img, label, (x0 + 1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 0, 0), 1, cv2.LINE_AA)
+
+
 def save_heatmap_overlay_png(
     value: np.ndarray,
     path: str,
@@ -172,13 +186,17 @@ def save_layered_vis(
     rows under boxes(kind='trail') so the viewer can draw the polyline on top.
     """
     import json
-    from opndet.decode import decode_batch
+    from opndet.decode import decode_batch, decode_obb_batch
     out_sub.mkdir(parents=True, exist_ok=True)
     model.eval()
     out = model(imgs.to(device))
     out_t = out["output"] if isinstance(out, dict) else out
     out_np = out_t.detach().cpu().numpy()
-    dets_per = decode_batch(out_np, img_h, img_w, stride, threshold=threshold)
+    is_obb = out_np.shape[1] == 7
+    if is_obb:
+        dets_per = decode_obb_batch(out_np, img_h, img_w, stride, threshold=threshold)
+    else:
+        dets_per = decode_batch(out_np, img_h, img_w, stride, threshold=threshold)
 
     has_prior = imgs.shape[1] >= 4
     H, W = imgs.shape[2], imgs.shape[3]
@@ -220,9 +238,19 @@ def save_layered_vis(
             if i < len(gt_boxes) and gt_boxes[i].shape[0] > 0:
                 db.add_boxes(ep, tag, i, "gt", gt_boxes[i])
             if dets_per[i]:
-                pb = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets_per[i]], dtype=np.float32)
-                ps = np.array([d.score for d in dets_per[i]], dtype=np.float32)
-                db.add_boxes(ep, tag, i, "pred", pb, ps)
+                if is_obb:
+                    # store enclosing AABB for the box row; corners go to meta.
+                    pb = np.array([[d.cx - d.w/2, d.cy - d.h/2,
+                                    d.cx + d.w/2, d.cy + d.h/2] for d in dets_per[i]],
+                                  dtype=np.float32)
+                    ps = np.array([d.score for d in dets_per[i]], dtype=np.float32)
+                    obb_meta = {j: {"corners": d.to_corners().tolist(), "theta": float(d.theta)}
+                                for j, d in enumerate(dets_per[i])}
+                    db.add_boxes(ep, tag, i, "pred", pb, ps, meta=obb_meta)
+                else:
+                    pb = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets_per[i]], dtype=np.float32)
+                    ps = np.array([d.score for d in dets_per[i]], dtype=np.float32)
+                    db.add_boxes(ep, tag, i, "pred", pb, ps)
             if trails_per is not None and i < len(trails_per):
                 # Encode the per-object trail polyline as a single "trail"
                 # box row per object: x1,y1 = trail head, x2,y2 = trail tail,
@@ -264,7 +292,11 @@ def render_predictions(
     out = model(imgs.to(device))
     out_t = out["output"] if isinstance(out, dict) else out
     out_np = out_t.cpu().numpy()
-    dets_per = decode_batch(out_np, img_h, img_w, stride, threshold=threshold)
+    is_obb = out_np.shape[1] == 7
+    if is_obb:
+        dets_per = decode_obb_batch(out_np, img_h, img_w, stride, threshold=threshold)
+    else:
+        dets_per = decode_batch(out_np, img_h, img_w, stride, threshold=threshold)
     # Cap dets per image — same rationale as eval.py's max_dets_per_image: an
     # untrained model (esp 4-ch with warm priors) can decode hundreds of cells
     # per image at low thresholds, and rendering thousands of cv2.rectangle +
@@ -285,9 +317,13 @@ def render_predictions(
                 rgb = _draw_prior_trails_from_trails(rgb, trails_per[i])
         # GT in solid magenta — visually distinct from the colored pred gradient.
         rgb = _draw(rgb, gt_boxes[i], color=(255, 0, 255), thick=2)
-        for d in dets_per[i]:
-            x1, y1 = int(round(d.x1)), int(round(d.y1))
-            x2, y2 = int(round(d.x2)), int(round(d.y2))
-            _draw_pred(rgb, x1, y1, x2, y2, float(d.score))
+        if is_obb:
+            for d in dets_per[i]:
+                _draw_obb_pred(rgb, d.to_corners(), float(d.score))
+        else:
+            for d in dets_per[i]:
+                x1, y1 = int(round(d.x1)), int(round(d.y1))
+                x2, y2 = int(round(d.x2)), int(round(d.y2))
+                _draw_pred(rgb, x1, y1, x2, y2, float(d.score))
         rendered.append(rgb.transpose(2, 0, 1))
     return np.stack(rendered, axis=0)

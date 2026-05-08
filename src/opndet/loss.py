@@ -218,7 +218,7 @@ class OpndetBboxLoss(nn.Module):
         w_wh: float = 5.0,
         focal_alpha: float = 2.0,
         focal_beta: float = 4.0,
-        wh_loss: str = "l1",            # l1 | giou | ciou | diou | nwd | ltrb
+        wh_loss: str = "l1",            # l1 | giou | ciou | diou | nwd | ltrb | obb
         cls_loss: str = "focal",        # focal | vfl
         vfl_alpha: float = 0.75,
         vfl_gamma: float = 2.0,
@@ -261,6 +261,48 @@ class OpndetBboxLoss(nn.Module):
 
         pos = tgt["pos"]
         n_pos = pos.sum().clamp(min=1.0)
+
+        # obb mode: raw[:, 1:7] is (l, t, r, b, sin2θ, cos2θ). Reuse ltrb
+        # AABB DIoU loss on the first 4 channels; add angle cosine distance
+        # on the trig channels, masked by `angle_mask` (non-round GTs only).
+        if self.wh_loss == "obb":
+            ltrb_logit = raw[:, 1:5]
+            ltrb_pred = torch.sigmoid(ltrb_logit)
+            angle_pred = torch.tanh(raw[:, 5:7])
+            pred_xyxy = _decode_pred_ltrb_xyxy(ltrb_pred, self.img_h, self.img_w, self.stride)
+            gt_xyxy = _decode_gt_ltrb_xyxy(tgt["obb"][:, 0:4], self.img_h, self.img_w, self.stride)
+            l_box = (_bbox_iou(pred_xyxy, gt_xyxy, mode="diou") * pos).sum() / n_pos
+            ang_mask = tgt.get("angle_mask")
+            if ang_mask is None:
+                ang_mask = pos
+            n_ang = ang_mask.sum().clamp(min=1.0)
+            angle_gt = tgt["obb"][:, 4:6]
+            cos_dist = 1.0 - (angle_pred * angle_gt).sum(dim=1, keepdim=True)
+            l_angle = (cos_dist * ang_mask).sum() / n_ang
+            if self.cls_loss == "vfl":
+                iou_target = _iou_only(pred_xyxy, gt_xyxy) * pos
+                l_hm = varifocal_loss(hm_logit, pos, iou_target, alpha=self.vfl_alpha, gamma=self.vfl_gamma)
+            else:
+                l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
+            total = self.w_hm * l_hm + self.w_wh * (l_box + l_angle)
+            out = {"loss": total, "l_hm": l_hm.detach(),
+                   "l_cxy": l_box.detach() * 0.0,
+                   "l_wh": l_box.detach(),
+                   "l_angle": l_angle.detach()}
+            if self.count_w > 0 or self.convex_w > 0:
+                hm_sig = torch.sigmoid(hm_logit)
+            if self.count_w > 0:
+                peaks = _peak_suppress(hm_sig, k=self.peak_kernel, eps=self.peak_eps)
+                pred_count = peaks.flatten(1).sum(dim=1)
+                gt_count = pos.flatten(1).sum(dim=1)
+                l_count = (pred_count - gt_count).abs().mean()
+                out["loss"] = out["loss"] + self.count_w * l_count
+                out["l_count"] = l_count.detach()
+            if self.convex_w > 0:
+                l_convex = convexity_loss(hm_sig, pos, k=self.convex_r)
+                out["loss"] = out["loss"] + self.convex_w * l_convex
+                out["l_convex"] = l_convex.detach()
+            return out
 
         # ltrb mode: raw[:, 1:5] is (l, t, r, b) post-sigmoid.
         # The cxy term is subsumed: each ltrb cell encodes both center offset

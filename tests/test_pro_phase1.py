@@ -140,6 +140,9 @@ def test_ltrb_decode_no_peaks():
 
 @pytest.mark.parametrize("preset", PRO_PRESETS)
 def test_pro_preset_builds_and_forwards(preset: str):
+    """Phase 1 → 4b: -pro presets now ship 7-channel OBB output.
+    See test_obb.py for OBB-specific shape/range assertions.
+    """
     from opndet.presets import resolve
     from opndet.yaml_build import build_model_from_yaml
 
@@ -150,9 +153,10 @@ def test_pro_preset_builds_and_forwards(preset: str):
         y = m(x)
     assert "output" in y
     out = y["output"]
-    assert out.shape == (1, 5, h // 4, w // 4), f"{preset}: bad shape {out.shape}"
+    # Phase 4b: OBB head ships 7 channels (obj, l, t, r, b, sin2θ, cos2θ).
+    assert out.shape == (1, 7, h // 4, w // 4), f"{preset}: bad shape {out.shape}"
     # ltrb channels are sigmoid'd → [0, 1].
-    assert (out[:, 1:] >= 0).all() and (out[:, 1:] <= 1).all()
+    assert (out[:, 1:5] >= 0).all() and (out[:, 1:5] <= 1).all()
 
 
 @pytest.mark.parametrize("preset", PRO_PRESETS)

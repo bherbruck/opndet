@@ -24,7 +24,7 @@ import copy
 from opndet.augment import AugConfig, make_augment
 from opndet.dataset import OpndetDataset, collate, load_datasets, split_samples
 from opndet.decode import decode_batch
-from opndet.encode import encode_targets
+from opndet.encode import encode_targets, encode_targets_ltrb, encode_targets_obb
 from opndet.loss import OpndetBboxLoss
 from opndet.presets import resolve as _resolve_preset
 from opndet.visualize import render_predictions
@@ -621,7 +621,40 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     elif tp_cfg is not None:
         print(f"  warning: augment.temporal_prior set but model in_ch={in_ch}; ignoring")
 
-    encode_fn = partial(encode_targets, cfg=cfg_shim, dist_head=has_dist)
+    # Detect head variant via the YAML alias graph:
+    #   `ang_r` present  → 7-ch OBB head      → encode_targets_obb
+    #   `ltrb_r` present → 5-ch ltrb head     → encode_targets_ltrb
+    #   else             → 5-ch (cxy, wh) head → encode_targets
+    aliases = getattr(model, "aliases", {})
+    has_obb = "ang_r" in aliases
+    has_ltrb = "ltrb_r" in aliases and not has_obb
+
+    def _obb_encode_fn(boxes_xyxy, obbs=None):
+        # OBB GT path: prefer pre-computed (cx, cy, w, h, θ) when the dataset
+        # passes them (no-aug val/test). Otherwise derive zero-θ OBBs from the
+        # (possibly augmented) AABB so the angle channels still get supervised
+        # trivially at θ=0.
+        if obbs is not None and len(obbs) > 0:
+            return encode_targets_obb(obbs, cfg_shim)
+        if boxes_xyxy.shape[0] == 0:
+            return encode_targets_obb(np.zeros((0, 5), dtype=np.float32), cfg_shim)
+        cx = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) * 0.5
+        cy = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) * 0.5
+        w = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]
+        h = boxes_xyxy[:, 3] - boxes_xyxy[:, 1]
+        theta = np.zeros_like(cx)
+        obbs2 = np.stack([cx, cy, w, h, theta], axis=1).astype(np.float32)
+        return encode_targets_obb(obbs2, cfg_shim)
+    _obb_encode_fn._takes_obbs = True  # type: ignore[attr-defined]
+
+    if has_obb:
+        encode_fn = _obb_encode_fn
+        print("  head variant: OBB (7-channel)")
+    elif has_ltrb:
+        encode_fn = partial(encode_targets_ltrb, cfg=cfg_shim)
+        print("  head variant: ltrb (5-channel)")
+    else:
+        encode_fn = partial(encode_targets, cfg=cfg_shim, dist_head=has_dist)
     cache = bool(c.get("cache_images", False))
     mosaic_prob = float(aug_cfg.mosaic_prob if hasattr(aug_cfg, "mosaic_prob") else 0.0)
     min_vis = float(aug_cfg.min_visible_frac if hasattr(aug_cfg, "min_visible_frac") else 0.5)
@@ -680,6 +713,11 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     loss_kw.setdefault("img_h", img_h)
     loss_kw.setdefault("img_w", img_w)
     loss_kw.setdefault("stride", cfg_shim.stride)
+    # Auto-route wh_loss to match the head variant. User can override.
+    if has_obb:
+        loss_kw.setdefault("wh_loss", "obb")
+    elif has_ltrb:
+        loss_kw.setdefault("wh_loss", "ltrb")
     # Auto-mirror the model's peak op so count-aware loss sees the same sparse map as inference.
     # User can still override by setting peak_kernel/peak_eps explicitly in the yaml's `loss:` block.
     peak_k, peak_eps = _detect_peak_op(model)

@@ -1,0 +1,326 @@
+"""ROADMAP §1.8 Phase 4b — OBB output contract tests.
+
+  - obb_to_corners ↔ corners_to_obb roundtrip
+  - encode_targets_obb roundtrip via decode_obb
+  - rotated Gaussian draw produces an elongated heatmap
+  - OBB loss is differentiable (angle channels receive gradient)
+  - All -pro variants build with 7-channel head + opset-13 export parity
+  - YOLOv8-OBB label parser
+"""
+from __future__ import annotations
+
+import math
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import onnx
+import onnxruntime as ort
+import pytest
+import torch
+from torch import nn
+
+
+PRO_PRESETS = ["bbox-f-pro", "bbox-p-pro", "bbox-n-pro", "bbox-s-pro",
+               "bbox-m-pro", "bbox-l-pro", "bbox-x-pro"]
+
+
+def _export(m: nn.Module, x: torch.Tensor, path: str) -> None:
+    torch.onnx.export(
+        m, x, path,
+        input_names=["image"], output_names=["output"],
+        opset_version=13, do_constant_folding=True,
+        dynamic_axes=None, dynamo=False,
+    )
+
+
+# ---- 1. corners ↔ OBB roundtrip ----
+
+def test_corners_obb_roundtrip():
+    from opndet.encode import obb_to_corners, corners_to_obb
+
+    rng = np.random.default_rng(0)
+    cases = [
+        (200.0, 150.0, 100.0, 40.0, math.radians(0)),
+        (200.0, 150.0, 100.0, 40.0, math.radians(30)),
+        (50.0, 80.0, 60.0, 25.0, math.radians(75)),
+        (300.0, 200.0, 80.0, 80.0, math.radians(45)),  # square
+    ]
+    for cx, cy, w, h, th in cases:
+        c = obb_to_corners(cx, cy, w, h, th)
+        cx2, cy2, w2, h2, th2 = corners_to_obb(c)
+        assert abs(cx - cx2) < 1e-3
+        assert abs(cy - cy2) < 1e-3
+        assert abs(w - w2) < 1e-3, f"w mismatch: {w} vs {w2}"
+        assert abs(h - h2) < 1e-3, f"h mismatch: {h} vs {h2}"
+        # angle wraps π — accept either th or th+π modulo equivalence; for
+        # square objects orientation is degenerate (any rotation valid).
+        d = abs(((th - th2) + math.pi / 2) % math.pi - math.pi / 2)
+        assert d < 1e-3 or abs(w - h) < 1e-3, f"theta mismatch: {math.degrees(th)} vs {math.degrees(th2)}"
+
+
+def test_obb_to_aabb_matches_corners_extents():
+    from opndet.encode import obb_to_corners, obb_to_aabb
+
+    cx, cy, w, h, th = 200.0, 150.0, 100.0, 40.0, math.radians(30)
+    corners = obb_to_corners(cx, cy, w, h, th)
+    x1, y1, x2, y2 = obb_to_aabb(cx, cy, w, h, th)
+    assert abs(corners[:, 0].min() - x1) < 1e-3
+    assert abs(corners[:, 0].max() - x2) < 1e-3
+    assert abs(corners[:, 1].min() - y1) < 1e-3
+    assert abs(corners[:, 1].max() - y2) < 1e-3
+
+
+# ---- 2. encode_targets_obb ↔ decode_obb roundtrip ----
+
+
+def test_encode_decode_obb_roundtrip():
+    from opndet.config import ModelConfig
+    from opndet.decode import decode_obb
+    from opndet.encode import encode_targets_obb, obb_to_corners
+
+    cfg = ModelConfig()
+    obbs = np.array([
+        [200.0, 150.0, 100.0, 40.0, math.radians(30)],
+        [80.0,  80.0,   60.0, 25.0, math.radians(75)],
+    ], dtype=np.float32)
+    tgt = encode_targets_obb(obbs, cfg)
+    assert tgt["pos"].sum() == 2
+    assert tgt["angle_mask"].sum() == 2  # both non-round
+    obj = tgt["pos"].numpy()
+    out = np.concatenate([obj, tgt["obb"].numpy()], axis=0)
+    dets = decode_obb(out, cfg.img_h, cfg.img_w, cfg.stride, threshold=0.5)
+    assert len(dets) == 2
+
+    # Match decoded OBBs to GT by center distance
+    decoded = sorted([(d.cx, d.cy, d.w, d.h, d.theta) for d in dets])
+    expected = sorted([tuple(o) for o in obbs])
+    for (px, py, _, _, pth), (gx, gy, _, _, gth) in zip(decoded, expected):
+        assert abs(px - gx) < 1.5
+        assert abs(py - gy) < 1.5
+        # angle: 2θ encoded so wraps at π → tolerate ±π
+        d = abs(((pth - gth) + math.pi / 2) % math.pi - math.pi / 2)
+        assert d < 1e-2, f"theta mismatch: {math.degrees(pth)} vs {math.degrees(gth)}"
+
+    # Reconstructed OBB corners closely match the GT OBB corners
+    decoded_objs = sorted(dets, key=lambda d: d.cx)
+    expected_obbs = sorted(obbs, key=lambda o: o[0])
+    for d, gt in zip(decoded_objs, expected_obbs):
+        gt_corners = obb_to_corners(*gt)
+        # Sort corners of both by (x, y) so order-of-sides doesn't matter.
+        sort_key = lambda p: (p[0], p[1])
+        a = np.array(sorted(d.to_corners().tolist(), key=sort_key))
+        b = np.array(sorted(gt_corners.tolist(), key=sort_key))
+        max_err = float(np.abs(a - b).max())
+        assert max_err < 2.0, f"OBB corners off by {max_err}"
+
+
+def test_encode_obb_no_obbs():
+    from opndet.config import ModelConfig
+    from opndet.encode import encode_targets_obb
+
+    cfg = ModelConfig()
+    tgt = encode_targets_obb(np.zeros((0, 5), dtype=np.float32), cfg)
+    assert tgt["pos"].sum() == 0
+    assert tgt["obb"].abs().sum() == 0
+
+
+# ---- 3. rotated Gaussian shape ----
+
+
+def test_rotated_gaussian_is_elongated():
+    """When w >> h and theta=0, the heatmap should be wider in x than y."""
+    from opndet.config import ModelConfig
+    from opndet.encode import encode_targets_obb
+
+    cfg = ModelConfig()
+    # Big elongated OBB at center
+    cx, cy = cfg.img_w / 2, cfg.img_h / 2
+    obbs = np.array([[cx, cy, 200.0, 40.0, 0.0]], dtype=np.float32)
+    tgt = encode_targets_obb(obbs, cfg)
+    hm = tgt["hm"][0].numpy()
+    Hp, Wp = hm.shape
+    cy_g = int(round(cy / cfg.stride))
+    cx_g = int(round(cx / cfg.stride))
+    # Half-width of the bright region (>0.1) along x and y at the center row/col
+    row = hm[cy_g]
+    col = hm[:, cx_g]
+    x_extent = float((row > 0.1).sum())
+    y_extent = float((col > 0.1).sum())
+    assert x_extent > y_extent * 1.5, f"expect elongated: x={x_extent} y={y_extent}"
+
+
+# ---- 4. OBB loss differentiability ----
+
+
+def test_obb_loss_grads_to_angle_channels():
+    from opndet.config import ModelConfig
+    from opndet.encode import encode_targets_obb
+    from opndet.loss import OpndetBboxLoss
+
+    cfg = ModelConfig()
+    obbs = np.array([[200.0, 150.0, 100.0, 40.0, math.radians(30)]], dtype=np.float32)
+    tgt = encode_targets_obb(obbs, cfg)
+    tgt = {k: v.unsqueeze(0) for k, v in tgt.items()}  # batch dim
+
+    Hp, Wp = cfg.img_h // cfg.stride, cfg.img_w // cfg.stride
+    raw = torch.zeros(1, 7, Hp, Wp, requires_grad=True)
+    loss_fn = OpndetBboxLoss(wh_loss="obb", img_h=cfg.img_h, img_w=cfg.img_w, stride=cfg.stride)
+    out = loss_fn(raw, tgt)
+    out["loss"].backward()
+    grad = raw.grad
+    # angle channels should have non-zero gradient at the positive cell
+    assert grad[:, 5:7].abs().sum() > 0, "angle channels got no gradient"
+    # ltrb channels also non-zero
+    assert grad[:, 1:5].abs().sum() > 0
+
+
+def test_obb_loss_skips_round_angle_supervision():
+    """For round objects (angle_mask=0) the angle term is excluded — so
+    perturbing only the angle channels at round-only positives leaves loss
+    angle-component zero."""
+    from opndet.config import ModelConfig
+    from opndet.loss import OpndetBboxLoss
+
+    cfg = ModelConfig()
+    Hp, Wp = cfg.img_h // cfg.stride, cfg.img_w // cfg.stride
+    # Manually build a tgt where pos=1 but angle_mask=0 at one cell
+    tgt = {
+        "hm": torch.zeros(1, 1, Hp, Wp),
+        "obb": torch.zeros(1, 6, Hp, Wp),
+        "pos": torch.zeros(1, 1, Hp, Wp),
+        "angle_mask": torch.zeros(1, 1, Hp, Wp),
+    }
+    tgt["pos"][0, 0, 10, 20] = 1.0
+    tgt["obb"][0, 0:4, 10, 20] = 0.05
+    # Note: angle_mask stays 0 so angle term contributes nothing.
+    raw = torch.zeros(1, 7, Hp, Wp, requires_grad=True)
+    loss_fn = OpndetBboxLoss(wh_loss="obb", img_h=cfg.img_h, img_w=cfg.img_w, stride=cfg.stride)
+    out = loss_fn(raw, tgt)
+    assert out["l_angle"].item() == 0.0
+
+
+# ---- 5. -pro presets build & export at opset 13 (7-channel) ----
+
+
+@pytest.mark.parametrize("preset", PRO_PRESETS)
+def test_pro_preset_builds_obb(preset: str):
+    from opndet.presets import resolve
+    from opndet.yaml_build import build_model_from_yaml
+
+    m = build_model_from_yaml(resolve(preset)).eval()
+    c, h, w = m.input_shape
+    x = torch.randn(1, c, h, w)
+    with torch.no_grad():
+        y = m(x)
+    out = y["output"]
+    assert out.shape == (1, 7, h // 4, w // 4), f"{preset}: bad shape {out.shape}"
+    # ltrb in [0, 1] (post-Sigmoid), angle in [-1, 1] (post-Tanh).
+    assert (out[:, 1:5] >= 0).all() and (out[:, 1:5] <= 1).all()
+    assert (out[:, 5:7] >= -1).all() and (out[:, 5:7] <= 1).all()
+
+
+@pytest.mark.parametrize("preset", PRO_PRESETS)
+def test_pro_preset_obb_exports_opset13(preset: str):
+    from opndet.export import ALLOWED_OPS
+    from opndet.presets import resolve
+    from opndet.yaml_build import build_model_from_yaml
+
+    m = build_model_from_yaml(resolve(preset)).eval()
+    c, h, w = m.input_shape
+    x = torch.randn(1, c, h, w)
+    with tempfile.TemporaryDirectory() as td:
+        path = str(Path(td) / f"{preset}.onnx")
+        _export(m, x, path)
+        om = onnx.load(path)
+        ops = {n.op_type for n in om.graph.node}
+        forbidden = ops - ALLOWED_OPS
+        assert not forbidden, f"{preset} forbidden ops: {forbidden}"
+        assert "Tanh" in ops, f"{preset} expected Tanh in graph"
+
+        with torch.no_grad():
+            y_pt = m(x)["output"].numpy()
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        y_ort = sess.run(None, {"image": x.numpy()})[0]
+        assert y_pt.shape == y_ort.shape == (1, 7, h // 4, w // 4)
+        diff = float(np.abs(y_pt - y_ort).max())
+        assert diff < 1e-3, f"{preset} parity diff {diff:.2e}"
+
+
+# ---- 6. YOLOv8-OBB label parser ----
+
+
+def test_yolo_obb_line_parse():
+    from opndet.encode import obb_to_corners, yolo_obb_line_to_obb
+
+    img_w, img_h = 384, 256
+    cx, cy, w, h, th = 100.0, 80.0, 60.0, 25.0, math.radians(45)
+    corners = obb_to_corners(cx, cy, w, h, th)
+    norm = corners.copy()
+    norm[:, 0] /= img_w
+    norm[:, 1] /= img_h
+    line = "0 " + " ".join(f"{v:.6f}" for v in norm.flatten())
+    parsed = yolo_obb_line_to_obb(line, img_w, img_h)
+    assert parsed is not None
+    cls, pcx, pcy, pw, ph, pth = parsed
+    assert cls == 0
+    assert abs(pcx - cx) < 0.5
+    assert abs(pcy - cy) < 0.5
+    # w/h round-trip via minAreaRect: tolerate small numerical noise.
+    assert abs(pw - w) < 0.5
+    assert abs(ph - h) < 0.5
+
+
+def test_yolo_obb_line_malformed():
+    from opndet.encode import yolo_obb_line_to_obb
+    assert yolo_obb_line_to_obb("not a real line", 100, 100) is None
+    assert yolo_obb_line_to_obb("0 0.1 0.2 0.3", 100, 100) is None
+
+
+# ---- 7. dataset obb_dir loader ----
+
+
+def test_dataset_obb_loader(tmp_path):
+    from opndet.dataset import load_coco_single_class
+    import json
+    import cv2
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    obb_dir = tmp_path / "obb"
+    obb_dir.mkdir()
+
+    img = np.zeros((256, 384, 3), dtype=np.uint8)
+    cv2.imwrite(str(img_dir / "a.jpg"), img)
+    cv2.imwrite(str(img_dir / "b.jpg"), img)
+
+    coco = {
+        "images": [
+            {"id": 1, "file_name": "a.jpg", "width": 384, "height": 256},
+            {"id": 2, "file_name": "b.jpg", "width": 384, "height": 256},
+        ],
+        "annotations": [
+            {"id": 1, "image_id": 1, "category_id": 1, "bbox": [50, 50, 100, 50], "iscrowd": 0},
+            {"id": 2, "image_id": 2, "category_id": 1, "bbox": [10, 10, 80, 80], "iscrowd": 0},
+        ],
+        "categories": [{"id": 1, "name": "x"}],
+    }
+    coco_path = tmp_path / "ann.json"
+    coco_path.write_text(json.dumps(coco))
+
+    # Only image 'a' has an OBB sidecar; 'b' should fall back to None
+    from opndet.encode import obb_to_corners
+    corners = obb_to_corners(100.0, 80.0, 60.0, 25.0, math.radians(30))
+    norm = corners.copy()
+    norm[:, 0] /= 384
+    norm[:, 1] /= 256
+    line = "0 " + " ".join(f"{v:.6f}" for v in norm.flatten())
+    (obb_dir / "a.txt").write_text(line + "\n")
+
+    samples = load_coco_single_class(coco_path, img_dir, obb_dir=obb_dir)
+    assert len(samples) == 2
+    by_name = {s.image_path.name: s for s in samples}
+    assert by_name["a.jpg"].obbs is not None
+    assert by_name["a.jpg"].obbs.shape == (1, 5)
+    assert abs(by_name["a.jpg"].obbs[0, 0] - 100.0) < 0.5
+    assert by_name["b.jpg"].obbs is None

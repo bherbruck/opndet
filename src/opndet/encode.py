@@ -2,10 +2,74 @@ from __future__ import annotations
 
 import math
 
+import cv2
 import numpy as np
 import torch
 
 from opndet.config import ModelConfig
+
+
+# ---- OBB representation helpers (ROADMAP §1.8 Phase 4b) -------------------
+# Internal canonical: (cx, cy, w_major, h_minor, theta) with theta in [0, pi).
+# w >= h by construction. theta is the rotation of the major axis from +x.
+
+
+def corners_to_obb(corners: np.ndarray) -> tuple[float, float, float, float, float]:
+    """4 corners (px, [4,2]) → (cx, cy, w_major, h_minor, theta in [0, pi))."""
+    pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    (cx, cy), (w_r, h_r), ang_deg = cv2.minAreaRect(pts)
+    # cv2.minAreaRect returns angle in (-90, 0] (legacy) or [0, 90) depending on
+    # OpenCV version. Canonicalize to (w >= h, theta in [0, pi)).
+    w, h = float(w_r), float(h_r)
+    theta = math.radians(float(ang_deg))
+    if h > w:
+        w, h = h, w
+        theta += math.pi / 2.0
+    theta = theta % math.pi
+    return float(cx), float(cy), w, h, theta
+
+
+def obb_to_corners(cx: float, cy: float, w: float, h: float, theta: float) -> np.ndarray:
+    """OBB → 4 corners (float32, [4,2]). theta in radians, major axis rotation."""
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    half_w, half_h = w * 0.5, h * 0.5
+    local = np.array([
+        [-half_w, -half_h],
+        [ half_w, -half_h],
+        [ half_w,  half_h],
+        [-half_w,  half_h],
+    ], dtype=np.float32)
+    R = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
+    return local @ R.T + np.array([cx, cy], dtype=np.float32)
+
+
+def obb_to_aabb(cx: float, cy: float, w: float, h: float, theta: float) -> tuple[float, float, float, float]:
+    """OBB → enclosing AABB (x1, y1, x2, y2). The AABB the rotated rect inscribes."""
+    cos_t = abs(math.cos(theta))
+    sin_t = abs(math.sin(theta))
+    aw = w * cos_t + h * sin_t
+    ah = w * sin_t + h * cos_t
+    return cx - aw * 0.5, cy - ah * 0.5, cx + aw * 0.5, cy + ah * 0.5
+
+
+def yolo_obb_line_to_obb(line: str, img_w: int, img_h: int) -> tuple[int, float, float, float, float, float] | None:
+    """Parse one YOLOv8-OBB line into (class_id, cx, cy, w, h, theta).
+    Format: 'class_id x1 y1 x2 y2 x3 y3 x4 y4' (8 normalized floats, four corners).
+    Returns None on malformed input.
+    """
+    parts = line.strip().split()
+    if len(parts) != 9:
+        return None
+    try:
+        class_id = int(parts[0])
+        coords = np.array([float(v) for v in parts[1:]], dtype=np.float32).reshape(4, 2)
+    except ValueError:
+        return None
+    coords[:, 0] *= img_w
+    coords[:, 1] *= img_h
+    cx, cy, w, h, theta = corners_to_obb(coords)
+    return class_id, cx, cy, w, h, theta
 
 
 def gaussian_radius(w: float, h: float, min_overlap: float = 0.7) -> float:
@@ -173,6 +237,99 @@ def encode_targets_ltrb(
         "hm": torch.from_numpy(hm).unsqueeze(0),
         "ltrb": torch.from_numpy(ltrb),
         "pos": torch.from_numpy(pos).unsqueeze(0),
+    }
+
+
+def _draw_rotated_gaussian(hm: np.ndarray, cx: int, cy: int, sigma_x: float, sigma_y: float, theta: float) -> None:
+    """Rotated elliptical Gaussian on a stride-cell grid. Center (cx, cy) in cell coords;
+    sigma_x/sigma_y in cells; theta = rotation of MAJOR axis (sigma_x) from +x axis.
+    Vectorized over a (2*rad+1)^2 patch.
+    """
+    h, w = hm.shape
+    rad = int(3 * max(sigma_x, sigma_y))
+    if rad < 1:
+        rad = 1
+    x0, x1 = max(0, cx - rad), min(w, cx + rad + 1)
+    y0, y1 = max(0, cy - rad), min(h, cy + rad + 1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    ys, xs = np.ogrid[y0:y1, x0:x1]
+    dx = (xs - cx).astype(np.float32)
+    dy = (ys - cy).astype(np.float32)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    # Rotate (dx, dy) into the OBB's local frame (major along x_local).
+    xp =  dx * cos_t + dy * sin_t
+    yp = -dx * sin_t + dy * cos_t
+    g = np.exp(-(xp * xp / (2.0 * sigma_x * sigma_x) + yp * yp / (2.0 * sigma_y * sigma_y)))
+    hm[y0:y1, x0:x1] = np.maximum(hm[y0:y1, x0:x1], g)
+
+
+def encode_targets_obb(
+    obbs: np.ndarray,
+    cfg: ModelConfig,
+    min_sigma: float = 1.0,
+    aspect_round_thresh: float = 1.15,
+) -> dict[str, torch.Tensor]:
+    """Encode list of OBBs (cx, cy, w_major, h_minor, theta) px+rad into dense GT.
+
+    Reg target is (l, t, r, b) image-frame distances to the OBB's enclosing AABB,
+    plus (sin2θ, cos2θ) angle channels in [-1, 1]. The 2θ encoding handles the
+    180° wrap of OBB orientation.
+
+    obbs: [N, 5] of (cx, cy, w, h, theta).
+    Returns dict with:
+      hm    : [1, H', W']  rotated elliptical Gaussian heatmap
+      obb   : [6, H', W']  (l, t, r, b, sin2θ, cos2θ)
+      pos   : [1, H', W']  1.0 at positive (center) cells
+      angle_mask : [1, H', W']  1.0 at non-round positives (aspect > thresh), 0 elsewhere
+    """
+    H, W = cfg.img_h, cfg.img_w
+    s = cfg.stride
+    Hp, Wp = H // s, W // s
+    hm = np.zeros((Hp, Wp), dtype=np.float32)
+    reg = np.zeros((6, Hp, Wp), dtype=np.float32)
+    pos = np.zeros((Hp, Wp), dtype=np.float32)
+    ang_mask = np.zeros((Hp, Wp), dtype=np.float32)
+
+    if len(obbs) > 0:
+        for cx_px, cy_px, bw, bh, theta in obbs:
+            bw = float(bw)
+            bh = float(bh)
+            if bw < 1.0 or bh < 1.0:
+                continue
+            cx_g = float(cx_px) / s
+            cy_g = float(cy_px) / s
+            ix = int(cx_g)
+            iy = int(cy_g)
+            if ix < 0 or iy < 0 or ix >= Wp or iy >= Hp:
+                continue
+            r_px = gaussian_radius(bw, bh)
+            base_sigma = max(min_sigma, r_px / s / 3.0)
+            # Scale sigmas by aspect so the heatmap's footprint matches the OBB.
+            ar = max(bw, bh) / max(min(bw, bh), 1.0)
+            sigma_major = max(min_sigma, base_sigma * math.sqrt(ar))
+            sigma_minor = max(min_sigma, base_sigma / math.sqrt(ar))
+            _draw_rotated_gaussian(hm, ix, iy, sigma_major, sigma_minor, float(theta))
+            x1, y1, x2, y2 = obb_to_aabb(cx_px, cy_px, bw, bh, float(theta))
+            cx_cell = (ix + 0.5) * s
+            cy_cell = (iy + 0.5) * s
+            reg[0, iy, ix] = float(np.clip((cx_cell - x1) / W, 0.0, 1.0))
+            reg[1, iy, ix] = float(np.clip((cy_cell - y1) / H, 0.0, 1.0))
+            reg[2, iy, ix] = float(np.clip((x2 - cx_cell) / W, 0.0, 1.0))
+            reg[3, iy, ix] = float(np.clip((y2 - cy_cell) / H, 0.0, 1.0))
+            two_theta = 2.0 * float(theta)
+            reg[4, iy, ix] = math.sin(two_theta)
+            reg[5, iy, ix] = math.cos(two_theta)
+            pos[iy, ix] = 1.0
+            if max(bw, bh) / max(min(bw, bh), 1e-6) >= aspect_round_thresh:
+                ang_mask[iy, ix] = 1.0
+
+    return {
+        "hm": torch.from_numpy(hm).unsqueeze(0),
+        "obb": torch.from_numpy(reg),
+        "pos": torch.from_numpy(pos).unsqueeze(0),
+        "angle_mask": torch.from_numpy(ang_mask).unsqueeze(0),
     }
 
 
