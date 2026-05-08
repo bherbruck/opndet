@@ -340,4 +340,4 @@ Match the existing opndet codebase style:
 - `train.yaml` schema documents the `augment.temporal_prior` config block.
 - `tests/test_temporal_prior.py` covers the eight test cases above.
 - `scripts/visualize_prior_synth.py` produces a 16-sample grid PNG for visual QA.
-- Default training config for `bbox-f-egg-tp` (a new preset to be created separately) wires this in.
+- Default training config for `bbox-f-object-tp` (a new preset to be created separately) wires this in.

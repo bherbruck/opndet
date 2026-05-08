@@ -28,7 +28,7 @@ opndet export --model bbox-s --ckpt best.pt --out diag.onnx --diagnostic   # +na
 opndet quantize --onnx opndet.onnx --calib data/imgs --out opndet_int8.onnx [--verify]
 opndet calibrate --ckpt best.pt --config train.yaml                         # bake Platt T into the ckpt
 opndet eval --ckpt best.pt --config train.yaml [--stability]                # full report; --stability runs perturbation flapping check
-opndet analyze --ckpt best.pt --model bbox-s --image egg.jpg                # interpretability: per-layer slider + Grad-CAM HTML
+opndet analyze --ckpt best.pt --model bbox-s --image object.jpg                # interpretability: per-layer slider + Grad-CAM HTML
 opndet dashboard --root /path/to/runs                                        # DuckDB-backed live training dashboard
 
 # Tests

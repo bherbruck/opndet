@@ -82,7 +82,7 @@ The single most common failure mode in deployed detectors is **flapping**: a con
 
 ### 1.2 Touching-object disambiguation
 
-The DESIGN.md already identified this as the biggest risk: "peak collapse, dense clusters of 100+ small objects." Two centers within 4 px (2 cells at stride 4) merge into a single peak after MaxPool with k=5. For touching pills, eggs in a flat, fish on a sorter, this is *the* problem.
+The DESIGN.md already identified this as the biggest risk: "peak collapse, dense clusters of 100+ small objects." Two centers within 4 px (2 cells at stride 4) merge into a single peak after MaxPool with k=5. For touching pills, objects in a flat, fish on a sorter, this is *the* problem.
 
 **Current state**: single peak suppression with k=3 or k=5 MaxPool. CornerNet σ heuristic for GT encoding, min σ = 1.0 cell. No touching-object-specific supervision.
 
@@ -90,7 +90,7 @@ The DESIGN.md already identified this as the biggest risk: "peak collapse, dense
 
 1. ✅ **Add the auxiliary distance head** that DESIGN.md v1 already specced but isn't in the current single-tensor output. Output becomes `[1, 6, H/4, W/4]` with an extra `dist` channel — a distance-to-nearest-center scalar field. Train with L1 loss against the normalized Euclidean distance to the nearest GT center, capped at object radius. At inference, multiply `obj * dist` to push down peaks that are between two centers (where `dist` is low) and preserve peaks at true centers (where `dist` is high). This is a v1-deferred feature in DESIGN.md; promote to v2 default for bbox-s/m. *(Shipped: new preset `bbox-m-dist` with internal 6-ch raw -> Sigmoid · dist · PeakSuppress in-graph, deployment output stays [1, 5, H/4, W/4] for backward compat. Target = inscribed-ellipse linear ramp (1 at center, 0 at boundary), aggregated with elementwise max — touching objects' ramps decay to 0 at midplanes by construction. New `Mul` and `SigmoidT` ops in primitives.py. encode.py auto-includes `dist` target when model has a `dist` alias. l_dist logged to TB. ONNX-13 parity verified at 1.33e-6. Patterns for bbox-s-dist / bbox-n-dist follow trivially.)*
 
-2. **Smaller suppression neighborhood for dense scenes**. Add a per-preset `peak_kernel` setting that the YAML controls explicitly. For dense scenes (eggs in a 6×8 flat, pills on a tray), k=3 is correct; for sparse scenes (one fish at a time), k=5 is fine. Currently k is set in the YAML but the trade-off isn't documented and the default (k=5 for bbox-m) is wrong for dense scenes.
+2. **Smaller suppression neighborhood for dense scenes**. Add a per-preset `peak_kernel` setting that the YAML controls explicitly. For dense scenes (objects in a 6×8 flat, pills on a tray), k=3 is correct; for sparse scenes (one fish at a time), k=5 is fine. Currently k is set in the YAML but the trade-off isn't documented and the default (k=5 for bbox-m) is wrong for dense scenes.
 
 3. **Tight-pack mosaic augmentation**. The current mosaic combines 4 images. Add a "tight-pack" mosaic mode that *deliberately* creates touching-object boundaries by reducing inter-image padding to zero or even negative (overlapping crops). This forces the model to see touching objects at training time, not just at deployment time.
 
@@ -128,7 +128,7 @@ mAP is a ranking-based metric and hides problems that matter for industrial depl
 
 3. ✅ **Per-error-type breakdown**: missed objects (recall miss), false positives (precision miss), duplicate detections (peak collapse failure mode), localization error (IoU < 0.5 but match found). Report each separately. Currently they're mushed into mAP@0.5. *(Shipped: TP / FP_localization / FP_duplicate / FP_background / FN_missed table.)*
 
-4. ✅ **Size-stratified metrics**. Small objects fail differently than large ones. Stratify metrics by object size (small / medium / large in pixel area) and report each tier separately. This catches the "model works great on big eggs but misses small ones" failure that mAP averages away. *(Shipped: COCO-style strata — small <32², medium <96², large ≥96² — recall and precision per tier.)*
+4. ✅ **Size-stratified metrics**. Small objects fail differently than large ones. Stratify metrics by object size (small / medium / large in pixel area) and report each tier separately. This catches the "model works great on big objects but misses small ones" failure that mAP averages away. *(Shipped: COCO-style strata — small <32², medium <96², large ≥96² — recall and precision per tier.)*
 
 5. ✅ **Localization error decomposition** (matters for sizing applications). For sizing, *localization bias* matters more than IoU. A bbox that's offset 2 pixels in +x direction across all detections won't show up in IoU stats (they'll all be > 0.9) but will systematically bias your size estimates. Decompose into: **systematic bias** (mean of pred_center − gt_center, should be near zero), **random scatter** (stddev, tells you precision), **scale bias** (mean of pred_size − gt_size relative to gt_size, should be near zero). These never get reported and they're exactly what you need for industrial sizing. *(Shipped: `loc_bias` reports center bias x/y, center scatter x/y, scale bias w/h, scale scatter w/h.)*
 
@@ -156,7 +156,7 @@ Standard detection losses optimize per-cell BCE/focal + per-cell box regression.
 
 2. **Hungarian-matched VFL targets**. VFL uses IoU between predicted box and GT box at each positive cell as the supervisory target. Currently this is done greedy (each cell matches its own GT). Use Hungarian matching to assign predictions to GTs globally before computing IoU targets. Reduces the case where two predictions both match the same GT and one of them gets a spuriously low IoU target.
 
-3. **Asymmetric count loss for deployment safety**. In some industrial contexts, **over-counting and under-counting have different costs**. Counting eggs for grading: missing one is yield loss; phantom egg breaks the packaging machine. Add an asymmetric count term: `α * max(0, pred - gt) + β * max(0, gt - pred)` with α and β configurable per-application. Lets users say "I want a recall-biased model" (small α, large β) or "I want a precision-biased model" (large α, small β).
+3. **Asymmetric count loss for deployment safety**. In some industrial contexts, **over-counting and under-counting have different costs**. Counting objects for grading: missing one is yield loss; phantom object breaks the packaging machine. Add an asymmetric count term: `α * max(0, pred - gt) + β * max(0, gt - pred)` with α and β configurable per-application. Lets users say "I want a recall-biased model" (small α, large β) or "I want a precision-biased model" (large α, small β).
 
 4. **Per-domain loss balancing**. If the dataset has domain labels (lighting, camera, source), oversample under-represented domains or weight their loss higher. Prevents the model from optimizing easy domains at the expense of hard ones. This pairs with the per-domain validation metric in 1.4.
 
@@ -174,7 +174,7 @@ Listed under Part 2 architecturally but elevated to high priority. Pluggable lab
 
 A targeted attack on the residual ghost-rate. Instead of architectural changes (which `opndet analyze` already shows are doing fine), train DIRECTLY against the model's actual failure modes by mining its own false positives.
 
-**Why this is high priority:** Residual ghost rate at convergence is ~1-2%, dominated by phantom detections on shadows / dust / texture artifacts the model has never seen labeled as "not an egg." Architectural fixes (k=7 peak suppression, repulsion baseline-subtract, focal_beta tuning) won't move this number further — it's a *training-data gap*, not a *model-capacity gap*. The model has the architecture to ignore these patterns; it just hasn't been told to.
+**Why this is high priority:** Residual ghost rate at convergence is ~1-2%, dominated by phantom detections on shadows / dust / texture artifacts the model has never seen labeled as "not an object." Architectural fixes (k=7 peak suppression, repulsion baseline-subtract, focal_beta tuning) won't move this number further — it's a *training-data gap*, not a *model-capacity gap*. The model has the architecture to ignore these patterns; it just hasn't been told to.
 
 **Plan:**
 
@@ -184,7 +184,7 @@ A targeted attack on the residual ghost-rate. Instead of architectural changes (
 
 3. **Cluster the false-reason patches** — K-means on raw pixels OR on a feature embedding (e.g., the model's own backbone features at that patch). K=10-20 clusters typically. Each cluster center represents a category of false reason (likely: shadow, dust speck, packaging texture, light reflection, partial-occluded background, etc.).
 
-4. **Generate hard-negative augmentation pool** — save cluster representatives + a sampling of patches from each cluster. Tag with cluster label so the user can inspect ("oh, cluster 3 is shadows under egg trays — that's the dominant FP cause").
+4. **Generate hard-negative augmentation pool** — save cluster representatives + a sampling of patches from each cluster. Tag with cluster label so the user can inspect ("oh, cluster 3 is shadows under object trays — that's the dominant FP cause").
 
 5. **Inject as training augmentation** — add an aug step `--hard-negative-pool <dir>`: with probability `p`, paste a randomly-chosen hard-negative patch into a non-GT region of a training image (no label, all background). The model gets explicit "DON'T FIRE ON THIS" supervision targeted at its actual failure modes.
 
@@ -215,18 +215,18 @@ Connects to but is distinct from §1.5's "asymmetric count loss" — that biases
 
 ## Part 2 — The convex prior (the differentiator)
 
-The single biggest architectural insight for opndet's actual application domain is that **industrial objects are convex or near-convex**. Eggs, pills, bottles, fish, fasteners, lumber cross-sections, kernels, tablets, fruit. This is a real architectural constraint that nobody else is exploiting because general-purpose detectors can't make the assumption.
+The single biggest architectural insight for opndet's actual application domain is that **industrial objects are convex or near-convex**. Objects, pills, bottles, fish, fasteners, lumber cross-sections, kernels, tablets, fruit. This is a real architectural constraint that nobody else is exploiting because general-purpose detectors can't make the assumption.
 
 If opndet commits to "convex objects only" as a positioning choice, several optimizations become available that would be wrong for general detection.
 
 ### 2.1 OBB / oriented-ellipse output format — **HIGH PRIORITY**
 
-For convex objects, the oriented bounding box (OBB) — equivalently the bounding ellipse — is a *strictly better* shape descriptor than AABB. AABB at 45° rotation has up to 60%+ background pixels in the box; OBB cuts this to near zero. Ellipse heatmap targets become egg-tight (no background lit), making peak supervision shape-aware and convexity loss redundant. Sizing, grading, weight estimation all become accurate measurements rather than approximations.
+For convex objects, the oriented bounding box (OBB) — equivalently the bounding ellipse — is a *strictly better* shape descriptor than AABB. AABB at 45° rotation has up to 60%+ background pixels in the box; OBB cuts this to near zero. Ellipse heatmap targets become object-tight (no background lit), making peak supervision shape-aware and convexity loss redundant. Sizing, grading, weight estimation all become accurate measurements rather than approximations.
 
 **Why this is high priority now (was not before):**
 - SAM-driven OBB labeling is solved. User has working code (`mask_to_obb_corners` via `cv2.fitEllipse` with aspect-ratio fallback for round objects, `corners_to_yolo_obb_line` for YOLOv8-OBB output). One Colab cell, ~minutes per 1000 images.
 - AABB at rotation is the dominant unfairness in current mAP@.5:.95 — model can nail orientation but get penalized on IoU because GT is AABB.
-- Heatmap target as actual egg shape (rotated elliptical Gaussian) replaces the convexity loss with stronger, denser supervision.
+- Heatmap target as actual object shape (rotated elliptical Gaussian) replaces the convexity loss with stronger, denser supervision.
 
 **Plan:**
 
@@ -253,7 +253,7 @@ For convex objects, the oriented bounding box (OBB) — equivalently the boundin
    yp = -(xs - cx) * sin(θ) + (ys - cy) * cos(θ)
    g = exp(-(xp²/(2σ_w²) + yp²/(2σ_h²)))
    ```
-   Heatmap is now the actual egg shape, oriented correctly. Convexity loss can be retired; supervision IS the convex prior.
+   Heatmap is now the actual object shape, oriented correctly. Convexity loss can be retired; supervision IS the convex prior.
 
 5. **Decoder**: client-side decode produces both OBB params and an inferred AABB (axis-aligned bounding box of the rotated rectangle) for backwards-compatibility with downstream consumers. Browser demo gets a "show OBB" toggle.
 
@@ -261,13 +261,13 @@ For convex objects, the oriented bounding box (OBB) — equivalently the boundin
 
 7. **SAM preprocessing pipeline** as a CLI subcommand: `opndet sam-obb --coco <json> --images <dir> --out <dir>`. Wraps the user's existing notebook code: SAM2 from AABB prompt → mask → fitEllipse → 4-corner OBB → YOLOv8-OBB `*.txt` files. One-shot per dataset, idempotent (skip files that exist).
 
-8. **New preset**: `opndet-bbox-x-obb.yaml`. Output 7ch, otherwise mirrors bbox-x. Curriculum mirrors kitchen-sink: pure-center → boxes → angle → repulsion. Train and benchmark vs AABB bbox-x on the egg dataset.
+8. **New preset**: `opndet-bbox-x-obb.yaml`. Output 7ch, otherwise mirrors bbox-x. Curriculum mirrors kitchen-sink: pure-center → boxes → angle → repulsion. Train and benchmark vs AABB bbox-x on the target dataset.
 
 **Definition of done**:
 - Pluggable label loaders ship with `coco` and `yolo_obb` adapters
 - `opndet sam-obb` CLI generates labels from any AABB-annotated dataset
 - `opndet-bbox-x-obb` preset trains end-to-end and produces tight OBB output
-- Validation on egg dataset shows mAP@.5:.95 vs OBB GT ≥ 5pp higher than bbox-x AABB vs AABB GT, **AND** subjective viz: boxes hug eggs at all rotations
+- Validation on target dataset shows mAP@.5:.95 vs OBB GT ≥ 5pp higher than bbox-x AABB vs AABB GT, **AND** subjective viz: boxes hug objects at all rotations
 - ONNX export round-trips cleanly with parity test
 - Browser demo renders rotated rectangles via `cv2.boxPoints`-equivalent
 
@@ -581,7 +581,7 @@ This is the major capability after sequential data lands. It addresses the singl
 
 **The goal is center stabilization, full stop.** Center stability is roughly an order of magnitude more important than any other temporal property for industrial counting and grading applications. Bbox dimensions, confidence trajectory, and orientation can all be smoothed application-side by averaging across frames; center jitter is much harder to fix downstream, because it directly affects which pixel a detection lives at. Get the center right; everything else follows.
 
-Eggs on a conveyor don't need motion extrapolation — the snapshot detector finds them in roughly the same place every frame anyway. What it doesn't have is *consistency* — center, confidence, and bbox dimensions vary frame-to-frame even when the underlying object is stable. The temporal prior fixes the center first; everything else is downstream of that.
+Objects on a conveyor don't need motion extrapolation — the snapshot detector finds them in roughly the same place every frame anyway. What it doesn't have is *consistency* — center, confidence, and bbox dimensions vary frame-to-frame even when the underlying object is stable. The temporal prior fixes the center first; everything else is downstream of that.
 
 The architecture is deliberately simple: stamp each detection's bounding box at amplitude 1.0; fade the entire accumulator by 1/N each frame. The model gets one extra input channel (presence), trained to read it as a soft prior on where centers should lock. No long contrails, no motion vectors, no trajectory math, no size memory, no embeddings.
 
@@ -662,7 +662,7 @@ That's the entire algorithm. Six lines. No blur, no normalization, no ring buffe
 
 **Why bbox-footprint rendering (not point Gaussians)**:
 
-Stamping the bounding box (or a soft anisotropic Gaussian sized to the bbox) instead of a fixed-sigma point peak gives the model a prior structurally similar to its own output. The model produces bboxes; the prior shows recent bbox footprints. This is more directly informative than peak heatmaps and naturally adapts to object size — a 30 px egg gets a 30 px footprint, a 100 px fish gets a 100 px footprint, no per-deployment sigma tuning required.
+Stamping the bounding box (or a soft anisotropic Gaussian sized to the bbox) instead of a fixed-sigma point peak gives the model a prior structurally similar to its own output. The model produces bboxes; the prior shows recent bbox footprints. This is more directly informative than peak heatmaps and naturally adapts to object size — a 30 px object gets a 30 px footprint, a 100 px fish gets a 100 px footprint, no per-deployment sigma tuning required.
 
 For deployment, hard bbox stamping (a 1.0-filled rectangle inside the box) is fine and faster than the soft variant.
 
@@ -826,7 +826,7 @@ Encoding tracking signals into the model itself — i.e., having the model produ
 - Train with identity labels (significantly more expensive to annotate)
 - Application matches new detection embeddings against recent track embeddings
 
-This is a meaningful capability addition but a separate project. For now, the temporal prior + external tracker pattern is the right deployment story. If validation reveals that ByteTrack still struggles in dense pack scenarios with very similar-looking objects (e.g., visually identical eggs in a tight grid), then in-model identity becomes worth pursuing. Otherwise, defer.
+This is a meaningful capability addition but a separate project. For now, the temporal prior + external tracker pattern is the right deployment story. If validation reveals that ByteTrack still struggles in dense pack scenarios with very similar-looking objects (e.g., visually identical objects in a tight grid), then in-model identity becomes worth pursuing. Otherwise, defer.
 
 ### 7.9 Validation
 
@@ -909,10 +909,10 @@ Make `--config` optional. If omitted, use the bundled `train.yaml` as-is. CLI fl
 1. If `--config` is omitted, load the bundled `train.yaml`.
 2. If `--data` is given, override `data.sources`.
 3. If `--model` is given, override `train.model` (default: `bbox-s`).
-4. Result: `uvx opndet train --data ./my-eggs` is a complete invocation. No yaml required.
+4. Result: `uvx opndet train --data ./my-objects` is a complete invocation. No yaml required.
 5. Print every auto-decision at startup so the user sees what was detected and what was defaulted. Save the resolved config to the run directory for reproducibility.
 
-**Definition of done**: `uvx opndet train --data ./my-eggs` works end-to-end with no config file. All auto-decisions are visible and overridable.
+**Definition of done**: `uvx opndet train --data ./my-objects` works end-to-end with no config file. All auto-decisions are visible and overridable.
 
 ---
 

@@ -766,10 +766,10 @@ async function runOcclusionAttribution(clickX, clickY) {
 
   // Detection-aware region. If the click is inside a predicted bbox, sweep
   // small patches WITHIN that bbox — fine attribution showing which feature
-  // of the egg the model relied on. Otherwise sweep a small window around
+  // of the object the model relied on. Otherwise sweep a small window around
   // the click point. Either way, patches are small enough to give meaningful
   // per-feature signal (the previous full-image 4x4 made each patch bigger
-  // than an entire egg, so only one patch ever showed a real score drop).
+  // than an entire object, so only one patch ever showed a real score drop).
   let rx, ry, rw, rh, mode;
   let targetDet = null;
   if (dets && dets.length > 0) {
@@ -780,7 +780,7 @@ async function runOcclusionAttribution(clickX, clickY) {
     }
   }
   if (targetDet) {
-    // Pad the bbox by 20% so context just outside the egg is also probed
+    // Pad the bbox by 20% so context just outside the object is also probed
     // (sometimes the false-cue is JUST OUTSIDE the bbox — a shadow edge etc.)
     const padX = (targetDet.x2 - targetDet.x1) * 0.2;
     const padY = (targetDet.y2 - targetDet.y1) * 0.2;
@@ -803,9 +803,9 @@ async function runOcclusionAttribution(clickX, clickY) {
   drawLetterbox(lastImage);
   const snap = ctx.getImageData(0, 0, inputW, inputH).data;
 
-  // 5x5 = 25 patches inside the region. For a typical 60x60 px egg + 20% pad
+  // 5x5 = 25 patches inside the region. For a typical 60x60 px object + 20% pad
   // = 84x84 region, each patch is ~17x17 px — fine enough to localize "the
-  // model reads the egg's center / edge / shadow / etc."
+  // model reads the object's center / edge / shadow / etc."
   const gridN = 5;
   const patchH = Math.ceil(rh / gridN);
   const patchW = Math.ceil(rw / gridN);

@@ -328,7 +328,7 @@ def _repulsion_loss(pred_xyxy: torch.Tensor, tgt: dict, pos: torch.Tensor, img_h
     and penalize IoU between this prediction and that neighbor's GT box.
 
     Baseline-subtracted: only the EXCESS overlap beyond what the GTs already share is
-    penalized. Without this, two overlapping GTs (e.g. partially-stacked eggs) push the
+    penalized. Without this, two overlapping GTs (e.g. partially-stacked objects) push the
     regression toward shrunken boxes — a perfect prediction would still take a penalty
     just because GT_self overlaps GT_neighbor by construction.
     """

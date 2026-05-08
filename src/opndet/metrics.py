@@ -158,7 +158,7 @@ def center_match(
     metric answers the deployment question: was the detection close to
     where the object actually is, regardless of box shape?
 
-    Defaults: dist_frac=0.5 (half the smaller GT side) means a 40px egg
+    Defaults: dist_frac=0.5 (half the smaller GT side) means a 40px object
     is matched if the predicted center is within 20px. min_dist_px=8
     floors that for tiny GTs so single-pixel offsets don't fail at
     stride=4 quantization.

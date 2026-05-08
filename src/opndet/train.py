@@ -345,7 +345,7 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
     map_50_95 = float(aps.mean())
     # Shape-mAP: center-aligned IoU. Decouples from sub-pixel center precision so
     # the metric is honest at small object sizes / large strides. Self-converges
-    # with standard mAP as image resolution grows (eggs bigger in px → ceiling
+    # with standard mAP as image resolution grows (objects bigger in px → ceiling
     # rises → no clipping vs standard). Documented as ours, not COCO-standard.
     all_scores_s, all_correct_s, _ = _accumulate_correct(per_image, iouv, mode="shape")
     aps_s = _ap_from_correct(all_scores_s, all_correct_s, total_gt)

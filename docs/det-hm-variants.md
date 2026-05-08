@@ -61,7 +61,7 @@ for y, x in peaks:
 
 Bbox-only annotations don't carry enough info. For each training image:
 
-1. Run SAM (or any instance segmentation that you trust on eggs) over the image. Use the existing GT bbox set as point prompts → one mask per egg.
+1. Run SAM (or any instance segmentation that you trust on objects) over the image. Use the existing GT bbox set as point prompts → one mask per object.
 2. For each instance mask:
    - Compute the signed distance transform inside the mask (positive = inside, decreasing toward edge)
    - Take the gradient of that distance transform → vectors pointing toward the centroid
@@ -118,8 +118,8 @@ Touching objects separate naturally: each pixel belongs to whichever instance's 
 
 ### Why it works on touching cases
 
-- bbox-x's peak suppression on `obj`: two adjacent eggs both peak; the smaller one's peak gets zeroed by MaxPool of the bigger one's neighbor → false negative.
-- flow-field: each pixel gets its OWN flow vector toward its OWN instance's center. Two adjacent eggs have flow fields that diverge across the boundary between them → distinct attractors → distinct instances. No max-pool-driven merging.
+- bbox-x's peak suppression on `obj`: two adjacent objects both peak; the smaller one's peak gets zeroed by MaxPool of the bigger one's neighbor → false negative.
+- flow-field: each pixel gets its OWN flow vector toward its OWN instance's center. Two adjacent objects have flow fields that diverge across the boundary between them → distinct attractors → distinct instances. No max-pool-driven merging.
 
 ### What's still TODO
 - [ ] SAM target generation script (one-time per dataset)

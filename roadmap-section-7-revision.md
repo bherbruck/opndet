@@ -36,7 +36,7 @@ These are the points the new content reflects. Reference for review, not literal
 
 11. **Spawn zones are operator-supplied static priors that get max-merged with the dynamic accumulator.** Operator provides a binary mask + amplitude (e.g., 0.4) for known entry points. The accumulator update applies the spawn mask at the end of each fade+stamp cycle so spawn zones don't fade away. This boosts initial detection at known spawn locations without retraining.
 
-12. **The 7/10 → 10/10 detection consistency goal.** Current snapshot bbox-f-egg detects an object on roughly 7 of 10 consecutive frames; the temporal model targets 10/10. This is the headline success metric. Subordinate metrics (center stability, confidence consistency, bbox dimension stability) are downstream of this primary goal.
+12. **The 7/10 → 10/10 detection consistency goal.** Current snapshot bbox-f-object detects an object on roughly 7 of 10 consecutive frames; the temporal model targets 10/10. This is the headline success metric. Subordinate metrics (center stability, confidence consistency, bbox dimension stability) are downstream of this primary goal.
 
 ## Replacement content for Section 7
 
@@ -45,17 +45,17 @@ These are the points the new content reflects. Reference for review, not literal
 
 This section specifies opndet's temporal-mode architecture: a model variant that takes a 4th input channel (the "prior") alongside the standard 3-channel RGB input. The prior carries spatial information about where objects were recently detected, allowing the model to produce stable, locked-on detections frame-to-frame instead of the flappy, jittery output that pure-snapshot detectors produce on video streams.
 
-The headline success metric: where snapshot bbox-f-egg detects a given object on roughly 7 of 10 consecutive frames, temporal-mode bbox-f-egg-tp targets 10/10. Subordinate metrics (center jitter, confidence flapping, bbox dimension stability) all improve as a consequence of the primary lock-on behavior.
+The headline success metric: where snapshot bbox-f-object detects a given object on roughly 7 of 10 consecutive frames, temporal-mode bbox-f-object-tp targets 10/10. Subordinate metrics (center jitter, confidence flapping, bbox dimension stability) all improve as a consequence of the primary lock-on behavior.
 
 ### 7.1 Architecture
 
-The temporal model is bbox-f-egg with `in_ch: 4`. The stem conv accepts 4 channels instead of 3. The prior heatmap is at stride 4 (matching output stride), 96×128 spatial resolution, single channel. Concatenated with RGB at the very front, processed by the stem conv alongside RGB.
+The temporal model is bbox-f-object with `in_ch: 4`. The stem conv accepts 4 channels instead of 3. The prior heatmap is at stride 4 (matching output stride), 96×128 spatial resolution, single channel. Concatenated with RGB at the very front, processed by the stem conv alongside RGB.
 
 Param count delta: ~108 weights added to the stem (12 stem output channels × 1 new input channel × 3×3 kernel). Negligible.
 
-The rest of the network is identical to bbox-f-egg. Same backbone, same head, same peak suppression, same output format `[1, 5, H/4, W/4]`.
+The rest of the network is identical to bbox-f-object. Same backbone, same head, same peak suppression, same output format `[1, 5, H/4, W/4]`.
 
-This is opt-in via a new YAML preset (`opndet-bbox-f-egg-tp.yaml`) and is *not* the default for any tier. Deployments must explicitly choose the temporal variant. The temporal variant is its own product, not a drop-in replacement for the snapshot model.
+This is opt-in via a new YAML preset (`opndet-bbox-f-object-tp.yaml`) and is *not* the default for any tier. Deployments must explicitly choose the temporal variant. The temporal variant is its own product, not a drop-in replacement for the snapshot model.
 
 ### 7.2 The accumulator (deployment-side)
 
@@ -186,7 +186,7 @@ Before promoting temporal mode beyond experimental status, verify the model uses
 
 Tests, all on synthesized or real video sequences:
 
-1. **7-of-10 → 10-of-10 metric.** Primary success metric. On consecutive-frame video clips, measure the fraction of frames on which a given object is correctly detected. Temporal mode should hit ≥95% across representative clips; snapshot mode bbox-f-egg currently hits ~70-80%.
+1. **7-of-10 → 10-of-10 metric.** Primary success metric. On consecutive-frame video clips, measure the fraction of frames on which a given object is correctly detected. Temporal mode should hit ≥95% across representative clips; snapshot mode bbox-f-object currently hits ~70-80%.
 
 2. **Center stability.** For correctly-detected objects across consecutive frames, measure stddev of detected center position. Temporal mode should reduce this by ≥3× vs snapshot.
 
@@ -206,7 +206,7 @@ Tests, all on synthesized or real video sequences:
 
 10. **Spawn-zone bootstrap.** With a configured spawn zone, frame-1 detection at the spawn region should be measurably better than without.
 
-Definition of done: temporal model variant ships as a separate preset (`bbox-f-egg-tp` or similar). Training synthesis is implemented and documented. Reference accumulator code is included in the SDK. Validation tests above all pass on representative test sequences. Documentation explains when to use temporal vs snapshot mode and how to configure the spawn zone for a deployment.
+Definition of done: temporal model variant ships as a separate preset (`bbox-f-object-tp` or similar). Training synthesis is implemented and documented. Reference accumulator code is included in the SDK. Validation tests above all pass on representative test sequences. Documentation explains when to use temporal vs snapshot mode and how to configure the spawn zone for a deployment.
 ```
 
 ## Notes for Claude Code on style

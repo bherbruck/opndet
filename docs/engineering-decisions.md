@@ -28,7 +28,7 @@ This doc is for future LLMs / engineers who don't have session-context. The git 
 
 ### Repulsion loss subtracts a baseline (commit 296acf4)
 
-**Why:** RepGT-style penalty was `IoA(pred, neighbor_GT)`. For two GT boxes that already overlap (touching/stacked eggs), even a perfect prediction (`pred ≡ GT_self`) had a non-zero phantom penalty — biasing the wh head toward shrunken boxes near any neighbor.
+**Why:** RepGT-style penalty was `IoA(pred, neighbor_GT)`. For two GT boxes that already overlap (touching/stacked objects), even a perfect prediction (`pred ≡ GT_self`) had a non-zero phantom penalty — biasing the wh head toward shrunken boxes near any neighbor.
 
 **Fix:** subtract `IoA(GT_self, GT_neighbor)` from the penalty. A perfect prediction now scores 0 regardless of GT overlap. Penalty fires only on EXCESS overlap beyond what the GTs already share.
 
@@ -48,7 +48,7 @@ This doc is for future LLMs / engineers who don't have session-context. The git 
 
 **Why:** k=5 (radius 2, 8-px min spacing at stride=4) suppresses any non-tied pair within 2 cells. But two cells with sigmoid output that rounds to identical fp values (common at saturation) BOTH pass the `>= MaxPool` test since each IS the local max. Wider window (k=7, radius 3, 12-px min spacing) catches close-but-not-tied pairs out to 3 cells, killing the dominant case of adjacent duplicates.
 
-**Why not all presets:** k=7 caps minimum detection density at 12 px center-to-center. For small/embedded presets (bbox-f/p/n), the user might want higher density. bbox-x is quality-first, eggs are spaced ≥30 px in typical industrial framing, k=7 is safe.
+**Why not all presets:** k=7 caps minimum detection density at 12 px center-to-center. For small/embedded presets (bbox-f/p/n), the user might want higher density. bbox-x is quality-first, objects are spaced ≥30 px in typical industrial framing, k=7 is safe.
 
 **Tied-pair edge case:** If two cells have *exactly* identical fp values, no kernel size suppresses both. The architectural fix would be position-encoded tiebreak (add tiny position-dependent constant before MaxPool to break ties deterministically). Not implemented; if duplicates persist after k=7 + repulsion, hard-negative mining (§1.7) is the next attack surface.
 
@@ -62,7 +62,7 @@ The five channels (`obj`, `cx`, `cy`, `w`, `h`) and the post-suppression sparse 
 
 ### Standard mAP@.5:.95 lies on small objects at stride=4. Shape-mAP is the honest companion.
 
-**Math:** at stride=4 with ~1 px SGD residual, the architectural IoU ceiling for a 30-px egg is ~0.94. mAP@.95 is *literally impossible* even on a perfect-modulo-noise model. mAP@.5:.95 averages 10 thresholds including unreachable ones, dragging the headline number down.
+**Math:** at stride=4 with ~1 px SGD residual, the architectural IoU ceiling for a 30-px object is ~0.94. mAP@.95 is *literally impossible* even on a perfect-modulo-noise model. mAP@.5:.95 averages 10 thresholds including unreachable ones, dragging the headline number down.
 
 **Solution:** `map_50_95_shape` (commit 00365bb) — IoU computed after translating pred to share GT's center. Decouples mAP from sub-pixel center precision. Fair when stride limits center precision; converges with standard mAP as image resolution grows. Reported alongside, never replaces, standard mAP (we keep both for cross-paper comparability).
 
@@ -98,11 +98,11 @@ Each epoch, evaluate computes `threshold_opt` (the threshold where F1 peaks for 
 
 ### `min_visible_frac: 0.7` for kitchen-sink (vs default 0.5)
 
-Cleaner training labels under cutout / scale aug. Boxes whose visible area falls below 70% are dropped from supervision. Prevents the model from being told to predict "this fragment of an egg behind a cutout" — when it can't see most of the egg, it shouldn't be supervised on its full bbox.
+Cleaner training labels under cutout / scale aug. Boxes whose visible area falls below 70% are dropped from supervision. Prevents the model from being told to predict "this fragment of an object behind a cutout" — when it can't see most of the object, it shouldn't be supervised on its full bbox.
 
 ### `mosaic_prob: 0.0` for count-aware training
 
-Mosaic mixes 4 images' worth of objects into one frame. The count loss expects `peak_count == n_gt`; mosaic stuffs 4× expected eggs in one image, corrupting the count signal. Disable mosaic when `count_weight > 0`.
+Mosaic mixes 4 images' worth of objects into one frame. The count loss expects `peak_count == n_gt`; mosaic stuffs 4× expected objects in one image, corrupting the count signal. Disable mosaic when `count_weight > 0`.
 
 ### `scale_jitter` disabled in current kitchen-sink
 

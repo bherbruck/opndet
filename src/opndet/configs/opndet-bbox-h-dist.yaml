@@ -2,7 +2,7 @@
 # Output contract is unchanged ([1, 5, H/4, W/4]). The dist channel is internal:
 # multiplied with the obj heatmap inside the graph before peak suppression so peaks
 # at midplanes between touching objects get pushed down. Helps for dense / touching
-# convex object scenes (eggs in a flat, pills on a tray).
+# convex object scenes (objects in a flat, pills on a tray).
 
 model:
   in_ch: 3
