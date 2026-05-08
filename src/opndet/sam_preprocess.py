@@ -116,53 +116,32 @@ def is_obb_within_prompt(corners: np.ndarray, prompt_xyxy: np.ndarray,
     return _obb_area(corners) <= max_area_frac * aabb_a
 
 
-def _aabb_centers(all_xyxy: np.ndarray, exclude_idx: int) -> np.ndarray:
-    """Center points of every AABB except the one at exclude_idx. Shape (N-1, 2)."""
-    if all_xyxy is None or len(all_xyxy) <= 1:
-        return np.zeros((0, 2), dtype=np.float32)
-    keep = np.ones(len(all_xyxy), dtype=bool)
-    keep[exclude_idx] = False
-    others = all_xyxy[keep]
-    cx = (others[:, 0] + others[:, 2]) * 0.5
-    cy = (others[:, 1] + others[:, 3]) * 0.5
-    return np.stack([cx, cy], axis=1).astype(np.float32)
+def is_obb_self_consistent(corners: np.ndarray, prompt_xyxy: np.ndarray) -> bool:
+    """Reject OBBs that have drifted off their prompt. Two checks:
 
+    1. The OBB centroid lies inside the prompt AABB. If SAM's mask escaped
+       and grew toward background, the OBB centroid moves with it.
+    2. The prompt AABB's center lies inside the OBB. The OBB should still
+       cover the labeled object's expected location.
 
-def _count_inside_obb(corners: np.ndarray, points: np.ndarray) -> int:
-    """How many `points` (N, 2) fall inside the OBB polygon (4 corners)."""
-    if corners is None or len(points) == 0:
-        return 0
-    poly = corners.astype(np.float32).reshape(-1, 1, 2)
-    n = 0
-    for px, py in points:
-        if cv2.pointPolygonTest(poly, (float(px), float(py)), False) >= 0:
-            n += 1
-    return n
-
-
-def _count_inside_aabb(xyxy: np.ndarray, points: np.ndarray) -> int:
-    """How many `points` (N, 2) fall inside the AABB (x1, y1, x2, y2)."""
-    if xyxy is None or len(points) == 0:
-        return 0
-    x1, y1, x2, y2 = xyxy
-    inside = (points[:, 0] >= x1) & (points[:, 0] <= x2) & (points[:, 1] >= y1) & (points[:, 1] <= y2)
-    return int(inside.sum())
-
-
-def is_obb_neighbor_count_sane(corners: np.ndarray, this_idx: int,
-                              all_xyxy: np.ndarray, slack: int = 0) -> bool:
-    """Reject OBBs that swallow more OTHER objects' centers than the prompt
-    AABB did. An honest egg-OBB contains its own center plus maybe one
-    overlapping neighbor; if SAM grabbed the whole tray, the resulting OBB
-    contains 10+ neighbor centers. `slack` allows tolerating a few extra
-    (default 0 = strict).
+    Both checks use only the target object — no neighbor-counting needed,
+    so dense scenes don't trigger false positives.
     """
-    if corners is None or all_xyxy is None or len(all_xyxy) <= 1:
+    if corners is None or prompt_xyxy is None:
         return True
-    others = _aabb_centers(all_xyxy, this_idx)
-    count_in_obb = _count_inside_obb(corners, others)
-    count_in_aabb = _count_inside_aabb(all_xyxy[this_idx], others)
-    return count_in_obb <= count_in_aabb + slack
+    x1, y1, x2, y2 = prompt_xyxy
+    # 1. OBB centroid inside AABB
+    obb_cx = float(corners[:, 0].mean())
+    obb_cy = float(corners[:, 1].mean())
+    if not (x1 <= obb_cx <= x2 and y1 <= obb_cy <= y2):
+        return False
+    # 2. AABB center inside OBB polygon
+    aabb_cx = float((x1 + x2) * 0.5)
+    aabb_cy = float((y1 + y2) * 0.5)
+    poly = corners.astype(np.float32).reshape(-1, 1, 2)
+    if cv2.pointPolygonTest(poly, (aabb_cx, aabb_cy), False) < 0:
+        return False
+    return True
 
 
 def corners_to_yolo_obb_line(corners: np.ndarray, img_w: int, img_h: int, class_id: int = 0) -> str:
@@ -261,9 +240,9 @@ def process_image(img_path: Path, annotations: list[dict], predictor,
         if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
             stats.n_invalid += 1
             continue
-        # Sanity: OBB must not contain MORE other-object centers than the
-        # AABB did (catches mask-escapes that swallow neighboring objects).
-        if not is_obb_neighbor_count_sane(corners, i, boxes_xyxy, slack=0):
+        # Sanity: OBB centroid inside AABB AND AABB center inside OBB.
+        # Catches mask-escape cases where the OBB drifts off its prompt.
+        if not is_obb_self_consistent(corners, boxes_xyxy[i]):
             stats.n_invalid += 1
             continue
         if _is_round_via_corners(corners):
@@ -348,7 +327,8 @@ def _load_predictor(sam_model: str, device: str):
 
 def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
         sam_model: str = "sam2_b", device: str = "cuda",
-        max_images: int | None = None, progress_every: int = 25) -> RunStats:
+        max_images: int | None = None,
+        batch_size: int = 8, num_workers: int = 8) -> RunStats:
     coco_json = Path(coco_json)
     images_dir = Path(images_dir)
     out_dir = Path(out_dir)
@@ -411,7 +391,7 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
         img = cv2.imread(str(path))
         return (item, cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
         loaded = list(tqdm(
             pool.map(_load_one, todo),
             total=len(todo),
@@ -429,7 +409,7 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
     # Falls back to single-image set_image() if the SAM2 build doesn't expose
     # set_image_batch.
     has_batch_api = hasattr(predictor, "set_image_batch") and hasattr(predictor, "predict_batch")
-    BATCH = 8 if has_batch_api else 1
+    BATCH = batch_size if has_batch_api else 1
 
     t_inf = time.time()
     pbar = tqdm(
@@ -472,7 +452,7 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
                 if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
                     im_stats.n_invalid += 1
                     continue
-                if not is_obb_neighbor_count_sane(corners, i, boxes_xyxy, slack=0):
+                if not is_obb_self_consistent(corners, boxes_xyxy[i]):
                     im_stats.n_invalid += 1
                     continue
                 if _is_round_via_corners(corners):

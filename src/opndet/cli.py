@@ -232,7 +232,8 @@ def _cmd_sam_obb(args: argparse.Namespace) -> int:
         sam_model=args.sam_model,
         device=args.device,
         max_images=args.max_images,
-        progress_every=args.progress_every,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
     print(f"processed={stats.n_images_processed} skipped={stats.n_images_skipped} "
           f"obj={stats.n_objects_processed} obb={stats.n_obb_extracted} "
@@ -431,7 +432,11 @@ def main(argv: list[str] | None = None) -> int:
                      help="SAM2 size: sam2_t|s|b|l or sam2.1_t|s|b|l, or raw HF id (default: sam2_b)")
     pso.add_argument("--device", default="cuda", help="cuda or cpu")
     pso.add_argument("--max-images", type=int, default=None, help="Cap number of images (debug)")
-    pso.add_argument("--progress-every", type=int, default=25, help="Print progress every N images")
+    pso.add_argument("--batch-size", type=int, default=8,
+                     help="Images per SAM2 image-encoder batch. Bump on big GPUs (16-32 on A100/H100); "
+                          "drop to 4 if OOM on T4. Higher = better GPU utilization (default: 8)")
+    pso.add_argument("--num-workers", type=int, default=8,
+                     help="ThreadPoolExecutor workers for parallel disk reads during preload (default: 8)")
     pso.set_defaults(func=_cmd_sam_obb)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
