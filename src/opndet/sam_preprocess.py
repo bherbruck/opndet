@@ -16,6 +16,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from tqdm.auto import tqdm
 
 ROUNDNESS_THRESHOLD = 1.15
 
@@ -403,18 +404,24 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
     # Step 1: preload ALL images into RAM in parallel. ~3 GB for a 5000-image
     # 384x512 dataset; fits comfortably on Colab. Eliminates the per-image
     # disk-I/O wait that idles the GPU between SAM forwards.
-    print(f"  preloading {len(todo)} images into RAM...")
     from concurrent.futures import ThreadPoolExecutor
+
+    def _load_one(item):
+        path = item[0]
+        img = cv2.imread(str(path))
+        return (item, cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None)
+
     with ThreadPoolExecutor(max_workers=8) as pool:
-        loaded = list(pool.map(
-            lambda item: (item, cv2.cvtColor(cv2.imread(str(item[0])), cv2.COLOR_BGR2RGB)
-                          if cv2.imread(str(item[0])) is not None else None),
-            todo,
+        loaded = list(tqdm(
+            pool.map(_load_one, todo),
+            total=len(todo),
+            desc="preload imgs",
+            unit="img",
+            leave=False,
         ))
-    preload_dt = time.time() - t0
     n_loaded = sum(1 for _, img in loaded if img is not None)
-    print(f"  preloaded {n_loaded}/{len(todo)} in {preload_dt:.1f}s "
-          f"({n_loaded / max(preload_dt, 1e-6):.0f} img/s disk read)")
+    if n_loaded < len(todo):
+        stats.errors.append(f"{len(todo) - n_loaded} images failed to load")
 
     # Step 2: batched SAM2 inference. set_image_batch runs the image encoder
     # once over a batch (single big GPU forward); per-image predict() then
@@ -425,6 +432,12 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
     BATCH = 8 if has_batch_api else 1
 
     t_inf = time.time()
+    pbar = tqdm(
+        total=len(todo),
+        desc=f"sam-obb {sam_model}",
+        unit="img",
+        dynamic_ncols=True,
+    )
     for chunk_start in range(0, len(loaded), BATCH):
         chunk = loaded[chunk_start:chunk_start + BATCH]
         valid = [(item, img) for (item, img) in chunk if img is not None]
@@ -474,21 +487,16 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
             stats.n_aabb_fallback += im_stats.n_round_fallback
             stats.n_invalid_dropped += im_stats.n_invalid
 
-        if ((chunk_start // BATCH) + 1) % max(1, progress_every // BATCH) == 0:
-            elapsed = time.time() - t_inf
-            avg_rate = stats.n_images_processed / max(elapsed, 1e-6)
-            # Track instantaneous rate (recent BATCH images) — cumulative average
-            # is misleading on heterogeneous datasets (dense scenes drag it down
-            # for tens of slots after they've passed).
-            if not hasattr(run, "_last_t"):
-                run._last_t, run._last_n = elapsed, stats.n_images_processed   # type: ignore[attr-defined]
-                inst_rate = avg_rate
-            else:
-                inst_rate = (stats.n_images_processed - run._last_n) / max(elapsed - run._last_t, 1e-6)   # type: ignore[attr-defined]
-                run._last_t, run._last_n = elapsed, stats.n_images_processed   # type: ignore[attr-defined]
-            print(f"  [{stats.n_images_processed}/{len(todo)}] obb={stats.n_obb_extracted} "
-                  f"round={stats.n_aabb_fallback} drop={stats.n_invalid_dropped} "
-                  f"({inst_rate:.1f} img/s now, {avg_rate:.1f} avg, batch={BATCH})")
+        # Advance pbar by however many images this chunk added (NaN-safe).
+        n_done_this_chunk = sum(1 for v in valid)
+        pbar.update(n_done_this_chunk)
+        pbar.set_postfix({
+            "obb": stats.n_obb_extracted,
+            "round": stats.n_aabb_fallback,
+            "drop": stats.n_invalid_dropped,
+            "B": BATCH,
+        })
+    pbar.close()
 
     stats.duration_seconds = round(time.time() - t0, 2)
     manifest = {k: v for k, v in asdict(stats).items()}
