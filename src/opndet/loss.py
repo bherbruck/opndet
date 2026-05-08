@@ -344,17 +344,28 @@ class OpndetBboxLoss(nn.Module):
             iou_loss = probiou_loss(pred_box, gt_box)  # [B, H', W']
             pos2d = pos.squeeze(1) if pos.dim() == 4 else pos
             l_box = (iou_loss * pos2d).sum() / n_pos
+            # Auxiliary direct-angle loss: circular L1 on θ_norm. ProbIoU's
+            # angle gradient vanishes on near-square boxes (covariance becomes
+            # near-isotropic, ∂B/∂θ ≈ 0). Without an aux term, models tend to
+            # park θ at the sigmoid init (θ_norm ≈ 0.5 → θ = π/2) and learn
+            # only via indirect-IoU pressure. Direct-L1 fixes that.
+            ang_pred_norm = reg_pred[:, 4]
+            ang_gt_norm = gt[:, 4]
+            ang_diff = (ang_pred_norm - ang_gt_norm).abs()
+            ang_diff = torch.minimum(ang_diff, 1.0 - ang_diff)  # wrap [0,1] cycle
+            l_angle = (ang_diff * pos2d).sum() / n_pos
+            ang_aux_w = float(getattr(self, "angle_aux_weight", 0.5))
             if self.cls_loss == "vfl":
                 # VFL needs IoU as cls target — use 1 - probiou loss = ProbIoU (∈ [0, 1]).
                 iou_target = (1.0 - iou_loss).detach() * pos2d
                 l_hm = varifocal_loss(hm_logit, pos, iou_target.unsqueeze(1), alpha=self.vfl_alpha, gamma=self.vfl_gamma)
             else:
                 l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
-            total = self.w_hm * l_hm + self.w_wh * l_box
+            total = self.w_hm * l_hm + self.w_wh * (l_box + ang_aux_w * l_angle)
             out = {"loss": total, "l_hm": l_hm.detach(),
                    "l_cxy": l_box.detach() * 0.0,
                    "l_wh": l_box.detach(),
-                   "l_angle": l_box.detach() * 0.0}  # angle is folded into ProbIoU
+                   "l_angle": l_angle.detach()}
             if self.count_w > 0 or self.convex_w > 0:
                 hm_sig = torch.sigmoid(hm_logit)
             if self.count_w > 0:
