@@ -236,33 +236,34 @@ def save_layered_vis(
             if prior_path is not None:
                 db.add_overlay(ep, tag, i, "prior_heat", prior_path)
             db.add_overlay(ep, tag, i, "obj_heat", obj_path)
-            if i < len(gt_boxes) and gt_boxes[i].shape[0] > 0:
-                gt_meta = None
-                from opndet.decode import OBBDetection
+            from opndet.decode import OBBDetection
+            if is_obb:
+                # OBB-head models: GT data ALWAYS comes from gt_obbs_per (the
+                # encoded-and-decoded OBB roundtrip). gt_boxes (AABBs from the
+                # dataset's COCO loader) is IGNORED — its count may not match
+                # gt_obbs_per's count after encoder drops out-of-bounds, and
+                # mixing the two leaves some rows without corners meta → JS
+                # falls back to drawing AABB. Build box data 1:1 from OBBs.
                 if gt_obbs_per is not None and i < len(gt_obbs_per) and len(gt_obbs_per[i]) > 0:
-                    # Per-row meta: corners + theta. JS renderer reads `corners` to
-                    # draw a rotated quad; falls back to AABB row if absent.
+                    n_obb = len(gt_obbs_per[i])
+                    gt_box_arr = np.zeros((n_obb, 4), dtype=np.float32)
                     gt_meta = {}
                     for j, gt in enumerate(gt_obbs_per[i]):
                         cx, cy, aw, ah, theta = (float(v) for v in gt[:5])
                         det = OBBDetection(cx, cy, aw, ah, theta, 1.0)
+                        # Enclosing AABB for the row (informational only — JS
+                        # renders from corners). Stored from the OBB itself.
+                        gt_box_arr[j] = [cx - aw * 0.5, cy - ah * 0.5,
+                                          cx + aw * 0.5, cy + ah * 0.5]
                         gt_meta[j] = {"corners": det.to_corners().tolist(),
                                        "theta": theta}
-                elif is_obb:
-                    # OBB model with no OBB labels for this sample → derive
-                    # axis-aligned (θ=0) corners from the AABB so the dashboard
-                    # never shows raw AABB rectangles for OBB-head training.
-                    gt_meta = {}
-                    for j, b in enumerate(gt_boxes[i]):
-                        x1, y1, x2, y2 = (float(v) for v in b[:4])
-                        cx = (x1 + x2) * 0.5
-                        cy = (y1 + y2) * 0.5
-                        w = max(x2 - x1, 1.0)
-                        h = max(y2 - y1, 1.0)
-                        det = OBBDetection(cx, cy, w, h, 0.0, 1.0)
-                        gt_meta[j] = {"corners": det.to_corners().tolist(),
-                                       "theta": 0.0}
-                db.add_boxes(ep, tag, i, "gt", gt_boxes[i], meta=gt_meta)
+                    db.add_boxes(ep, tag, i, "gt", gt_box_arr, meta=gt_meta)
+                # If gt_obbs_per is empty for this sample, skip GT entirely.
+                # OBB models are unaware of AABB-only GT.
+            else:
+                # AABB-head models: dataset's gt_boxes is the authoritative GT.
+                if i < len(gt_boxes) and gt_boxes[i].shape[0] > 0:
+                    db.add_boxes(ep, tag, i, "gt", gt_boxes[i])
             if dets_per[i]:
                 if is_obb:
                     # store enclosing AABB for the box row; corners go to meta.

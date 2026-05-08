@@ -685,22 +685,56 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     has_obb = "ang_r" in aliases
     has_ltrb = "ltrb_r" in aliases and not has_obb
 
+    if has_obb:
+        # OBB head is COMPLETELY unaware of AABB-from-COCO. Two enforcements:
+        #   1. Drop samples without OBB sidecars (no silent θ=0 fallback).
+        #   2. REPLACE each sample's boxes (loaded from COCO) with the enclosing
+        #      AABB derived from its OBBs. After this point, NOTHING in the
+        #      pipeline reads AABB-from-COCO for OBB models — Sample.boxes is
+        #      strictly OBB-derived. SAM2/SAM-OBB output is the only source of
+        #      truth.
+        from opndet.encode import obb_to_aabb
+        def _has_obb_label(s):
+            return getattr(s, "obbs", None) is not None
+        def _replace_boxes_with_obb_enclosing(s):
+            if s.obbs is None or s.obbs.shape[0] == 0:
+                s.boxes = np.zeros((0, 4), dtype=np.float32)
+                return s
+            xyxy = np.array([obb_to_aabb(*o) for o in s.obbs], dtype=np.float32)
+            s.boxes = xyxy
+            return s
+        n_train_pre, n_val_pre, n_test_pre = len(train_s), len(val_s), len(test_s)
+        train_s = [_replace_boxes_with_obb_enclosing(s) for s in train_s if _has_obb_label(s)]
+        val_s   = [_replace_boxes_with_obb_enclosing(s) for s in val_s   if _has_obb_label(s)]
+        test_s  = [_replace_boxes_with_obb_enclosing(s) for s in test_s  if _has_obb_label(s)]
+        d_tr, d_v, d_te = n_train_pre - len(train_s), n_val_pre - len(val_s), n_test_pre - len(test_s)
+        if d_tr or d_v or d_te:
+            print(f"  OBB head: dropped samples without sidecar OBB labels "
+                  f"(train -{d_tr}, val -{d_v}, test -{d_te})")
+        print(f"  OBB head: AABB-from-COCO replaced with OBB-enclosing-AABB on "
+              f"{len(train_s) + len(val_s) + len(test_s)} samples — pipeline is "
+              f"now AABB-from-COCO free.")
+        if not train_s:
+            raise RuntimeError(
+                "OBB head selected but no training samples have OBB sidecars. "
+                "Run `opndet sam-obb --coco ... --images ... --out <obb_dir>` "
+                "first and point `data.sources[*].obb_dir` at it."
+            )
+
     def _obb_encode_fn(boxes_xyxy, obbs=None):
-        # OBB GT path: prefer pre-computed (cx, cy, w, h, θ) when the dataset
-        # passes them (no-aug val/test). Otherwise derive zero-θ OBBs from the
-        # (possibly augmented) AABB so the angle channels still get supervised
-        # trivially at θ=0.
+        # OBB GT path: REQUIRES real OBB GT. Samples without OBB sidecars are
+        # filtered out at startup (see filter below). If we still get here
+        # without OBBs and have boxes, that's a pipeline bug — fail loud rather
+        # than silently train against θ=0 AABB-as-OBB (the original collapse).
         if obbs is not None and len(obbs) > 0:
             return encode_targets_obb(obbs, cfg_shim)
         if boxes_xyxy.shape[0] == 0:
             return encode_targets_obb(np.zeros((0, 5), dtype=np.float32), cfg_shim)
-        cx = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) * 0.5
-        cy = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) * 0.5
-        w = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]
-        h = boxes_xyxy[:, 3] - boxes_xyxy[:, 1]
-        theta = np.zeros_like(cx)
-        obbs2 = np.stack([cx, cy, w, h, theta], axis=1).astype(np.float32)
-        return encode_targets_obb(obbs2, cfg_shim)
+        raise RuntimeError(
+            f"OBB head got {boxes_xyxy.shape[0]} boxes but no OBB GT. "
+            "Sample-filter should have dropped this; check dataset.OpndetDataset "
+            "wiring or rerun `opndet sam-obb` to generate sidecars."
+        )
     _obb_encode_fn._takes_obbs = True  # type: ignore[attr-defined]
 
     if has_obb:
