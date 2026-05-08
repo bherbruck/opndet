@@ -184,9 +184,13 @@ def _load_predictor(sam_model: str, device: str):
     try:
         from sam2.sam2_image_predictor import SAM2ImagePredictor
     except ImportError as e:
+        # NOTE: the SAM2 repo's PyPI metadata name is `sam-2` (with hyphen), not
+        # `sam2` — the `<name> @ git+URL` install form fails name-matching.
+        # Use the bare git URL.
         raise RuntimeError(
-            "SAM2 not installed. Install with: "
-            "pip install 'sam2 @ git+https://github.com/facebookresearch/sam2.git'"
+            "SAM2 not installed. Install with one of:\n"
+            "    pip install git+https://github.com/facebookresearch/sam2.git\n"
+            "    uv pip install --system git+https://github.com/facebookresearch/sam2.git"
         ) from e
 
     hf_id_map = {
