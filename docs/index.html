@@ -668,7 +668,10 @@ async function runOcclusionAttribution(clickX, clickY) {
   const snap = ctx.getImageData(0, 0, inputW, inputH).data;
 
   // Build a coarse grid of patches over the whole image.
-  const gridN = 5;   // 5x5 = 25 patches; tune for speed
+  // 4x4 = 16 patches: enough resolution to localize the cause, ~3-5s on
+  // typical phones / laptops via WASM. 5x5 (25) was 50% slower for marginal
+  // resolution gain.
+  const gridN = 4;
   const patchH = Math.ceil(inputH / gridN);
   const patchW = Math.ceil(inputW / gridN);
 
@@ -687,6 +690,11 @@ async function runOcclusionAttribution(clickX, clickY) {
       const s = od[cellY * W + cellX];
       gridScores[gy * gridN + gx] = Math.max(0, baseScore - s);
       els.attribStatus.textContent = `occluding patch ${gy * gridN + gx + 1} / ${gridN * gridN}...`;
+      // Yield to the browser event loop so the page can repaint the status
+      // text and stay responsive. Without this, ORT's WASM-single-thread
+      // backend keeps the main thread busy across awaits and the page
+      // freezes for the full ~5-10s sweep.
+      await new Promise(r => setTimeout(r, 0));
     }
   }
   const dt = (performance.now() - t0) / 1000;
