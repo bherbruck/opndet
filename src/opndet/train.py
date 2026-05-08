@@ -266,7 +266,7 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
         # OBB-mode side channel: when the head emits 7-ch, also run rotated-IoU
         # + angle-error metrics. GT OBBs come from the encoded targets dict
         # (post-letterbox, same coords as boxes_list), preds via decode_obb_batch.
-        if out_np.shape[1] == 7 and targets is not None and "obb" in targets and "pos" in targets:
+        if out_np.shape[1] == 6 and targets is not None and "obb" in targets and "pos" in targets:
             is_obb_model = True
             pred_obbs_per = decode_obb_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=score_thresh)
             pos_np = targets["pos"].cpu().numpy()
@@ -739,7 +739,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     if has_obb:
         encode_fn = _obb_encode_fn
-        print("  head variant: OBB (7-channel)")
+        print("  head variant: OBB (6-channel direct cxywhθ + ProbIoU loss)")
     elif has_ltrb:
         encode_fn = partial(encode_targets_ltrb, cfg=cfg_shim)
         print("  head variant: ltrb (5-channel)")

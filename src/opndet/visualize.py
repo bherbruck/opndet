@@ -193,7 +193,7 @@ def save_layered_vis(
     out = model(imgs.to(device))
     out_t = out["output"] if isinstance(out, dict) else out
     out_np = out_t.detach().cpu().numpy()
-    is_obb = out_np.shape[1] == 7
+    is_obb = out_np.shape[1] == 6
     if is_obb:
         dets_per = decode_obb_batch(out_np, img_h, img_w, stride, threshold=threshold)
     else:
@@ -319,7 +319,7 @@ def render_predictions(
     out = model(imgs.to(device))
     out_t = out["output"] if isinstance(out, dict) else out
     out_np = out_t.cpu().numpy()
-    is_obb = out_np.shape[1] == 7
+    is_obb = out_np.shape[1] == 6
     if is_obb:
         dets_per = decode_obb_batch(out_np, img_h, img_w, stride, threshold=threshold)
     else:

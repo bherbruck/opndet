@@ -271,24 +271,31 @@ def encode_targets_obb(
     min_sigma: float = 1.0,
     aspect_round_thresh: float = 1.15,
 ) -> dict[str, torch.Tensor]:
-    """Encode list of OBBs (cx, cy, w_major, h_minor, theta) px+rad into dense GT.
+    """Encode list of OBBs into dense GT for the YOLO-style 6-channel head.
 
-    Reg target is (l, t, r, b) image-frame distances to the OBB's enclosing AABB,
-    plus (sin2θ, cos2θ) angle channels in [-1, 1]. The 2θ encoding handles the
-    180° wrap of OBB orientation.
+    Output reg channels (5 total, all sigmoid range [0, 1]):
+        cx_offset = (cx_px - ix*stride) / stride       in [0, 1]  cell-relative
+        cy_offset = (cy_px - iy*stride) / stride       in [0, 1]
+        w_norm    = w_obb / img_w                      in [0, 1]
+        h_norm    = h_obb / img_h                      in [0, 1]
+        theta_norm = theta / π                         in [0, 1)  (sigmoid output × π = θ)
 
-    obbs: [N, 5] of (cx, cy, w, h, theta).
+    NO enclosing-AABB representation anywhere. Direct (cx, cy, w, h, θ).
+    Wrap-handling is the loss's job (ProbIoU treats each box as a 2D Gaussian
+    and is wrap-continuous via the rotated-box covariance).
+
+    obbs: [N, 5] of (cx, cy, w, h, theta) in image-pixel units, θ in radians ∈ [0, π).
     Returns dict with:
-      hm    : [1, H', W']  rotated elliptical Gaussian heatmap
-      obb   : [6, H', W']  (l, t, r, b, sin2θ, cos2θ)
-      pos   : [1, H', W']  1.0 at positive (center) cells
-      angle_mask : [1, H', W']  1.0 at non-round positives (aspect > thresh), 0 elsewhere
+      hm         : [1, H', W']  circular Gaussian heatmap (cls)
+      obb        : [5, H', W']  (cx_off, cy_off, w_norm, h_norm, θ_norm) at GT cells
+      pos        : [1, H', W']  1.0 at GT center cells
+      angle_mask : [1, H', W']  1.0 at non-round positives (aspect > thresh)
     """
     H, W = cfg.img_h, cfg.img_w
     s = cfg.stride
     Hp, Wp = H // s, W // s
     hm = np.zeros((Hp, Wp), dtype=np.float32)
-    reg = np.zeros((6, Hp, Wp), dtype=np.float32)
+    reg = np.zeros((5, Hp, Wp), dtype=np.float32)
     pos = np.zeros((Hp, Wp), dtype=np.float32)
     ang_mask = np.zeros((Hp, Wp), dtype=np.float32)
 
@@ -306,21 +313,13 @@ def encode_targets_obb(
                 continue
             r_px = gaussian_radius(bw, bh)
             base_sigma = max(min_sigma, r_px / s / 3.0)
-            # Circular cls heatmap: shape info lives in the reg head (sin2θ/cos2θ),
-            # NOT in the heatmap target. Elongated targets confuse peak-pick because
-            # neighbors along the major axis get high supervision values and steal
-            # the local-max winner. Box rotation still flows through reg channels.
             _draw_rotated_gaussian(hm, ix, iy, base_sigma, base_sigma, 0.0)
-            x1, y1, x2, y2 = obb_to_aabb(cx_px, cy_px, bw, bh, float(theta))
-            cx_cell = (ix + 0.5) * s
-            cy_cell = (iy + 0.5) * s
-            reg[0, iy, ix] = float(np.clip((cx_cell - x1) / W, 0.0, 1.0))
-            reg[1, iy, ix] = float(np.clip((cy_cell - y1) / H, 0.0, 1.0))
-            reg[2, iy, ix] = float(np.clip((x2 - cx_cell) / W, 0.0, 1.0))
-            reg[3, iy, ix] = float(np.clip((y2 - cy_cell) / H, 0.0, 1.0))
-            two_theta = 2.0 * float(theta)
-            reg[4, iy, ix] = math.sin(two_theta)
-            reg[5, iy, ix] = math.cos(two_theta)
+            reg[0, iy, ix] = float(np.clip(cx_g - ix, 0.0, 1.0))
+            reg[1, iy, ix] = float(np.clip(cy_g - iy, 0.0, 1.0))
+            reg[2, iy, ix] = float(np.clip(bw / W, 0.0, 1.0))
+            reg[3, iy, ix] = float(np.clip(bh / H, 0.0, 1.0))
+            theta_wrapped = float(theta) % math.pi
+            reg[4, iy, ix] = float(np.clip(theta_wrapped / math.pi, 0.0, 0.99999))
             pos[iy, ix] = 1.0
             if max(bw, bh) / max(min(bw, bh), 1e-6) >= aspect_round_thresh:
                 ang_mask[iy, ix] = 1.0

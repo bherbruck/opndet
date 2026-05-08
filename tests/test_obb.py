@@ -351,7 +351,9 @@ def test_obb_heatmap_target_is_circular():
 # ---- 4. OBB loss differentiability ----
 
 
-def test_obb_loss_grads_to_angle_channels():
+def test_obb_loss_grads_to_angle_channel():
+    """ProbIoU loss should produce non-zero gradient on ALL six output channels
+    (obj's heatmap loss + reg's ProbIoU on cx/cy/w/h/θ)."""
     from opndet.config import ModelConfig
     from opndet.encode import encode_targets_obb
     from opndet.loss import OpndetBboxLoss
@@ -359,43 +361,38 @@ def test_obb_loss_grads_to_angle_channels():
     cfg = ModelConfig()
     obbs = np.array([[200.0, 150.0, 100.0, 40.0, math.radians(30)]], dtype=np.float32)
     tgt = encode_targets_obb(obbs, cfg)
-    tgt = {k: v.unsqueeze(0) for k, v in tgt.items()}  # batch dim
+    tgt = {k: v.unsqueeze(0) for k, v in tgt.items()}
 
     Hp, Wp = cfg.img_h // cfg.stride, cfg.img_w // cfg.stride
-    raw = torch.zeros(1, 7, Hp, Wp, requires_grad=True)
+    # 6-ch raw: obj + (cx_off, cy_off, w_norm, h_norm, θ_norm).
+    raw = torch.zeros(1, 6, Hp, Wp, requires_grad=True)
     loss_fn = OpndetBboxLoss(wh_loss="obb", img_h=cfg.img_h, img_w=cfg.img_w, stride=cfg.stride)
     out = loss_fn(raw, tgt)
     out["loss"].backward()
     grad = raw.grad
-    # angle channels should have non-zero gradient at the positive cell
-    assert grad[:, 5:7].abs().sum() > 0, "angle channels got no gradient"
-    # ltrb channels also non-zero
+    # Angle channel (idx 5) should have non-zero gradient at the positive cell.
+    assert grad[:, 5:6].abs().sum() > 0, "angle channel got no gradient"
+    # Reg (cx,cy,w,h) also non-zero
     assert grad[:, 1:5].abs().sum() > 0
 
 
-def test_obb_loss_skips_round_angle_supervision():
-    """For round objects (angle_mask=0) the angle term is excluded — so
-    perturbing only the angle channels at round-only positives leaves loss
-    angle-component zero."""
-    from opndet.config import ModelConfig
-    from opndet.loss import OpndetBboxLoss
+def test_probiou_self_match_zero_loss():
+    """ProbIoU loss should be ~0 when pred == GT (perfect overlap → IoU≈1)."""
+    from opndet.loss import probiou_loss
 
-    cfg = ModelConfig()
-    Hp, Wp = cfg.img_h // cfg.stride, cfg.img_w // cfg.stride
-    # Manually build a tgt where pos=1 but angle_mask=0 at one cell
-    tgt = {
-        "hm": torch.zeros(1, 1, Hp, Wp),
-        "obb": torch.zeros(1, 6, Hp, Wp),
-        "pos": torch.zeros(1, 1, Hp, Wp),
-        "angle_mask": torch.zeros(1, 1, Hp, Wp),
-    }
-    tgt["pos"][0, 0, 10, 20] = 1.0
-    tgt["obb"][0, 0:4, 10, 20] = 0.05
-    # Note: angle_mask stays 0 so angle term contributes nothing.
-    raw = torch.zeros(1, 7, Hp, Wp, requires_grad=True)
-    loss_fn = OpndetBboxLoss(wh_loss="obb", img_h=cfg.img_h, img_w=cfg.img_w, stride=cfg.stride)
-    out = loss_fn(raw, tgt)
-    assert out["l_angle"].item() == 0.0
+    box = torch.tensor([[200.0, 150.0, 100.0, 40.0, math.radians(30)]])
+    loss = probiou_loss(box, box.clone())
+    assert loss.item() < 1e-3, f"self-match loss should be ~0, got {loss.item()}"
+
+
+def test_probiou_orthogonal_high_loss():
+    """ProbIoU loss should be high when boxes have very different orientations."""
+    from opndet.loss import probiou_loss
+
+    pred = torch.tensor([[200.0, 150.0, 100.0, 40.0, 0.0]])
+    gt   = torch.tensor([[200.0, 150.0, 100.0, 40.0, math.pi / 2]])
+    loss = probiou_loss(pred, gt)
+    assert loss.item() > 0.3, f"orthogonal-orient loss should be substantial, got {loss.item()}"
 
 
 # ---- 5. -pro presets build & export at opset 13 (7-channel) ----
@@ -412,10 +409,9 @@ def test_pro_preset_builds_obb(preset: str):
     with torch.no_grad():
         y = m(x)
     out = y["output"]
-    assert out.shape == (1, 7, h // 4, w // 4), f"{preset}: bad shape {out.shape}"
-    # ltrb in [0, 1] (post-Sigmoid), angle in [-1, 1] (post-Tanh).
-    assert (out[:, 1:5] >= 0).all() and (out[:, 1:5] <= 1).all()
-    assert (out[:, 5:7] >= -1).all() and (out[:, 5:7] <= 1).all()
+    assert out.shape == (1, 6, h // 4, w // 4), f"{preset}: bad shape {out.shape}"
+    # All reg channels are sigmoid → [0, 1] (cx_off, cy_off, w_norm, h_norm, θ_norm).
+    assert (out[:, 1:6] >= 0).all() and (out[:, 1:6] <= 1).all()
 
 
 @pytest.mark.parametrize("preset", ALL_OBB_PRESETS)
@@ -435,13 +431,13 @@ def test_pro_preset_obb_exports_opset13(preset: str):
         # Phase 2: server-tier presets may use MatMul / Softmax via C2PSA.
         forbidden = ops - allowed_ops_for_tier(m.tier)
         assert not forbidden, f"{preset} (tier={m.tier}) forbidden ops: {forbidden}"
-        assert "Tanh" in ops, f"{preset} expected Tanh in graph"
+        assert "Sigmoid" in ops, f"{preset} expected Sigmoid in graph"
 
         with torch.no_grad():
             y_pt = m(x)["output"].numpy()
         sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
         y_ort = sess.run(None, {"image": x.numpy()})[0]
-        assert y_pt.shape == y_ort.shape == (1, 7, h // 4, w // 4)
+        assert y_pt.shape == y_ort.shape == (1, 6, h // 4, w // 4)
         diff = float(np.abs(y_pt - y_ort).max())
         assert diff < 1e-3, f"{preset} parity diff {diff:.2e}"
 

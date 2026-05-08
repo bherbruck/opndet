@@ -1,7 +1,8 @@
-# opndet-bbox-s-obb: small OBB. Same arch as bbox-s, head emits 7-ch OBB output.
-# Stride 4, output [1, 7, 96, 128] = (obj_peak, l, t, r, b, sin2θ, cos2θ).
+# opndet-bbox-s-obb: small OBB. Same arch as bbox-s, head emits 6-ch OBB output.
+# Stride 4, output [1, 6, 96, 128] = (obj_peak, cx_off, cy_off, w_norm, h_norm, θ_norm).
+# Direct OBB (YOLOv8-OBB style, ProbIoU loss). NO enclosing AABB.
 # Tier: edge. opset-13 + Myriad-VPU safe.
-# REQUIRES OBB labels (`opndet sam-obb`) AND curriculum w_wh:0.1 from ep 0.
+# REQUIRES OBB labels (`opndet sam-obb`).
 
 model:
   tier: edge
@@ -31,15 +32,15 @@ model:
     - {name: nout,  from: add1,        module: ConvBnAct,       args: {in_ch: 64, out_ch: 64, k: 3}}
 
     - {name: trunk, from: nout,  module: ConvBnAct, args: {in_ch: 64, out_ch: 64, k: 3}}
-    - {name: raw,   from: trunk, module: Conv,      args: {in_ch: 64, out_ch: 7,  k: 1, bias_init: [-2.19, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}}
+    - {name: raw,   from: trunk, module: Conv,      args: {in_ch: 64, out_ch: 6,  k: 1, bias_init: [-2.19, 0.0, 0.0, 0.0, 0.0, 0.0]}}
 
-    - {name: obj_r,  from: raw,   module: SplitChannels,       args: {start: 0, end: 1}}
-    - {name: obj,    from: obj_r, module: SigmoidPeakSuppress, args: {k: 5, eps: 5.0e-3}}
-    - {name: ltrb_r, from: raw,   module: SplitChannels,       args: {start: 1, end: 5}}
-    - {name: ltrb,   from: ltrb_r, module: Sigmoid,            args: {}}
-    - {name: ang_r,  from: raw,   module: SplitChannels,       args: {start: 5, end: 7}}
-    - {name: angle,  from: ang_r, module: Tanh,                args: {}}
-    - {name: out,    from: [obj, ltrb, angle], module: Concat, args: {dim: 1}}
+    - {name: obj_r,   from: raw,    module: SplitChannels,       args: {start: 0, end: 1}}
+    - {name: obj,     from: obj_r,  module: SigmoidPeakSuppress, args: {k: 5, eps: 5.0e-3}}
+    - {name: cxywh_r, from: raw,    module: SplitChannels,       args: {start: 1, end: 5}}
+    - {name: cxywh,   from: cxywh_r, module: Sigmoid,            args: {}}
+    - {name: ang_r,   from: raw,    module: SplitChannels,       args: {start: 5, end: 6}}
+    - {name: angle,   from: ang_r,  module: Sigmoid,             args: {}}
+    - {name: out,     from: [obj, cxywh, angle], module: Concat, args: {dim: 1}}
 
   outputs:
     - {name: output, from: out, activation: none}

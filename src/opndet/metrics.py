@@ -312,24 +312,10 @@ def angle_err_rad(t1: float, t2: float) -> float:
     return min(d, math.pi - d)
 
 
-def aabb_theta_to_rotated_wh(aw: float, ah: float, theta_rad: float) -> tuple[float, float]:
-    """Invert (enclosing AABB w/h, θ) → (rotated rect w/h). Encoder stores AABB
-    bounding the OBB; metrics need the rotated rect dims for cv2 polygon IoU.
-    Singular at |cos 2θ|≈0 (θ≈±45°) — fall back to AABB dims (visually a square)."""
-    c = abs(math.cos(theta_rad))
-    s = abs(math.sin(theta_rad))
-    det = c * c - s * s
-    if abs(det) > 1e-3:
-        w = (c * float(aw) - s * float(ah)) / det
-        h = (-s * float(aw) + c * float(ah)) / det
-        return max(0.0, w), max(0.0, h)
-    return float(aw), float(ah)
-
-
 def obb_summary(pred_obbs: np.ndarray, gt_obbs: np.ndarray,
                 iou_thresh: float = 0.3) -> dict:
-    """Per-image OBB diagnostics. pred/gt: [N, 5] = (cx, cy, w_aabb, h_aabb, theta_rad)
-    matching the encode/decode contract (cx/cy/w/h are the enclosing AABB).
+    """Per-image OBB diagnostics. pred/gt: [N, 5] = (cx, cy, w, h, θ_rad)
+    where w, h are the rotated rectangle's OWN dims (not enclosing AABB).
 
     Hungarian-matches preds→GTs minimizing 1 - rotated_iou; matches below
     iou_thresh count as unmatched. Returns rotated_iou + angle_err on matched
@@ -345,12 +331,10 @@ def obb_summary(pred_obbs: np.ndarray, gt_obbs: np.ndarray,
         return out
     iou_mat = np.zeros((n_p, n_g), dtype=np.float64)
     for i in range(n_p):
-        wp, hp = aabb_theta_to_rotated_wh(pred_obbs[i, 2], pred_obbs[i, 3], pred_obbs[i, 4])
         for j in range(n_g):
-            wg, hg = aabb_theta_to_rotated_wh(gt_obbs[j, 2], gt_obbs[j, 3], gt_obbs[j, 4])
             iou_mat[i, j] = rotated_iou(
-                pred_obbs[i, 0], pred_obbs[i, 1], wp, hp, pred_obbs[i, 4],
-                gt_obbs[j, 0], gt_obbs[j, 1], wg, hg, gt_obbs[j, 4],
+                pred_obbs[i, 0], pred_obbs[i, 1], pred_obbs[i, 2], pred_obbs[i, 3], pred_obbs[i, 4],
+                gt_obbs[j, 0], gt_obbs[j, 1], gt_obbs[j, 2], gt_obbs[j, 3], gt_obbs[j, 4],
             )
     cost = 1.0 - iou_mat
     rows, cols = linear_sum_assignment(cost)

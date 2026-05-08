@@ -153,10 +153,10 @@ def test_pro_preset_builds_and_forwards(preset: str):
         y = m(x)
     assert "output" in y
     out = y["output"]
-    # Phase 4b: OBB head ships 7 channels (obj, l, t, r, b, sin2θ, cos2θ).
-    assert out.shape == (1, 7, h // 4, w // 4), f"{preset}: bad shape {out.shape}"
-    # ltrb channels are sigmoid'd → [0, 1].
-    assert (out[:, 1:5] >= 0).all() and (out[:, 1:5] <= 1).all()
+    # Direct OBB head (cxywhθ + ProbIoU): 6 channels (obj, cx_off, cy_off, w_norm, h_norm, θ_norm).
+    assert out.shape == (1, 6, h // 4, w // 4), f"{preset}: bad shape {out.shape}"
+    # All reg channels are sigmoid → [0, 1].
+    assert (out[:, 1:6] >= 0).all() and (out[:, 1:6] <= 1).all()
 
 
 @pytest.mark.parametrize("preset", PRO_PRESETS)

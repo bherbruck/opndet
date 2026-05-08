@@ -76,19 +76,19 @@ model:
 
     - {name: reg1, from: nout, module: ConvBnAct, args: {in_ch: 256, out_ch: 256, k: 3}}
     - {name: reg2, from: reg1, module: ConvBnAct, args: {in_ch: 256, out_ch: 256, k: 3}}
-    - {name: reg,  from: reg2, module: Conv,      args: {in_ch: 256, out_ch: 6, k: 1}}
+    - {name: reg,  from: reg2, module: Conv,      args: {in_ch: 256, out_ch: 5, k: 1}}
 
     - {name: raw,  from: [cls, reg], module: Concat, args: {dim: 1}}
 
     - {name: obj_r, from: raw,   module: SplitChannels,       args: {start: 0, end: 1}}
     - {name: soft_obj, from: obj_r, module: Sigmoid,          args: {}}
 
-    - {name: obj,    from: obj_r, module: SigmoidPeakSuppress, args: {k: 7, eps: 5.0e-3}}
-    - {name: ltrb_r, from: raw,   module: SplitChannels,       args: {start: 1, end: 5}}
-    - {name: ltrb,   from: ltrb_r, module: Sigmoid,            args: {}}
-    - {name: ang_r,  from: raw,   module: SplitChannels,       args: {start: 5, end: 7}}
-    - {name: angle,  from: ang_r, module: Tanh,                args: {}}
-    - {name: out,    from: [obj, ltrb, angle], module: Concat, args: {dim: 1}}
+    - {name: obj,     from: obj_r, module: SigmoidPeakSuppress, args: {k: 7, eps: 5.0e-3}}
+    - {name: cxywh_r, from: raw,    module: SplitChannels,      args: {start: 1, end: 5}}
+    - {name: cxywh,   from: cxywh_r, module: Sigmoid,           args: {}}
+    - {name: ang_r,   from: raw,    module: SplitChannels,      args: {start: 5, end: 6}}
+    - {name: angle,   from: ang_r,  module: Sigmoid,            args: {}}
+    - {name: out,     from: [obj, cxywh, angle], module: Concat, args: {dim: 1}}
 
   outputs:
     - {name: output, from: out, activation: none}

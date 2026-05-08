@@ -17,9 +17,9 @@ class Detection:
 
 @dataclass
 class OBBDetection:
-    """Oriented bounding box. (cx, cy, w, h) define the enclosing AABB the OBB
-    is inscribed in (matches the encode-side reconstruction); theta is the
-    rotation in radians applied around the AABB center to recover the OBB.
+    """Oriented bounding box. (cx, cy, w, h, theta) — direct rotated rect:
+    cx/cy is the OBB's centroid in pixels, w/h are its OWN dims (NOT the
+    enclosing AABB), theta is the rotation of the major axis in radians.
 
     `to_corners()` returns the 4 rotated corners (px) for visualization.
     """
@@ -31,28 +31,10 @@ class OBBDetection:
     score: float
 
     def to_corners(self) -> np.ndarray:
-        """Reconstruct OBB corners from the predicted (AABB, θ).
-
-        The encoder stores the OBB's enclosing AABB plus θ; we invert
-        (aw, ah, θ) → (w_obb, h_obb) via the 2x2 system
-            aw = w*|cos θ| + h*|sin θ|
-            ah = w*|sin θ| + h*|cos θ|
-        Singular when |cos 2θ| ≈ 0 (θ ≈ ±45°); in that fallback we draw the
-        AABB itself rotated by θ — visually fine, just not metrically tight.
-        """
-        c = abs(math.cos(self.theta))
-        s = abs(math.sin(self.theta))
-        det = c * c - s * s
-        if abs(det) > 1e-3:
-            w_obb = ( c * self.w - s * self.h) / det
-            h_obb = (-s * self.w + c * self.h) / det
-            w_obb = max(0.0, w_obb)
-            h_obb = max(0.0, h_obb)
-        else:
-            w_obb, h_obb = self.w, self.h
+        """Build OBB corners directly from (cx, cy, w, h, θ)."""
         cos_t = math.cos(self.theta)
         sin_t = math.sin(self.theta)
-        half_w, half_h = w_obb * 0.5, h_obb * 0.5
+        half_w, half_h = self.w * 0.5, self.h * 0.5
         local = np.array([
             [-half_w, -half_h],
             [ half_w, -half_h],
@@ -102,15 +84,37 @@ def decode_batch(out: np.ndarray, img_h: int, img_w: int, stride: int, threshold
     so the bytes look identical. We dispatch via decode() (cxy/wh) by default for C=5 — this matches
     historical behavior. -pro callers should use decode_ltrb_batch / decode_obb_batch directly when
     they need the correct semantics. eval/calibrate route through here regardless of head variant;
-    for OBB-head models we extract the enclosing AABB and ignore the rotation channels.
+    for OBB-head models (6-ch direct cxywhθ) we derive a non-rotated bounding rect from
+    (cx, cy, w, h) just for AABB-shaped Detection rows used by score-vs-IoU eval paths.
     """
     assert out.ndim == 4
     C = out.shape[1]
-    if C == 7:
-        # OBB head: build AABB-only Detection list from ltrb subset; drop angle.
-        ltrb_only = out[:, :5, :, :]
-        return [decode_ltrb(ltrb_only[i], img_h, img_w, stride, threshold) for i in range(out.shape[0])]
-    assert C == 5, f"decode_batch expects 5 or 7 output channels; got {C}"
+    if C == 6:
+        # 6-ch OBB head (cxywhθ direct). Build axis-aligned Detection from
+        # (cx, cy, w, h) only — the angle channel is read separately by
+        # OBB-aware eval paths via decode_obb_batch.
+        out_dets: list[list[Detection]] = []
+        for b in range(out.shape[0]):
+            obj, cxo, cyo, wn, hn, _tn = out[b]
+            ys, xs = np.nonzero(obj > threshold)
+            if len(ys) == 0:
+                out_dets.append([])
+                continue
+            scores = obj[ys, xs]
+            cx = (xs + cxo[ys, xs]) * stride
+            cy = (ys + cyo[ys, xs]) * stride
+            w  = wn[ys, xs] * img_w
+            h  = hn[ys, xs] * img_h
+            x1 = cx - w * 0.5
+            y1 = cy - h * 0.5
+            x2 = cx + w * 0.5
+            y2 = cy + h * 0.5
+            out_dets.append([
+                Detection(float(a), float(b_), float(c), float(d), float(s))
+                for a, b_, c, d, s in zip(x1, y1, x2, y2, scores)
+            ])
+        return out_dets
+    assert C == 5, f"decode_batch expects 5 or 6 output channels; got {C}"
     return [decode(out[i], img_h, img_w, stride, threshold) for i in range(out.shape[0])]
 
 
@@ -155,34 +159,27 @@ def decode_ltrb_batch(out: np.ndarray, img_h: int, img_w: int, stride: int, thre
 
 
 def decode_obb(out: np.ndarray, img_h: int, img_w: int, stride: int, threshold: float = 0.3) -> list[OBBDetection]:
-    """Decode `-pro` OBB output tensor. No NMS.
+    """Decode 6-ch OBB output. Direct (cx, cy, w, h, θ). No AABB.
 
-    out: [7, H', W'] post-sigmoid+tanh, peak-suppressed.
-        channels: [obj, l, t, r, b, sin2θ, cos2θ]. l/t/r/b in [0,1] image-norm
-        distances from cell center to enclosing-AABB edges; sin2θ/cos2θ in
-        [-1, 1] (post-Tanh).
-
-    Returns list of OBBDetection. (cx, cy, w, h) define the AABB; theta is
-    derived from 0.5 * atan2(sin2θ, cos2θ), wrapped to [0, π).
+    out: [6, H', W'] post-sigmoid + peak-suppressed obj.
+        channels: [obj, cx_offset, cy_offset, w_norm, h_norm, θ_norm]
+            cx_offset = (cx_px - ix*stride) / stride       in [0, 1]
+            cy_offset = (cy_px - iy*stride) / stride       in [0, 1]
+            w_norm    = w_obb / img_w                      in [0, 1]
+            h_norm    = h_obb / img_h                      in [0, 1]
+            θ_norm    = θ / π                              in [0, 1)
     """
-    assert out.ndim == 3 and out.shape[0] == 7
-    obj, l, t, r, b, s2, c2 = out
+    assert out.ndim == 3 and out.shape[0] == 6
+    obj, cxo, cyo, wn, hn, tn = out
     ys, xs = np.nonzero(obj > threshold)
     if len(ys) == 0:
         return []
     scores = obj[ys, xs]
-    cx_px = (xs + 0.5) * stride
-    cy_px = (ys + 0.5) * stride
-    x1 = cx_px - l[ys, xs] * img_w
-    y1 = cy_px - t[ys, xs] * img_h
-    x2 = cx_px + r[ys, xs] * img_w
-    y2 = cy_px + b[ys, xs] * img_h
-    cx = (x1 + x2) * 0.5
-    cy = (y1 + y2) * 0.5
-    w = np.maximum(x2 - x1, 0.0)
-    h = np.maximum(y2 - y1, 0.0)
-    theta = 0.5 * np.arctan2(s2[ys, xs], c2[ys, xs])
-    theta = np.mod(theta, math.pi)
+    cx = (xs + cxo[ys, xs]) * stride
+    cy = (ys + cyo[ys, xs]) * stride
+    w  = wn[ys, xs] * img_w
+    h  = hn[ys, xs] * img_h
+    theta = tn[ys, xs] * math.pi  # already in [0, π) by construction
     return [
         OBBDetection(float(cx_), float(cy_), float(w_), float(h_), float(th), float(s))
         for cx_, cy_, w_, h_, th, s in zip(cx, cy, w, h, theta, scores)
@@ -190,18 +187,16 @@ def decode_obb(out: np.ndarray, img_h: int, img_w: int, stride: int, threshold: 
 
 
 def decode_obb_batch(out: np.ndarray, img_h: int, img_w: int, stride: int, threshold: float = 0.3) -> list[list[OBBDetection]]:
-    """out: [B, 7, H', W']."""
-    assert out.ndim == 4 and out.shape[1] == 7
+    """out: [B, 6, H', W']."""
+    assert out.ndim == 4 and out.shape[1] == 6
     return [decode_obb(out[i], img_h, img_w, stride, threshold) for i in range(out.shape[0])]
 
 
 def gt_obbs_from_targets(pos: np.ndarray, obb: np.ndarray, img_h: int, img_w: int, stride: int) -> list[np.ndarray]:
-    """Reconstruct per-image GT OBBs from encoded targets.
+    """Reconstruct per-image GT OBBs from encoded targets (5-ch direct).
         pos: [B, 1, H', W']  (or [B, H', W'])  binary GT-cell mask
-        obb: [B, 6, H', W']  (l, t, r, b, sin2θ, cos2θ) at GT cells
-    Returns list[B] of [N, 5] arrays = (cx, cy, w_aabb, h_aabb, theta_rad).
-    Mirrors `decode_obb`'s arithmetic — caller can compare against pred OBBs
-    via metrics.obb_summary on the same (cx, cy, w_aabb, h_aabb, θ) contract.
+        obb: [B, 5, H', W']  (cx_off, cy_off, w_norm, h_norm, θ_norm) at GT cells
+    Returns list[B] of [N, 5] arrays = (cx_px, cy_px, w_obb, h_obb, θ_rad).
     """
     if pos.ndim == 4:
         pos = pos[:, 0]
@@ -211,22 +206,15 @@ def gt_obbs_from_targets(pos: np.ndarray, obb: np.ndarray, img_h: int, img_w: in
         if len(ys) == 0:
             out.append(np.zeros((0, 5), dtype=np.float32))
             continue
-        l = obb[b, 0, ys, xs]
-        t = obb[b, 1, ys, xs]
-        r = obb[b, 2, ys, xs]
-        bot = obb[b, 3, ys, xs]
-        s2 = obb[b, 4, ys, xs]
-        c2 = obb[b, 5, ys, xs]
-        cx_pix = (xs + 0.5) * stride
-        cy_pix = (ys + 0.5) * stride
-        x1 = cx_pix - l * img_w
-        y1 = cy_pix - t * img_h
-        x2 = cx_pix + r * img_w
-        y2 = cy_pix + bot * img_h
-        cx = (x1 + x2) * 0.5
-        cy = (y1 + y2) * 0.5
-        aw = np.maximum(x2 - x1, 0.0)
-        ah = np.maximum(y2 - y1, 0.0)
-        theta = np.mod(0.5 * np.arctan2(s2, c2), math.pi)
-        out.append(np.stack([cx, cy, aw, ah, theta], axis=-1).astype(np.float32))
+        cxo = obb[b, 0, ys, xs]
+        cyo = obb[b, 1, ys, xs]
+        wn  = obb[b, 2, ys, xs]
+        hn  = obb[b, 3, ys, xs]
+        tn  = obb[b, 4, ys, xs]
+        cx = (xs + cxo) * stride
+        cy = (ys + cyo) * stride
+        w  = wn * img_w
+        h  = hn * img_h
+        theta = tn * math.pi
+        out.append(np.stack([cx, cy, w, h, theta], axis=-1).astype(np.float32))
     return out

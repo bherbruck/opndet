@@ -112,6 +112,58 @@ def _nwd(p: torch.Tensor, g: torch.Tensor, c: float = 12.8, eps: float = 1e-7) -
     return 1.0 - torch.exp(-torch.sqrt(w2 + eps) / c)
 
 
+def probiou_loss(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """ProbIoU rotated-box loss (Bhattacharyya distance between 2D Gaussians).
+
+    pred, gt: [..., 5] = (cx, cy, w, h, theta_rad), all in same units (pixels).
+    Returns 1 - ProbIoU per element, shape [...].
+
+    Each rotated rectangle is approximated by a 2D Gaussian with covariance
+    Σ = R · diag(w²/12, h²/12) · Rᵀ. The variance w²/12 follows from a uniform
+    distribution along each axis (rectangle ≈ uniform 2D distribution).
+
+    The Bhattacharyya distance between the two Gaussians has a closed-form
+    expression in terms of the means and covariances. Hellinger ↔ ProbIoU.
+
+    Adapted from YOLOv8-OBB's reference implementation. Numerical safeguards:
+    eps in denominators, clamp on log argument, clamp on Bhattacharyya before exp.
+    """
+    px, py, pw, ph, pt = pred.unbind(-1)
+    gx, gy, gw, gh, gt_t = gt.unbind(-1)
+
+    cos_pt, sin_pt = torch.cos(pt), torch.sin(pt)
+    cos_gt, sin_gt = torch.cos(gt_t), torch.sin(gt_t)
+
+    pw2_12, ph2_12 = pw * pw / 12.0, ph * ph / 12.0
+    gw2_12, gh2_12 = gw * gw / 12.0, gh * gh / 12.0
+
+    # Σ = [[a, c], [c, b]] for each box
+    a1 = pw2_12 * cos_pt * cos_pt + ph2_12 * sin_pt * sin_pt
+    b1 = pw2_12 * sin_pt * sin_pt + ph2_12 * cos_pt * cos_pt
+    c1 = (pw2_12 - ph2_12) * cos_pt * sin_pt
+    a2 = gw2_12 * cos_gt * cos_gt + gh2_12 * sin_gt * sin_gt
+    b2 = gw2_12 * sin_gt * sin_gt + gh2_12 * cos_gt * cos_gt
+    c2 = (gw2_12 - gh2_12) * cos_gt * sin_gt
+
+    A = a1 + a2
+    B = b1 + b2
+    C = c1 + c2
+    detM = (A * B - C * C).clamp(min=eps)
+
+    dx = px - gx
+    dy = py - gy
+    t1 = (A * dy * dy + B * dx * dx - 2.0 * C * dx * dy) / detM / 4.0
+
+    det1 = (a1 * b1 - c1 * c1).clamp(min=eps)
+    det2 = (a2 * b2 - c2 * c2).clamp(min=eps)
+    t2 = 0.5 * torch.log((detM / (4.0 * torch.sqrt(det1 * det2) + eps)).clamp(min=eps))
+
+    bd = (t1 + t2).clamp(min=eps, max=100.0)
+    hd = torch.sqrt((1.0 - torch.exp(-bd)).clamp(min=0.0, max=1.0) + eps)
+    iou = 1.0 - hd  # ProbIoU
+    return 1.0 - iou  # loss
+
+
 def _iou_only(p: torch.Tensor, g: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """Pairwise per-cell IoU. p,g: [B,4,H,W] xyxy. Returns [B,1,H,W] in [0,1]."""
     px1, py1, px2, py2 = p[:, 0:1], p[:, 1:2], p[:, 2:3], p[:, 3:4]
@@ -262,33 +314,47 @@ class OpndetBboxLoss(nn.Module):
         pos = tgt["pos"]
         n_pos = pos.sum().clamp(min=1.0)
 
-        # obb mode: raw[:, 1:7] is (l, t, r, b, sin2θ, cos2θ). Reuse ltrb
-        # AABB DIoU loss on the first 4 channels; add angle cosine distance
-        # on the trig channels, masked by `angle_mask` (non-round GTs only).
+        # obb mode: raw[:, 1:6] is (cx_off, cy_off, w_norm, h_norm, θ_norm) ALL post-sigmoid.
+        # ProbIoU loss: treat each rotated box as a 2D Gaussian. Loss is differentiable
+        # everywhere, wrap-continuous (handles π-symmetry naturally), and directly
+        # correlates with rotated IoU. NO enclosing-AABB anywhere — pure (cx, cy, w, h, θ).
         if self.wh_loss == "obb":
-            ltrb_logit = raw[:, 1:5]
-            ltrb_pred = torch.sigmoid(ltrb_logit)
-            angle_pred = torch.tanh(raw[:, 5:7])
-            pred_xyxy = _decode_pred_ltrb_xyxy(ltrb_pred, self.img_h, self.img_w, self.stride)
-            gt_xyxy = _decode_gt_ltrb_xyxy(tgt["obb"][:, 0:4], self.img_h, self.img_w, self.stride)
-            l_box = (_bbox_iou(pred_xyxy, gt_xyxy, mode="diou") * pos).sum() / n_pos
-            ang_mask = tgt.get("angle_mask")
-            if ang_mask is None:
-                ang_mask = pos
-            n_ang = ang_mask.sum().clamp(min=1.0)
-            angle_gt = tgt["obb"][:, 4:6]
-            cos_dist = 1.0 - (angle_pred * angle_gt).sum(dim=1, keepdim=True)
-            l_angle = (cos_dist * ang_mask).sum() / n_ang
+            B, _, Hp, Wp = raw.shape
+            reg_logit = raw[:, 1:6]
+            reg_pred = torch.sigmoid(reg_logit)  # cx_off, cy_off, w_norm, h_norm, θ_norm
+            stride = self.stride
+            # Build [B, H', W'] grid of cell origins to convert offsets to pixels.
+            ys = torch.arange(Hp, device=raw.device, dtype=raw.dtype).view(1, Hp, 1)
+            xs = torch.arange(Wp, device=raw.device, dtype=raw.dtype).view(1, 1, Wp)
+            # Pixel coords for pred: (cell_idx + offset) * stride
+            pred_cx = (xs + reg_pred[:, 0]) * stride
+            pred_cy = (ys + reg_pred[:, 1]) * stride
+            pred_w  = reg_pred[:, 2] * self.img_w
+            pred_h  = reg_pred[:, 3] * self.img_h
+            pred_th = reg_pred[:, 4] * math.pi
+            gt = tgt["obb"]  # [B, 5, H', W']  (cx_off, cy_off, w_norm, h_norm, θ_norm)
+            gt_cx = (xs + gt[:, 0]) * stride
+            gt_cy = (ys + gt[:, 1]) * stride
+            gt_w  = gt[:, 2] * self.img_w
+            gt_h  = gt[:, 3] * self.img_h
+            gt_th = gt[:, 4] * math.pi
+            pred_box = torch.stack([pred_cx, pred_cy, pred_w, pred_h, pred_th], dim=-1)
+            gt_box   = torch.stack([gt_cx,   gt_cy,   gt_w,   gt_h,   gt_th  ], dim=-1)
+            # Per-cell ProbIoU loss; mask to GT-positive cells.
+            iou_loss = probiou_loss(pred_box, gt_box)  # [B, H', W']
+            pos2d = pos.squeeze(1) if pos.dim() == 4 else pos
+            l_box = (iou_loss * pos2d).sum() / n_pos
             if self.cls_loss == "vfl":
-                iou_target = _iou_only(pred_xyxy, gt_xyxy) * pos
-                l_hm = varifocal_loss(hm_logit, pos, iou_target, alpha=self.vfl_alpha, gamma=self.vfl_gamma)
+                # VFL needs IoU as cls target — use 1 - probiou loss = ProbIoU (∈ [0, 1]).
+                iou_target = (1.0 - iou_loss).detach() * pos2d
+                l_hm = varifocal_loss(hm_logit, pos, iou_target.unsqueeze(1), alpha=self.vfl_alpha, gamma=self.vfl_gamma)
             else:
                 l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
-            total = self.w_hm * l_hm + self.w_wh * (l_box + l_angle)
+            total = self.w_hm * l_hm + self.w_wh * l_box
             out = {"loss": total, "l_hm": l_hm.detach(),
                    "l_cxy": l_box.detach() * 0.0,
                    "l_wh": l_box.detach(),
-                   "l_angle": l_angle.detach()}
+                   "l_angle": l_box.detach() * 0.0}  # angle is folded into ProbIoU
             if self.count_w > 0 or self.convex_w > 0:
                 hm_sig = torch.sigmoid(hm_logit)
             if self.count_w > 0:
