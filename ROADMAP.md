@@ -30,11 +30,26 @@ A focused round of training-stability + interpretability work landed. Each item 
 - ✅ `opndet export --diagnostic` flag — exposes all named-layer outputs in the ONNX. Production graph unchanged when flag absent.
 - ✅ Webui explain mode (`ee4887a`) — `docs/index.html` adds layer slider + click-to-attribute via occlusion (no autograd in ORT Web). Loads diagnostic ONNX.
 
-**Roadmap additions:**
+**Roadmap additions + completions:**
 - §1.6 OBB cross-reference + §2.1 elevated to HIGH PRIORITY (SAM-driven labels solved, just need opndet-side wiring; user has notebook code).
 - §1.7 NEW + HIGH PRIORITY — Grad-CAM-driven hard-negative mining: mine FPs from val, cluster their attribution patches, inject as labeled-bg augmentation. Targets the residual ~1-2% ghost rate that architectural fixes are exhausted on.
 
-**The current kitchen-sink yaml** (`scratch/train_bbox_x.yaml`) bundles: `cls_loss: focal` (vfl had cold-start zero-IoU collapse), `peak_kernel=7` (via bbox-x preset), DIoU box loss, bf16 AMP, curriculum 4-stage (centers → boxes → convexity → repulsion → count), trajectory-patience with curriculum-aware floor, auto threshold. Reference for the converged-good training recipe; copy into scratch and edit paths.
+**§1.8 `bbox-*-pro` flagship variants — ALL 6 PHASES SHIPPED:**
+
+The kitchen-sink-of-everything per size point. 7 new presets (`bbox-{f,p,n,s,m,l,x}-pro`) each combining opndet's centerness/no-NMS/emergent-segmentation identity with YOLO-family bedrock + OBB output + hard-negative mining + opt-in MuSGD optimizer. Edge tier (`f/p/n/s`) maintains opset-13/Myriad-VPU compat; server tier (`m/l/x`) adds attention + SiLU + half-pixel resize. Tier-aware op-allowlist enforced at export time.
+
+- ✅ Phase 0 (`3858871`): tier doc + stubs + soft_obj opt-in
+- ✅ Phase 1 (`dc428e8`): SPPF primitive + PAFPN bottom-up neck + decoupled cls/reg head + ltrb regression
+- ✅ Phase 2 (`12f7adf`): server-tier ops — C2PSA position self-attention at p4/b4, SiLU activation, half_pixel bilinear resize, tier-aware allowlist
+- ✅ Phase 3 (`e7d0bde`): TAL-for-regression + STAL (size-adaptive top-k) + ProgLoss auto-balancing curriculum. cls supervision stays Gaussian heatmap (preserves emergent segmentation).
+- ✅ Phase 4a (`44b8ee1`): `opndet sam-obb` CLI — SAM2→YOLOv8-OBB preprocessing (one-shot per dataset, idempotent)
+- ✅ Phase 4b (`1372fd4`): OBB output contract `[1, 7, H/4, W/4]` = `(obj, l, t, r, b, sin2θ, cos2θ)`. Rotated elliptical Gaussian heatmap targets, OBB encode/decode/loss/viz.
+- ✅ Phase 5 (`bea6029`): `opndet mine-negatives` CLI + `hard_negative_pool` augmentation — Grad-CAM-driven mining with K-means clustering of phantom attribution patches.
+- ✅ Phase 6 (`77b2078`): MuSGD optimizer (Muon for hidden conv weights + AdamW for projections) — opt-in via `optimizer: musgd`. Server-tier-only; vision-domain wins are research-y, documented as such.
+
+Final param counts: `bbox-f-pro` 54K → `bbox-x-pro` 19.19M. All 7 -pro presets pass `verify_onnx` parity (ORT-vs-PT max abs diff < 1e-4) at opset 13. Edge-tier exports cleanly to Myriad opset; server-tier accepts the additional ops at the export-time tier check.
+
+**The current kitchen-sink yaml** (`scratch/train_bbox_x.yaml`, gitignored) bundles: `cls_loss: focal`, `peak_kernel=7`, DIoU box loss, bf16 AMP, curriculum 4-stage, trajectory-patience with curriculum-aware floor, auto threshold. Reference for the converged-good training recipe. The `-pro` lineage layers atop this with TAL/STAL assigner + ProgLoss curriculum + OBB output by default.
 
 ---
 
