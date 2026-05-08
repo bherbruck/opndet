@@ -234,12 +234,21 @@ def _cmd_sam_obb(args: argparse.Namespace) -> int:
         max_images=args.max_images,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        save_rejected=args.save_rejected,
     )
     print(f"processed={stats.n_images_processed} skipped={stats.n_images_skipped} "
           f"obj={stats.n_objects_processed} obb={stats.n_obb_extracted} "
           f"round={stats.n_aabb_fallback} drop={stats.n_invalid_dropped} "
           f"errors={len(stats.errors)} ({stats.duration_seconds}s)")
+    print(f"  drop breakdown: no_corners={stats.n_drop_no_corners} "
+          f"geometry={stats.n_drop_geometry} area={stats.n_drop_area} "
+          f"centroid={stats.n_drop_centroid}")
     print(f"manifest: {Path(args.out) / 'manifest.json'}")
+    rejected_dir = Path(args.out) / "_rejected"
+    if rejected_dir.exists():
+        n_saved = len(list(rejected_dir.glob("*.png")))
+        if n_saved > 0:
+            print(f"rejected previews: {n_saved} in {rejected_dir}")
     return 0
 
 
@@ -437,6 +446,10 @@ def main(argv: list[str] | None = None) -> int:
                           "drop to 4 if OOM on T4. Higher = better GPU utilization (default: 8)")
     pso.add_argument("--num-workers", type=int, default=8,
                      help="ThreadPoolExecutor workers for parallel disk reads during preload (default: 8)")
+    pso.add_argument("--save-rejected", type=int, default=16,
+                     help="Per-rule cap on rejected-OBB diagnostic previews saved to "
+                          "<out>/_rejected/ (default: 16; 0 to disable). Each preview is a "
+                          "3-panel image: AABB prompt | SAM mask | candidate OBB.")
     pso.set_defaults(func=_cmd_sam_obb)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")

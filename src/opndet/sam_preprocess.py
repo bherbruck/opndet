@@ -164,6 +164,11 @@ class ImageStats:
     n_obb: int = 0
     n_round_fallback: int = 0
     n_invalid: int = 0
+    # Per-rule drop breakdown (sums to n_invalid)
+    n_drop_geometry: int = 0      # is_valid_rectangle failed (cv2.fitEllipse junk)
+    n_drop_area: int = 0          # OBB area > max_area_frac × AABB area
+    n_drop_centroid: int = 0      # OBB centroid not inside AABB
+    n_drop_no_corners: int = 0    # mask_to_obb_corners returned None (no contour)
 
 
 @dataclass
@@ -174,6 +179,11 @@ class RunStats:
     n_obb_extracted: int = 0
     n_aabb_fallback: int = 0
     n_invalid_dropped: int = 0
+    # Per-rule drop breakdown (sums to n_invalid_dropped)
+    n_drop_geometry: int = 0
+    n_drop_area: int = 0
+    n_drop_centroid: int = 0
+    n_drop_no_corners: int = 0
     sam_model_used: str = ""
     timestamp: str = ""
     duration_seconds: float = 0.0
@@ -229,17 +239,20 @@ def process_image(img_path: Path, annotations: list[dict], predictor,
     lines: list[str] = []
     for i, mask in enumerate(masks):
         corners = mask_to_obb_corners(mask, fallback_bbox=boxes_xyxy[i])
-        if corners is None or not is_valid_rectangle(corners):
+        if corners is None:
+            stats.n_drop_no_corners += 1
             stats.n_invalid += 1
             continue
-        # Sanity: OBB area must not balloon beyond the AABB prompt's area
-        # (SAM2 sometimes escapes the box and grabs background).
+        if not is_valid_rectangle(corners):
+            stats.n_drop_geometry += 1
+            stats.n_invalid += 1
+            continue
         if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
+            stats.n_drop_area += 1
             stats.n_invalid += 1
             continue
-        # Sanity: OBB centroid inside AABB AND AABB center inside OBB.
-        # Catches mask-escape cases where the OBB drifts off its prompt.
         if not is_obb_self_consistent(corners, boxes_xyxy[i]):
+            stats.n_drop_centroid += 1
             stats.n_invalid += 1
             continue
         if _is_round_via_corners(corners):
@@ -247,6 +260,50 @@ def process_image(img_path: Path, annotations: list[dict], predictor,
         stats.n_obb += 1
         lines.append(corners_to_yolo_obb_line(corners, w, h, class_id=0))
     return lines, stats
+
+
+def _save_rejected_preview(img_rgb: np.ndarray, mask: np.ndarray | None,
+                           prompt_xyxy: np.ndarray, corners: np.ndarray | None,
+                           rule: str, out_path: Path) -> None:
+    """Save a 3-panel diagnostic image: AABB | mask overlay | candidate OBB.
+    Used to debug why an OBB was rejected.
+    """
+    h, w = img_rgb.shape[:2]
+    panel1 = img_rgb.copy()
+    if prompt_xyxy is not None:
+        x1, y1, x2, y2 = prompt_xyxy.astype(int)
+        cv2.rectangle(panel1, (int(x1), int(y1)), (int(x2), int(y2)), (200, 50, 220), 3)
+    cv2.putText(panel1, "1. AABB prompt", (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(panel1, "1. AABB prompt", (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    panel2 = img_rgb.copy()
+    if mask is not None and mask.size > 0:
+        m = (np.asarray(mask) > 0).astype(np.uint8)
+        if m.shape != (h, w):
+            m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+        red = np.zeros_like(panel2); red[:, :, 0] = 255
+        panel2 = np.where(m[..., None] > 0,
+                          cv2.addWeighted(panel2, 0.5, red, 0.5, 0),
+                          panel2).astype(np.uint8)
+    cv2.putText(panel2, "2. SAM mask", (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(panel2, "2. SAM mask", (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    panel3 = img_rgb.copy()
+    if corners is not None:
+        pts = corners.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(panel3, [pts], isClosed=True, color=(50, 220, 50), thickness=3)
+    cv2.putText(panel3, f"3. REJECTED: {rule}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(panel3, f"3. REJECTED: {rule}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (50, 50, 255), 1, cv2.LINE_AA)
+
+    grid = np.concatenate([panel1, panel2, panel3], axis=1)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
 
 
 def _sam_batch_predict(predictor, images: list[np.ndarray],
@@ -325,7 +382,8 @@ def _load_predictor(sam_model: str, device: str):
 def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
         sam_model: str = "sam2_b", device: str = "cuda",
         max_images: int | None = None,
-        batch_size: int = 8, num_workers: int = 8) -> RunStats:
+        batch_size: int = 8, num_workers: int = 8,
+        save_rejected: int = 16) -> RunStats:
     coco_json = Path(coco_json)
     images_dir = Path(images_dir)
     out_dir = Path(out_dir)
@@ -408,6 +466,12 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
     has_batch_api = hasattr(predictor, "set_image_batch") and hasattr(predictor, "predict_batch")
     BATCH = batch_size if has_batch_api else 1
 
+    # Preview saves of REJECTED OBBs (3-panel: AABB | mask | candidate OBB)
+    # Capped per-rule so we don't fill the disk on a bad run; lets the user
+    # eyeball "what does the centroid-rejection failure mode look like".
+    rejected_dir = out_dir / "_rejected"
+    saved_per_rule: dict[str, int] = {}
+
     t_inf = time.time()
     pbar = tqdm(
         total=len(todo),
@@ -437,20 +501,39 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
                 stats.errors.append(f"{img_path.name}: batch failed: {e}")
             continue
 
-        for (img_path, out_path, anns), masks, boxes_xyxy in zip(items_v, masks_per, boxes_per):
+        for (img_path, out_path, anns), masks, boxes_xyxy, img_rgb in zip(
+                items_v, masks_per, boxes_per, imgs_v):
             lines: list[str] = []
             im_stats = ImageStats(n_objects=len(boxes_xyxy))
+
+            def _maybe_save_reject(rule: str, mask, corners):
+                if saved_per_rule.get(rule, 0) >= save_rejected:
+                    return
+                saved_per_rule[rule] = saved_per_rule.get(rule, 0) + 1
+                fname = rejected_dir / f"{img_path.stem}_obj{i:02d}_{rule}.png"
+                _save_rejected_preview(img_rgb, mask, boxes_xyxy[i], corners, rule, fname)
+
             for i, mask in enumerate(masks):
                 corners = mask_to_obb_corners(mask, fallback_bbox=boxes_xyxy[i])
-                if corners is None or not is_valid_rectangle(corners):
+                if corners is None:
+                    im_stats.n_drop_no_corners += 1
                     im_stats.n_invalid += 1
+                    _maybe_save_reject("no_corners", mask, corners)
                     continue
-                # Sanity: reject mask-escape failures via two cheap checks.
-                if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
+                if not is_valid_rectangle(corners):
+                    im_stats.n_drop_geometry += 1
                     im_stats.n_invalid += 1
+                    _maybe_save_reject("geometry", mask, corners)
+                    continue
+                if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
+                    im_stats.n_drop_area += 1
+                    im_stats.n_invalid += 1
+                    _maybe_save_reject("area", mask, corners)
                     continue
                 if not is_obb_self_consistent(corners, boxes_xyxy[i]):
+                    im_stats.n_drop_centroid += 1
                     im_stats.n_invalid += 1
+                    _maybe_save_reject("centroid", mask, corners)
                     continue
                 if _is_round_via_corners(corners):
                     im_stats.n_round_fallback += 1
@@ -463,6 +546,10 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
             stats.n_obb_extracted += im_stats.n_obb
             stats.n_aabb_fallback += im_stats.n_round_fallback
             stats.n_invalid_dropped += im_stats.n_invalid
+            stats.n_drop_no_corners += im_stats.n_drop_no_corners
+            stats.n_drop_geometry += im_stats.n_drop_geometry
+            stats.n_drop_area += im_stats.n_drop_area
+            stats.n_drop_centroid += im_stats.n_drop_centroid
 
         # Advance pbar by however many images this chunk added (NaN-safe).
         n_done_this_chunk = sum(1 for v in valid)
@@ -470,7 +557,10 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
         pbar.set_postfix({
             "obb": stats.n_obb_extracted,
             "round": stats.n_aabb_fallback,
-            "drop": stats.n_invalid_dropped,
+            "noc": stats.n_drop_no_corners,
+            "geo": stats.n_drop_geometry,
+            "area": stats.n_drop_area,
+            "ctr": stats.n_drop_centroid,
             "B": BATCH,
         })
     pbar.close()
