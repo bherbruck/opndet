@@ -742,7 +742,40 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                     print(f"  WARN: curriculum key '{name}' has no loss_fn attribute "
                           f"(tried '{attr}'); skipping. Available: w_hm w_cxy w_wh "
                           f"rep_w count_w convex_w dist_w")
-    opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
+    opt_name = str(c.get("optimizer", "adamw")).lower()
+    if opt_name == "musgd":
+        from opndet.optim_muon import MuSGD
+        # Edge-tier guard: server-tier `-pro` is the intended target. Warn (don't
+        # block) for known edge-tier or non-pro presets so the user has cover to
+        # experiment without surprise.
+        _SERVER_PRO = {"bbox-m-pro", "bbox-l-pro", "bbox-x-pro"}
+        preset = str(c.get("model_config", "")).strip()
+        if preset and preset not in _SERVER_PRO:
+            print(
+                f"  WARN: optimizer=musgd is intended for server-tier `-pro` presets "
+                f"({sorted(_SERVER_PRO)}); got '{preset}'. Continuing — empirical wins "
+                f"for vision are unproven; validate before promoting."
+            )
+        opt = MuSGD(
+            model,
+            lr=float(c["lr"]),
+            weight_decay=float(c.get("weight_decay", 1e-4)),
+            muon_momentum=float(c.get("muon_momentum", 0.95)),
+            muon_lr_scale=float(c.get("muon_lr_scale", 1.0)),
+            ns_steps=int(c.get("muon_ns_steps", 5)),
+        )
+        ps = opt.partition_summary()
+        print(
+            f"optimizer: musgd (muon_tensors={ps['muon_tensors']}, "
+            f"adamw_tensors={ps['adamw_tensors']}, muon_params={ps['muon_params']:,}, "
+            f"adamw_params={ps['adamw_params']:,}, "
+            f"muon_momentum={c.get('muon_momentum', 0.95)}, "
+            f"muon_lr_scale={c.get('muon_lr_scale', 1.0)})"
+        )
+    elif opt_name == "adamw":
+        opt = torch.optim.AdamW(model.parameters(), lr=float(c["lr"]), weight_decay=float(c.get("weight_decay", 1e-4)))
+    else:
+        raise ValueError(f"unknown optimizer '{opt_name}'; expected 'adamw' or 'musgd'")
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
     amp_dtype_str = str(c.get("amp_dtype", "fp16")).lower()
@@ -940,11 +973,23 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                     losses["loss"] = losses["loss"] + kd["l_kd"]
                     losses["l_kd_hm"] = kd["l_kd_hm"].detach()
                     losses["l_kd_reg"] = kd["l_kd_reg"].detach()
+            # GradScaler expects a true torch.optim.Optimizer. MuSGD wraps two
+            # of them; dispatch to each leg so unscale_/step work correctly.
+            opt_legs = []
+            if hasattr(opt, "muon") and hasattr(opt, "adamw"):
+                if opt.muon is not None:
+                    opt_legs.append(opt.muon)
+                if opt.adamw is not None:
+                    opt_legs.append(opt.adamw)
+            else:
+                opt_legs = [opt]
             if needs_scaler:
                 scaler.scale(losses["loss"]).backward()
-                scaler.unscale_(opt)
+                for _o in opt_legs:
+                    scaler.unscale_(_o)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-                scaler.step(opt)
+                for _o in opt_legs:
+                    scaler.step(_o)
                 scaler.update()
             else:
                 losses["loss"].backward()

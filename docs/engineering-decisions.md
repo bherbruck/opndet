@@ -130,6 +130,22 @@ Training continues even if tensorboard import fails. Scalars still flow to DuckD
 
 ---
 
+## Optimizer choice
+
+### `optimizer: adamw` is the default. `optimizer: musgd` is opt-in for server-tier `-pro`.
+
+AdamW with cosine LR + warmup is the default for every preset. MuSGD (Muon for hidden conv weights + AdamW for biases / BN / narrow heads, per YOLO26 / Jordan 2024) is opt-in via `optimizer: musgd` in the training yaml. It is intended only for server-tier `-pro` presets (`bbox-{m,l,x}-pro`) — train.py warns but does not block if you set it on edge-tier presets.
+
+**Honest caveat.** Muon's empirical wins are most clearly demonstrated in transformer training. For convnet vision tasks the literature is thinner; the YOLO26 paper claims faster convergence but doesn't ship rigorous A/B numbers. For `bbox-x-pro` the partition lands ~99.8% of params in the Muon leg (17.2M of 17.3M; the remaining 0.2% is BN affine, biases, and the 1×{l,t,r,b,obj}-channel head convs). That is exactly the regime where the Newton-Schulz orthogonalization is supposed to matter most — uniform spectrum updates on every conv weight — but it is also the regime where convnet inductive bias may already be doing the work.
+
+**Validate on your own dataset before promoting.** The flag exists so you can measure. If MuSGD doesn't move val mAP after a full schedule, stick with AdamW — there is no theoretical reason it must win for vision.
+
+**Knobs.** `muon_momentum` (default 0.95, heavy-ball β), `muon_lr_scale` (default 1.0; multiplies the cosine-scheduled LR for the Muon leg only), `muon_ns_steps` (default 5; canonical Jordan setting). The cosine LR schedule applies to all param groups uniformly.
+
+**State-dict compat.** MuSGD checkpoints carry a `_tag: "musgd-v1"` field; loading an AdamW checkpoint into a MuSGD optimizer (or vice versa) raises `ValueError` rather than silently corrupting. Switch optimizers on a fresh run, not mid-training.
+
+---
+
 ## What NOT to remove "to clean up"
 
 These look redundant or weird but are load-bearing:

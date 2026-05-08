@@ -217,10 +217,11 @@ The kitchen-sink-of-everything variants. One per size point (`bbox-{f,p,n,s,m,l,
 - New augmentation: `hard_negative_pool: <dir>` config option in `augment:` block. With probability `p`, paste a random pool patch into a non-GT region of the training image (no label = explicit "don't fire on this")
 - A/B target: ≥40% reduction in `center_ghost_rate` vs same yaml without mining
 
-**Phase 6: MuSGD optimizer** (~1 week, server-tier only, opt-in)
-- Per YOLO26 paper: Muon for hidden conv layers + AdamW for input/output projections
-- Empirical wins less proven for vision than transformers; ship as opt-in `optimizer: musgd` config option
-- Validate on a single dataset before promoting to default
+**Phase 6: MuSGD optimizer** (~1 week, server-tier only, opt-in) — **shipped**
+- Implemented in `src/opndet/optim_muon.py`. Opt-in via `optimizer: musgd` in the training yaml.
+- Per YOLO26 paper: Muon (Newton-Schulz orthogonalized momentum) for hidden conv weights + AdamW for biases / BN / narrow heads.
+- For `bbox-x-pro` the partition routes ~99.8% of params (17.2M of 17.3M) to the Muon leg.
+- Empirical wins less proven for vision than transformers; train.py warns when used on non-server-tier presets but does not block. Validate on your own dataset before promoting to a default.
 
 **Definition of done (overall):**
 - All 7 `bbox-*-pro` presets exist and train end-to-end

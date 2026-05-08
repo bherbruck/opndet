@@ -148,11 +148,13 @@ All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except h
 - **Conventional Commits format** (`feat:`, `fix:`, `perf:`, `chore:`).
 - **Bundled YAML** lives at `src/opndet/configs/` and ships with the wheel via `[tool.setuptools.package-data]`. The CLI's `--model` flag resolves preset names against this dir via `src/opndet/presets.py::resolve()`.
 - **train.yaml is a *template*** — `init-config` dumps the bundled one for users to edit. Never assume specific paths in it.
+- **Optimizer choice**: AdamW is the default for every preset. `optimizer: musgd` in the training yaml opts into MuSGD (Muon for hidden conv weights + AdamW for biases / BN / narrow heads, per YOLO26). It is intended for server-tier `-pro` presets only; train.py warns but does not block on edge-tier presets. Vision-side wins are unproven — validate on your own dataset before promoting. See `docs/engineering-decisions.md` "Optimizer choice".
 
 ## Files at a glance
 
 - `cli.py` — argparse subcommand router; entry point for the `opndet` script.
-- `train.py` — training loop. Lazy imports tensorboard with no-op fallback when import fails (Colab numpy/tensorboard mismatches). Auto-increment `out_dir`, resume, trajectory-patience, curriculum w/ alias map, cosine LR + warmup, in-process Colab `files.download()`.
+- `train.py` — training loop. Lazy imports tensorboard with no-op fallback when import fails (Colab numpy/tensorboard mismatches). Auto-increment `out_dir`, resume, trajectory-patience, curriculum w/ alias map, cosine LR + warmup, in-process Colab `files.download()`. Reads `optimizer: adamw|musgd` from config (default adamw).
+- `optim_muon.py` — Muon + MuSGD optimizers (ROADMAP §1.8 Phase 6). Opt-in via `optimizer: musgd`; routes >=2D-flattenable conv weights to Muon, everything else to AdamW.
 - `model.py` / `blocks.py` — hand-coded reference model (kept for parity tests).
 - `primitives.py` / `registry.py` / `yaml_build.py` — YAML DSL system.
 - `encode.py` — Gaussian heatmap GT encoder (CornerNet σ heuristic).
