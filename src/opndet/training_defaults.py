@@ -154,6 +154,25 @@ PER_SIZE: dict[str, dict[str, Any]] = {
     "bbox-g-dist": {"lr": 7.0e-4, "batch_size": 16, "warmup_steps": 600, "augment": _AUG_HEAVY},
     "bbox-t":      {"lr": 5.0e-4, "batch_size": 16, "warmup_steps": 800, "augment": _AUG_HEAVY},
     "bbox-t-dist": {"lr": 5.0e-4, "batch_size": 16, "warmup_steps": 800, "augment": _AUG_HEAVY},
+
+    # `-pro` flagships (ROADMAP §1.8). Phase 3 default: `assigner: stal` (size-
+    # adaptive TAL for regression). Edge tier mirrors base-tier LR/batch; server
+    # tier mirrors its base counterpart. Users can override `assigner: peak` to
+    # disable. Curriculum default `progloss` auto-balances loss-term weights.
+    "bbox-f-pro": {"lr": 3.0e-3, "batch_size": 256, "augment": _AUG_LIGHT, "distill": _DISTILL_TIGHTER,
+                   "assigner": "stal", "curriculum": "progloss"},
+    "bbox-p-pro": {"lr": 3.0e-3, "batch_size": 256, "augment": _AUG_LIGHT, "distill": _DISTILL_TIGHTER,
+                   "assigner": "stal", "curriculum": "progloss"},
+    "bbox-n-pro": {"lr": 3.0e-3, "batch_size": 128, "augment": _AUG_MEDIUM, "distill": _DISTILL_TIGHTER,
+                   "assigner": "stal", "curriculum": "progloss"},
+    "bbox-s-pro": {"lr": 3.0e-3, "batch_size": 128, "augment": _AUG_FULL,
+                   "assigner": "stal", "curriculum": "progloss"},
+    "bbox-m-pro": {"lr": 3.0e-3, "batch_size": 64,  "augment": _AUG_FULL,
+                   "assigner": "stal", "curriculum": "progloss"},
+    "bbox-l-pro": {"lr": 2.0e-3, "batch_size": 64, "warmup_steps": 400, "augment": _AUG_FULL,
+                   "assigner": "stal", "curriculum": "progloss"},
+    "bbox-x-pro": {"lr": 1.5e-3, "batch_size": 32, "warmup_steps": 400, "augment": _AUG_FULL,
+                   "assigner": "stal", "curriculum": "progloss"},
 }
 
 

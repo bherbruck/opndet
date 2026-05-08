@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 
 import copy
 
+from opndet.assigner import build_assigner
 from opndet.augment import AugConfig, make_augment
 from opndet.dataset import OpndetDataset, collate, load_datasets, split_samples
 from opndet.decode import decode_batch
@@ -728,6 +729,24 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             print(f"count-aware loss: peak_kernel={peak_k}, peak_eps={peak_eps} (auto-detected from model)")
     loss_fn = OpndetBboxLoss(**loss_kw)
 
+    # ROADMAP §1.8 Phase 3: TAL/STAL assigner for regression-side per-cell
+    # positive selection. `assigner: peak` (or omitted) keeps the original
+    # single-cell-per-GT path. `tal` / `stal` enable dense top-k assignment.
+    # cls supervision stays on the Gaussian heatmap target either way (see
+    # docs/engineering-decisions.md "Assigner choice").
+    assigner_cfg = c.get("assigner")
+    _assign_mode = "obb" if has_obb else ("ltrb" if has_ltrb else None)
+    if assigner_cfg is not None and _assign_mode is None:
+        print(f"  WARN: assigner: '{assigner_cfg}' set but head is not ltrb/obb; ignoring")
+        assigner = None
+    else:
+        assigner = build_assigner(assigner_cfg, mode=_assign_mode or "ltrb",
+                                  img_h=img_h, img_w=img_w, stride=cfg_shim.stride)
+    if assigner is not None:
+        kind = "stal" if assigner.stal else "tal"
+        print(f"assigner: {kind} (topk={assigner.topk}, alpha={assigner.alpha}, "
+              f"beta={assigner.beta}, mode={assigner.mode})")
+
     # Loss-weight curriculum. Two YAML forms:
     #   curriculum: warmup_wh           # shorthand: ramp w_wh from 0 → final
     #                                   # over the first 20% of total epochs
@@ -739,6 +758,28 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     curriculum_cfg = c.get("curriculum")
     curriculum_schedule: dict[str, dict] = {}
     _curriculum_epochs = int(c.get("epochs", 100))   # `epochs` not yet bound here
+    # ProgLoss: auto-balance loss-term weights so each contributes equally.
+    # `curriculum: progloss` shorthand or {progloss: {ema_decay, smooth, components}}.
+    progloss_enabled = False
+    progloss_ema_decay = 0.9
+    progloss_smooth = 0.2  # fraction toward target per epoch
+    progloss_components = ["l_hm", "l_wh", "l_cxy"]
+    progloss_attr_map = {"l_hm": "w_hm", "l_wh": "w_wh", "l_cxy": "w_cxy"}
+    progloss_min_weight = 0.05
+    progloss_max_weight = 50.0
+    if curriculum_cfg == "progloss":
+        progloss_enabled = True
+    elif isinstance(curriculum_cfg, dict) and "progloss" in curriculum_cfg:
+        progloss_enabled = True
+        pcfg = curriculum_cfg.pop("progloss")
+        if isinstance(pcfg, dict):
+            progloss_ema_decay = float(pcfg.get("ema_decay", progloss_ema_decay))
+            progloss_smooth = float(pcfg.get("smooth", progloss_smooth))
+            comps = pcfg.get("components")
+            if comps:
+                progloss_components = [str(x) for x in comps]
+            progloss_min_weight = float(pcfg.get("min_weight", progloss_min_weight))
+            progloss_max_weight = float(pcfg.get("max_weight", progloss_max_weight))
     if curriculum_cfg == "warmup_wh":
         warmup_end = max(1, int(_curriculum_epochs * 0.20))
         curriculum_schedule = {
@@ -762,6 +803,59 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         "convexity_weight":  "convex_w",
         "dist_weight":       "dist_w",
     }
+    # ProgLoss state. EMAs of (loss_total, loss_term_k) updated each batch by
+    # _progloss_observe; new weights computed at epoch end by _progloss_step
+    # so each component contributes ~equally to total.
+    progloss_state: dict[str, float] = {"_total": 0.0, **{c: 0.0 for c in progloss_components}}
+    progloss_init = {"_total": False, **{c: False for c in progloss_components}}
+    progloss_w0 = {progloss_attr_map[k]: float(getattr(loss_fn, progloss_attr_map[k]))
+                   for k in progloss_components if k in progloss_attr_map}
+    if progloss_enabled:
+        print(f"curriculum: progloss — auto-balancing {progloss_components} "
+              f"(ema={progloss_ema_decay}, smooth={progloss_smooth})")
+
+    def _progloss_observe(losses_d: dict) -> None:
+        if not progloss_enabled:
+            return
+        # losses_d['loss'] is the scalar total (a tensor); component values are
+        # detached scalars. Use the detached components only.
+        total_v = float(losses_d.get("loss", torch.zeros(())).detach()) if hasattr(losses_d.get("loss", 0.0), "detach") else float(losses_d.get("loss", 0.0))
+        if not progloss_init["_total"]:
+            progloss_state["_total"] = total_v
+            progloss_init["_total"] = True
+        else:
+            progloss_state["_total"] = progloss_ema_decay * progloss_state["_total"] + (1.0 - progloss_ema_decay) * total_v
+        for k in progloss_components:
+            v = losses_d.get(k)
+            if v is None:
+                continue
+            v = float(v.detach()) if hasattr(v, "detach") else float(v)
+            if not progloss_init[k]:
+                progloss_state[k] = v
+                progloss_init[k] = True
+            else:
+                progloss_state[k] = progloss_ema_decay * progloss_state[k] + (1.0 - progloss_ema_decay) * v
+
+    def _progloss_step() -> None:
+        if not progloss_enabled:
+            return
+        active = [k for k in progloss_components if progloss_init[k] and progloss_state[k] > 1e-9
+                  and progloss_attr_map.get(k) and hasattr(loss_fn, progloss_attr_map[k])]
+        if len(active) < 2:
+            return
+        n = len(active)
+        # Target weight: each weighted component contributes 1/n of an arbitrary
+        # reference (we use the mean of un-weighted component magnitudes so the
+        # total scalar is roughly preserved, not exploded).
+        ref = sum(progloss_state[k] for k in active) / n
+        for k in active:
+            attr = progloss_attr_map[k]
+            base = getattr(loss_fn, attr)
+            target = ref / max(progloss_state[k], 1e-9)
+            target = max(progloss_min_weight, min(progloss_max_weight, target))
+            new = (1.0 - progloss_smooth) * float(base) + progloss_smooth * target
+            setattr(loss_fn, attr, float(new))
+
     def _apply_curriculum(epoch_1based: int) -> None:
         for name, spec in curriculum_schedule.items():
             s_ep = float(spec.get("start_epoch", 0))
@@ -987,11 +1081,12 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     for epoch in range(start_epoch, epochs):
         _apply_curriculum(epoch + 1)
+        _progloss_step()
         model.train()
         t0 = time.time()
         running: dict[str, float] = {}
         pbar = tqdm(train_loader, desc=f"epoch {epoch+1}/{epochs}", leave=False)
-        for imgs, _, tgt in pbar:
+        for imgs, boxes_list, tgt in pbar:
             for g in opt.param_groups:
                 g["lr"] = cosine_lr(step, total_steps, base_lr, warmup=warmup)
             imgs = imgs.to(device, non_blocking=True)
@@ -999,6 +1094,48 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 raw5 = model.forward_with_alias(imgs, "raw")
+                if assigner is not None:
+                    # Forward gives raw logits; sigmoid for the assigner's
+                    # alignment metric. Box channels are first 4 of the reg
+                    # output (sigmoid'd). Run under no_grad inside the autocast.
+                    with torch.no_grad():
+                        pred_obj_s = torch.sigmoid(raw5[:, 0:1].float())
+                        pred_box_s = torch.sigmoid(raw5[:, 1:5].float())
+                    a_out = assigner(pred_obj_s, pred_box_s, boxes_list)
+                    new_pos = a_out["pos"].to(tgt["pos"].dtype)
+                    if has_obb and "obb" in tgt:
+                        # Replace ltrb edges; propagate angle channels from
+                        # each GT's center cell to all assigned cells.
+                        ltrb_new = a_out["ltrb"].to(tgt["obb"].dtype)
+                        ang_new = tgt["obb"][:, 4:6].clone()
+                        new_ang_mask = torch.zeros_like(tgt["angle_mask"]) if "angle_mask" in tgt else None
+                        H_out = ang_new.shape[-2]; W_out = ang_new.shape[-1]
+                        for b in range(ang_new.shape[0]):
+                            assigned_b = a_out["assigned_gt"][b]
+                            unique_gts = torch.unique(assigned_b[assigned_b >= 0])
+                            bxs = boxes_list[b]
+                            if not isinstance(bxs, torch.Tensor):
+                                bxs = torch.as_tensor(bxs, dtype=torch.float32)
+                            for n in unique_gts.tolist():
+                                if bxs.ndim != 2 or bxs.shape[0] <= n:
+                                    continue
+                                gx = bxs[n]
+                                cx_g = int(min(max(((float(gx[0]) + float(gx[2])) * 0.5 / cfg_shim.stride), 0.0), W_out - 1))
+                                cy_g = int(min(max(((float(gx[1]) + float(gx[3])) * 0.5 / cfg_shim.stride), 0.0), H_out - 1))
+                                ang_val = tgt["obb"][b, 4:6, cy_g, cx_g]
+                                sel = (assigned_b == n)
+                                if sel.any():
+                                    ang_new[b, :, sel] = ang_val.view(2, 1)
+                                    if new_ang_mask is not None:
+                                        is_non_round = float(tgt["angle_mask"][b, 0, cy_g, cx_g]) > 0
+                                        if is_non_round:
+                                            new_ang_mask[b, 0][sel] = 1.0
+                        tgt["obb"] = torch.cat([ltrb_new, ang_new], dim=1)
+                        if new_ang_mask is not None:
+                            tgt["angle_mask"] = new_ang_mask
+                    elif has_ltrb and "ltrb" in tgt:
+                        tgt["ltrb"] = a_out["ltrb"].to(tgt["ltrb"].dtype)
+                    tgt["pos"] = new_pos
                 losses = loss_fn(raw5, tgt)
 
                 if teacher_model is not None or self_distill:
@@ -1038,6 +1175,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             for k, v in losses.items():
                 if isinstance(v, torch.Tensor):
                     running[k] = running.get(k, 0.0) + float(v.detach())
+            _progloss_observe(losses)
             step += 1
             if step % 5 == 0:
                 pbar.set_postfix(loss=f"{losses['loss'].item():.3f}", lr=f"{opt.param_groups[0]['lr']:.1e}")
