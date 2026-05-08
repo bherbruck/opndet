@@ -492,7 +492,7 @@ async function runOn(src) {
   const stride = parseInt(els.stride.value, 10) || 4;
   const threshold = parseFloat(els.threshold.value);
   const dets = decode(o.data, C, H, W, inputH, inputW, stride, threshold);
-  lastDecodeArgs = { o, C, H, W, lb };
+  lastDecodeArgs = { o, C, H, W, lb, dets };
 
   // FPS accumulator
   fpsBuf.push(performance.now());
@@ -605,6 +605,41 @@ function turbo(t) {
 
 // Render a (H, W) Float32Array as a Turbo heatmap ImageData at canvas size.
 // Uses nearest-neighbor upsample to (inputW, inputH) — matches the analyze.py choice.
+// Render arr (gridH × gridW) as a TURBO heatmap clipped to the region
+// (rx, ry, rw, rh) inside an inputH × inputW ImageData. Pixels OUTSIDE the
+// region are alpha=0 (transparent) so blitOverlay leaves them untouched.
+function renderHeatmapInRegion(arr, gridH, gridW, rx, ry, rw, rh) {
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] < mn) mn = arr[i];
+    if (arr[i] > mx) mx = arr[i];
+  }
+  const inv = (mx - mn) > 1e-12 ? 1 / (mx - mn) : 0;
+  const id = ctx.createImageData(inputW, inputH);
+  // Default: fully transparent
+  for (let i = 3; i < id.data.length; i += 4) id.data[i] = 0;
+  // Fill region pixels
+  for (let yy = 0; yy < rh; yy++) {
+    const dy = ry + yy;
+    if (dy < 0 || dy >= inputH) continue;
+    const cy = Math.min(gridH - 1, Math.floor(yy * gridH / rh));
+    const row_off = cy * gridW;
+    for (let xx = 0; xx < rw; xx++) {
+      const dx = rx + xx;
+      if (dx < 0 || dx >= inputW) continue;
+      const cx = Math.min(gridW - 1, Math.floor(xx * gridW / rw));
+      const v = (arr[row_off + cx] - mn) * inv;
+      const [r, g, b] = turbo(v);
+      const didx = (dy * inputW + dx) * 4;
+      id.data[didx]     = r;
+      id.data[didx + 1] = g;
+      id.data[didx + 2] = b;
+      id.data[didx + 3] = 255;
+    }
+  }
+  return id;
+}
+
 function renderHeatmapImageData(arr, h, w) {
   // Find min/max
   let mn = Infinity, mx = -Infinity;
@@ -663,14 +698,19 @@ function rebuildLayerOverlay(redraw = true) {
 function blitOverlay() {
   if (!activeOverlay) return;
   const alpha = parseFloat(els.alpha.value);
-  // Pull current image, blend each pixel.
+  // Pull current image, blend each pixel. Respects overlay alpha channel so
+  // partial-region overlays (e.g. detection-bbox-bounded attribution) leave
+  // pixels outside the region untouched.
   const base = ctx.getImageData(0, 0, inputW, inputH);
   const o = activeOverlay.data;
   const b = base.data;
   for (let i = 0; i < b.length; i += 4) {
-    b[i]   = (1 - alpha) * b[i]   + alpha * o[i];
-    b[i+1] = (1 - alpha) * b[i+1] + alpha * o[i+1];
-    b[i+2] = (1 - alpha) * b[i+2] + alpha * o[i+2];
+    const oa = o[i + 3] / 255;
+    if (oa === 0) continue;
+    const eff = alpha * oa;
+    b[i]   = (1 - eff) * b[i]   + eff * o[i];
+    b[i+1] = (1 - eff) * b[i+1] + eff * o[i+1];
+    b[i+2] = (1 - eff) * b[i+2] + eff * o[i+2];
   }
   ctx.putImageData(base, 0, 0);
 }
@@ -716,7 +756,7 @@ async function runOcclusionAttribution(clickX, clickY) {
     return;
   }
 
-  const { o, C, H, W } = lastDecodeArgs;
+  const { o, C, H, W, dets } = lastDecodeArgs;
   const stride = parseInt(els.stride.value, 10) || 4;
   // Map the clicked canvas pixel to a target output cell.
   const cellX = Math.max(0, Math.min(W - 1, Math.floor(clickX / stride)));
@@ -724,42 +764,75 @@ async function runOcclusionAttribution(clickX, clickY) {
   const targetIdx = cellY * W + cellX;
   const baseScore = o.data[targetIdx];
 
+  // Detection-aware region. If the click is inside a predicted bbox, sweep
+  // small patches WITHIN that bbox — fine attribution showing which feature
+  // of the egg the model relied on. Otherwise sweep a small window around
+  // the click point. Either way, patches are small enough to give meaningful
+  // per-feature signal (the previous full-image 4x4 made each patch bigger
+  // than an entire egg, so only one patch ever showed a real score drop).
+  let rx, ry, rw, rh, mode;
+  let targetDet = null;
+  if (dets && dets.length > 0) {
+    for (const d of dets) {
+      if (clickX >= d.x1 && clickX <= d.x2 && clickY >= d.y1 && clickY <= d.y2) {
+        targetDet = d; break;
+      }
+    }
+  }
+  if (targetDet) {
+    // Pad the bbox by 20% so context just outside the egg is also probed
+    // (sometimes the false-cue is JUST OUTSIDE the bbox — a shadow edge etc.)
+    const padX = (targetDet.x2 - targetDet.x1) * 0.2;
+    const padY = (targetDet.y2 - targetDet.y1) * 0.2;
+    rx = Math.max(0, Math.floor(targetDet.x1 - padX));
+    ry = Math.max(0, Math.floor(targetDet.y1 - padY));
+    rw = Math.min(inputW - rx, Math.ceil((targetDet.x2 - targetDet.x1) + 2 * padX));
+    rh = Math.min(inputH - ry, Math.ceil((targetDet.y2 - targetDet.y1) + 2 * padY));
+    mode = `detection bbox (score ${targetDet.score.toFixed(2)})`;
+  } else {
+    // No detection contains the click — sweep a 96-px window around the click.
+    const winSize = 96;
+    rx = Math.max(0, Math.floor(clickX - winSize / 2));
+    ry = Math.max(0, Math.floor(clickY - winSize / 2));
+    rw = Math.min(inputW - rx, winSize);
+    rh = Math.min(inputH - ry, winSize);
+    mode = "window around click";
+  }
+
   // Snapshot the current letterboxed canvas pixels (before any overlays).
-  // The canvas might have an overlay from layer mode — re-letterbox first.
   drawLetterbox(lastImage);
   const snap = ctx.getImageData(0, 0, inputW, inputH).data;
 
-  // Build a coarse grid of patches over the whole image.
-  // 4x4 = 16 patches: enough resolution to localize the cause, ~3-5s on
-  // typical phones / laptops via WASM. The worker runs each forward off
-  // the main thread, so the page stays responsive throughout.
-  const gridN = 4;
-  const patchH = Math.ceil(inputH / gridN);
-  const patchW = Math.ceil(inputW / gridN);
+  // 5x5 = 25 patches inside the region. For a typical 60x60 px egg + 20% pad
+  // = 84x84 region, each patch is ~17x17 px — fine enough to localize "the
+  // model reads the egg's center / edge / shadow / etc."
+  const gridN = 5;
+  const patchH = Math.ceil(rh / gridN);
+  const patchW = Math.ceil(rw / gridN);
 
   const gridScores = new Float32Array(gridN * gridN);
   const t0 = performance.now();
 
   for (let gy = 0; gy < gridN; gy++) {
     for (let gx = 0; gx < gridN; gx++) {
-      const py = gy * patchH;
-      const px = gx * patchW;
+      const py = ry + gy * patchH;
+      const px = rx + gx * patchW;
       const tensor = tensorWithOcclusion(snap, px, py, patchW, patchH);
-      // Transfer the Float32Array buffer to the worker (zero-copy). The
-      // worker only sends back a single scalar so the round trip is cheap.
       const m = await workerCall(
         { type: "run", data: tensor.data, shape: [1, 3, inputH, inputW], targetIdx },
         [tensor.data.buffer]
       );
       gridScores[gy * gridN + gx] = Math.max(0, baseScore - m.value);
-      els.attribStatus.textContent = `occluding patch ${gy * gridN + gx + 1} / ${gridN * gridN}...`;
+      els.attribStatus.textContent = `occluding patch ${gy * gridN + gx + 1} / ${gridN * gridN} (${mode})...`;
     }
   }
   const dt = (performance.now() - t0) / 1000;
 
-  activeOverlay = renderHeatmapImageData(gridScores, gridN, gridN);
-  // Mark click point + the target cell as a small green square for clarity.
-  els.attribStatus.innerHTML = `<span class="ok">attribution done</span> · cell (${cellY},${cellX}) base=${baseScore.toFixed(3)} · ${dt.toFixed(1)}s for ${gridN*gridN} occlusions`;
+  activeOverlay = renderHeatmapInRegion(gridScores, gridN, gridN, rx, ry, rw, rh);
+  // Bright cells = pixels whose occlusion dropped the score most = pixels
+  // the model relied on. Shown clipped to the detection bbox (or click
+  // window) so other parts of the canvas stay visible at native colors.
+  els.attribStatus.innerHTML = `<span class="ok">attribution done</span> · ${mode} · cell (${cellY},${cellX}) base=${baseScore.toFixed(3)} · ${dt.toFixed(1)}s for ${gridN*gridN} occlusions`;
   attribBusy = false;
   if (lastImage) renderFromCache();
   // Highlight clicked spot
