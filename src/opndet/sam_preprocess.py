@@ -169,6 +169,7 @@ class ImageStats:
     n_drop_area: int = 0          # OBB area > max_area_frac × AABB area
     n_drop_centroid: int = 0      # OBB centroid not inside AABB
     n_drop_no_corners: int = 0    # mask_to_obb_corners returned None (no contour)
+    n_kept_edge: int = 0          # mask touched image edge — area+centroid checks skipped
 
 
 @dataclass
@@ -184,6 +185,7 @@ class RunStats:
     n_drop_area: int = 0
     n_drop_centroid: int = 0
     n_drop_no_corners: int = 0
+    n_kept_edge: int = 0
     sam_model_used: str = ""
     timestamp: str = ""
     duration_seconds: float = 0.0
@@ -260,6 +262,48 @@ def process_image(img_path: Path, annotations: list[dict], predictor,
         stats.n_obb += 1
         lines.append(corners_to_yolo_obb_line(corners, w, h, class_id=0))
     return lines, stats
+
+
+def _aabb_corners_from_xyxy(xyxy: np.ndarray) -> np.ndarray:
+    """4 corners of the axis-aligned bbox in (x1,y1) (x2,y1) (x2,y2) (x1,y2) order."""
+    x1, y1, x2, y2 = xyxy
+    return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+
+
+def _min_area_rect_corners(mask: np.ndarray) -> np.ndarray | None:
+    """Tightest rotated rectangle enclosing the visible mask pixels — used for
+    truncated objects where fitEllipse would extrapolate past the image edge.
+    Returns 4 corners in cv2.boxPoints order, or None if the mask is empty.
+    """
+    m = (np.asarray(mask) > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    if len(contour) < 3:
+        return None
+    rect = cv2.minAreaRect(contour)
+    return cv2.boxPoints(rect).astype(np.float32)
+
+
+def _mask_touches_edge(mask: np.ndarray | None, margin: int = 2) -> bool:
+    """True if the SAM mask reaches the image edge — indicates the object is
+    truncated. fitEllipse on truncated masks extrapolates past the edge, so
+    area + centroid sanity checks have to be relaxed for these.
+    """
+    if mask is None:
+        return False
+    m = np.asarray(mask)
+    if m.size == 0:
+        return False
+    m = (m > 0)
+    if not m.any():
+        return False
+    h, w = m.shape[-2:]
+    return bool(
+        m[..., :margin, :].any() or m[..., -margin:, :].any()
+        or m[..., :, :margin].any() or m[..., :, -margin:].any()
+    )
 
 
 def _save_rejected_preview(img_rgb: np.ndarray, mask: np.ndarray | None,
@@ -514,27 +558,40 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
                 _save_rejected_preview(img_rgb, mask, boxes_xyxy[i], corners, rule, fname)
 
             for i, mask in enumerate(masks):
-                corners = mask_to_obb_corners(mask, fallback_bbox=boxes_xyxy[i])
-                if corners is None:
-                    im_stats.n_drop_no_corners += 1
-                    im_stats.n_invalid += 1
-                    _maybe_save_reject("no_corners", mask, corners)
-                    continue
-                if not is_valid_rectangle(corners):
-                    im_stats.n_drop_geometry += 1
-                    im_stats.n_invalid += 1
-                    _maybe_save_reject("geometry", mask, corners)
-                    continue
-                if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
-                    im_stats.n_drop_area += 1
-                    im_stats.n_invalid += 1
-                    _maybe_save_reject("area", mask, corners)
-                    continue
-                if not is_obb_self_consistent(corners, boxes_xyxy[i]):
-                    im_stats.n_drop_centroid += 1
-                    im_stats.n_invalid += 1
-                    _maybe_save_reject("centroid", mask, corners)
-                    continue
+                # Truncated objects: SAM mask touches an image edge. fitEllipse
+                # would extrapolate the ellipse off-frame, producing an OBB
+                # that fails the area + centroid sanity checks. Use minAreaRect
+                # instead — tightest rotated rectangle bounding the VISIBLE
+                # mask pixels. Preserves rotation info, no extrapolation, fits
+                # within the prompt AABB by construction.
+                if _mask_touches_edge(mask):
+                    corners = _min_area_rect_corners(mask)
+                    if corners is None:
+                        # mask had no contour after all — fall back to AABB
+                        corners = _aabb_corners_from_xyxy(boxes_xyxy[i])
+                    im_stats.n_kept_edge += 1
+                else:
+                    corners = mask_to_obb_corners(mask, fallback_bbox=boxes_xyxy[i])
+                    if corners is None:
+                        im_stats.n_drop_no_corners += 1
+                        im_stats.n_invalid += 1
+                        _maybe_save_reject("no_corners", mask, corners)
+                        continue
+                    if not is_valid_rectangle(corners):
+                        im_stats.n_drop_geometry += 1
+                        im_stats.n_invalid += 1
+                        _maybe_save_reject("geometry", mask, corners)
+                        continue
+                    if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
+                        im_stats.n_drop_area += 1
+                        im_stats.n_invalid += 1
+                        _maybe_save_reject("area", mask, corners)
+                        continue
+                    if not is_obb_self_consistent(corners, boxes_xyxy[i]):
+                        im_stats.n_drop_centroid += 1
+                        im_stats.n_invalid += 1
+                        _maybe_save_reject("centroid", mask, corners)
+                        continue
                 if _is_round_via_corners(corners):
                     im_stats.n_round_fallback += 1
                 im_stats.n_obb += 1
@@ -550,6 +607,7 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
             stats.n_drop_geometry += im_stats.n_drop_geometry
             stats.n_drop_area += im_stats.n_drop_area
             stats.n_drop_centroid += im_stats.n_drop_centroid
+            stats.n_kept_edge += im_stats.n_kept_edge
 
         # Advance pbar by however many images this chunk added (NaN-safe).
         n_done_this_chunk = sum(1 for v in valid)
@@ -557,10 +615,10 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
         pbar.set_postfix({
             "obb": stats.n_obb_extracted,
             "round": stats.n_aabb_fallback,
-            "noc": stats.n_drop_no_corners,
-            "geo": stats.n_drop_geometry,
+            "edge": stats.n_kept_edge,
             "area": stats.n_drop_area,
             "ctr": stats.n_drop_centroid,
+            "geo": stats.n_drop_geometry,
             "B": BATCH,
         })
     pbar.close()
