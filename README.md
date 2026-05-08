@@ -58,15 +58,46 @@ opndet quantize  --onnx opndet.onnx --calib data/imgs --out opndet_int8.onnx [--
 
 ## Bundled presets
 
-| Preset   | Params  | int8 size | Use case                                  |
-|----------|---------|-----------|-------------------------------------------|
-| `bbox-f` | 28K     | ~30 KB    | Femto. Microcontroller stunt.             |
-| `bbox-p` | 92K     | ~95 KB    | Pico. TinyML / MCU.                       |
-| `bbox-n` | 0.31M   | ~320 KB   | Nano. Edge SoC, sub-ms latency.           |
-| `bbox-s` | 1.27M   | ~1.3 MB   | Small. Solid quality.                     |
-| `bbox-m` | 2.37M   | ~2.4 MB   | Medium. ≈ YOLOv8n FLOP budget.            |
+### Base lineup (CenterNet-style, opset-13 + Myriad-VPU compatible on edge tier)
+
+| Preset   | Params  | int8 size | Tier   | Use case                                       |
+|----------|---------|-----------|--------|------------------------------------------------|
+| `bbox-f` | 28K     | ~30 KB    | edge   | Femto. Microcontroller stunt.                  |
+| `bbox-p` | 92K     | ~95 KB    | edge   | Pico. TinyML / MCU.                            |
+| `bbox-n` | 0.31M   | ~320 KB   | edge   | Nano. Edge SoC, sub-ms latency.                |
+| `bbox-s` | 1.27M   | ~1.3 MB   | edge   | Small. Solid quality.                          |
+| `bbox-m` | 2.37M   | ~2.4 MB   | server | Medium. ≈ YOLOv8n FLOP budget.                 |
+| `bbox-l` | 5.57M   | ~5.6 MB   | server | Large. Mid-range server.                       |
+| `bbox-x` | 10.36M  | ~10 MB    | server | Quality-first server. `peak_kernel=7`.         |
 
 All produce identical output layout: `[1, 5, H/4, W/4]`, fixed input `(3, 384, 512)`.
+
+### `-pro` flagship lineup (kitchen-sink-of-everything per size point)
+
+YOLO-family bedrock (SPPF + PAFPN + decoupled head + ltrb regression) + OBB output (rotated bounding boxes, 7-channel `[1, 7, H/4, W/4]`) + TAL/STAL task-aligned assigner + ProgLoss auto-balancing curriculum + hard-negative mining flywheel + opt-in MuSGD optimizer. Edge tier maintains opset-13 / Myriad VPU compat; server tier additionally uses C2PSA position self-attention, SiLU activation, half-pixel resize.
+
+| Preset       | Params  | Tier   | Notes                                          |
+|--------------|---------|--------|------------------------------------------------|
+| `bbox-f-pro` | 54K     | edge   | Femto-pro. Architecture refresh, no attention. |
+| `bbox-p-pro` | 155K    | edge   | Pico-pro.                                      |
+| `bbox-n-pro` | 447K    | edge   | Nano-pro.                                      |
+| `bbox-s-pro` | 1.81M   | edge   | Small-pro. Default for opset-13 deployment.    |
+| `bbox-m-pro` | 3.91M   | server | Medium-pro. + C2PSA + SiLU.                    |
+| `bbox-l-pro` | 9.69M   | server | Large-pro.                                     |
+| `bbox-x-pro` | 19.19M  | server | **Flagship**. Most opinionated; every win baked in. |
+
+`-pro` variants change the output contract to 7 channels (OBB-aware). Use `opndet sam-obb` to preprocess your AABB-labeled dataset into OBB labels before training a `-pro` preset.
+
+### Specialized variants
+
+| Preset           | Notes                                                                              |
+|------------------|-------------------------------------------------------------------------------------|
+| `bbox-{f,h}-tp`  | Temporal-prior input variant — 4-channel input including a prior heatmap channel  |
+| `bbox-{m,l,x,t,h,g}-dist` | Distillation-aware student trained from a larger teacher                  |
+| `bbox-x-hm2`     | 2-channel heatmap variant (obj + radius), opset-13 clean. Touching-objects focus. |
+| `bbox-x-flow`    | 4-channel CellPose-style flow head, server-only. Touching-objects via flow integration. |
+
+See `src/opndet/configs/` for full YAML definitions and `docs/det-hm-variants.md` + `ROADMAP.md` for design notes.
 
 ---
 
