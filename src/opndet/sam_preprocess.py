@@ -86,6 +86,84 @@ def is_valid_rectangle(corners: np.ndarray | None, tolerance: float = 0.01) -> b
     return abs(float(np.dot(v1, v2)) / norm_product) <= tolerance
 
 
+def _obb_area(corners: np.ndarray) -> float:
+    """Area of the rotated rectangle from its 4 corners."""
+    side1 = float(np.linalg.norm(corners[1] - corners[0]))
+    side2 = float(np.linalg.norm(corners[2] - corners[1]))
+    return side1 * side2
+
+
+def _aabb_area(xyxy: np.ndarray) -> float:
+    """Area of the axis-aligned bbox (x1, y1, x2, y2)."""
+    return float(max(0.0, xyxy[2] - xyxy[0]) * max(0.0, xyxy[3] - xyxy[1]))
+
+
+def is_obb_within_prompt(corners: np.ndarray, prompt_xyxy: np.ndarray,
+                        max_area_frac: float = 1.5) -> bool:
+    """Reject OBBs whose area exceeds `max_area_frac × prompt AABB area`.
+
+    Catches the rare SAM2 failure mode where the mask escapes the box prompt
+    and grabs the entire background — fitEllipse on that mask returns an OBB
+    spanning much of the image. Honest OBBs (even rotated) are always smaller
+    than 1.5× the input AABB area in practice.
+    """
+    if corners is None or prompt_xyxy is None:
+        return True
+    aabb_a = _aabb_area(prompt_xyxy)
+    if aabb_a <= 0:
+        return True
+    return _obb_area(corners) <= max_area_frac * aabb_a
+
+
+def _aabb_centers(all_xyxy: np.ndarray, exclude_idx: int) -> np.ndarray:
+    """Center points of every AABB except the one at exclude_idx. Shape (N-1, 2)."""
+    if all_xyxy is None or len(all_xyxy) <= 1:
+        return np.zeros((0, 2), dtype=np.float32)
+    keep = np.ones(len(all_xyxy), dtype=bool)
+    keep[exclude_idx] = False
+    others = all_xyxy[keep]
+    cx = (others[:, 0] + others[:, 2]) * 0.5
+    cy = (others[:, 1] + others[:, 3]) * 0.5
+    return np.stack([cx, cy], axis=1).astype(np.float32)
+
+
+def _count_inside_obb(corners: np.ndarray, points: np.ndarray) -> int:
+    """How many `points` (N, 2) fall inside the OBB polygon (4 corners)."""
+    if corners is None or len(points) == 0:
+        return 0
+    poly = corners.astype(np.float32).reshape(-1, 1, 2)
+    n = 0
+    for px, py in points:
+        if cv2.pointPolygonTest(poly, (float(px), float(py)), False) >= 0:
+            n += 1
+    return n
+
+
+def _count_inside_aabb(xyxy: np.ndarray, points: np.ndarray) -> int:
+    """How many `points` (N, 2) fall inside the AABB (x1, y1, x2, y2)."""
+    if xyxy is None or len(points) == 0:
+        return 0
+    x1, y1, x2, y2 = xyxy
+    inside = (points[:, 0] >= x1) & (points[:, 0] <= x2) & (points[:, 1] >= y1) & (points[:, 1] <= y2)
+    return int(inside.sum())
+
+
+def is_obb_neighbor_count_sane(corners: np.ndarray, this_idx: int,
+                              all_xyxy: np.ndarray, slack: int = 0) -> bool:
+    """Reject OBBs that swallow more OTHER objects' centers than the prompt
+    AABB did. An honest egg-OBB contains its own center plus maybe one
+    overlapping neighbor; if SAM grabbed the whole tray, the resulting OBB
+    contains 10+ neighbor centers. `slack` allows tolerating a few extra
+    (default 0 = strict).
+    """
+    if corners is None or all_xyxy is None or len(all_xyxy) <= 1:
+        return True
+    others = _aabb_centers(all_xyxy, this_idx)
+    count_in_obb = _count_inside_obb(corners, others)
+    count_in_aabb = _count_inside_aabb(all_xyxy[this_idx], others)
+    return count_in_obb <= count_in_aabb + slack
+
+
 def corners_to_yolo_obb_line(corners: np.ndarray, img_w: int, img_h: int, class_id: int = 0) -> str:
     """YOLOv8-OBB normalized format. Allows coords outside [0,1] for truncated objects."""
     normalized = corners.astype(np.float64).copy()
@@ -175,6 +253,16 @@ def process_image(img_path: Path, annotations: list[dict], predictor,
     for i, mask in enumerate(masks):
         corners = mask_to_obb_corners(mask, fallback_bbox=boxes_xyxy[i])
         if corners is None or not is_valid_rectangle(corners):
+            stats.n_invalid += 1
+            continue
+        # Sanity: OBB area must not balloon beyond the AABB prompt's area
+        # (SAM2 sometimes escapes the box and grabs background).
+        if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
+            stats.n_invalid += 1
+            continue
+        # Sanity: OBB must not contain MORE other-object centers than the
+        # AABB did (catches mask-escapes that swallow neighboring objects).
+        if not is_obb_neighbor_count_sane(corners, i, boxes_xyxy, slack=0):
             stats.n_invalid += 1
             continue
         if _is_round_via_corners(corners):
@@ -365,6 +453,13 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
             for i, mask in enumerate(masks):
                 corners = mask_to_obb_corners(mask, fallback_bbox=boxes_xyxy[i])
                 if corners is None or not is_valid_rectangle(corners):
+                    im_stats.n_invalid += 1
+                    continue
+                # Sanity: reject mask-escape failures via two cheap checks.
+                if not is_obb_within_prompt(corners, boxes_xyxy[i], max_area_frac=1.5):
+                    im_stats.n_invalid += 1
+                    continue
+                if not is_obb_neighbor_count_sane(corners, i, boxes_xyxy, slack=0):
                     im_stats.n_invalid += 1
                     continue
                 if _is_round_via_corners(corners):
