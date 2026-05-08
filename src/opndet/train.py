@@ -711,9 +711,6 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         if d_tr or d_v or d_te:
             print(f"  OBB head: dropped samples without sidecar OBB labels "
                   f"(train -{d_tr}, val -{d_v}, test -{d_te})")
-        print(f"  OBB head: AABB-from-COCO replaced with OBB-enclosing-AABB on "
-              f"{len(train_s) + len(val_s) + len(test_s)} samples — pipeline is "
-              f"now AABB-from-COCO free.")
         if not train_s:
             raise RuntimeError(
                 "OBB head selected but no training samples have OBB sidecars. "
