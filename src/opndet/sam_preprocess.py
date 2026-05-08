@@ -117,31 +117,28 @@ def is_obb_within_prompt(corners: np.ndarray, prompt_xyxy: np.ndarray,
 
 
 def is_obb_self_consistent(corners: np.ndarray, prompt_xyxy: np.ndarray) -> bool:
-    """Reject OBBs that have drifted off their prompt. Two checks:
+    """Reject OBBs that have drifted off their prompt: the OBB's centroid
+    must lie inside the prompt AABB.
 
-    1. The OBB centroid lies inside the prompt AABB. If SAM's mask escaped
-       and grew toward background, the OBB centroid moves with it.
-    2. The prompt AABB's center lies inside the OBB. The OBB should still
-       cover the labeled object's expected location.
+    A SAM mask that escaped the box will have its mask centroid (and thus
+    the fitEllipse OBB centroid) drift far from the AABB center — easy to
+    detect. Honest masks (even partially occluded or edge-truncated) stay
+    near the AABB center because the mask is still inside or partially
+    inside the prompt.
 
-    Both checks use only the target object — no neighbor-counting needed,
-    so dense scenes don't trigger false positives.
+    Why not also require the AABB center to lie inside the OBB? Edge cases:
+      - Annotator drew a loose AABB; SAM tightly fit the mask in one
+        quadrant. Honest mask, but AABB center is outside OBB.
+      - Object is truncated at the frame edge; AABB extends off-frame,
+        AABB center is outside the visible mask region.
+    Both are valid OBBs we want to keep, so the inverse check is too strict.
     """
     if corners is None or prompt_xyxy is None:
         return True
     x1, y1, x2, y2 = prompt_xyxy
-    # 1. OBB centroid inside AABB
     obb_cx = float(corners[:, 0].mean())
     obb_cy = float(corners[:, 1].mean())
-    if not (x1 <= obb_cx <= x2 and y1 <= obb_cy <= y2):
-        return False
-    # 2. AABB center inside OBB polygon
-    aabb_cx = float((x1 + x2) * 0.5)
-    aabb_cy = float((y1 + y2) * 0.5)
-    poly = corners.astype(np.float32).reshape(-1, 1, 2)
-    if cv2.pointPolygonTest(poly, (aabb_cx, aabb_cy), False) < 0:
-        return False
-    return True
+    return x1 <= obb_cx <= x2 and y1 <= obb_cy <= y2
 
 
 def corners_to_yolo_obb_line(corners: np.ndarray, img_w: int, img_h: int, class_id: int = 0) -> str:
