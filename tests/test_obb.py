@@ -24,6 +24,12 @@ from torch import nn
 PRO_PRESETS = ["bbox-f-pro", "bbox-p-pro", "bbox-n-pro", "bbox-s-pro",
                "bbox-m-pro", "bbox-l-pro", "bbox-x-pro"]
 
+# Edge-tier OBB-only family (base arch + 7-ch OBB head). Same output contract
+# as -pro but without SPPF/PAFPN/decoupled head — leaner footprint, Myriad-X safe.
+OBB_PRESETS = ["bbox-f-obb", "bbox-p-obb", "bbox-n-obb", "bbox-s-obb"]
+
+ALL_OBB_PRESETS = PRO_PRESETS + OBB_PRESETS
+
 
 def _export(m: nn.Module, x: torch.Tensor, path: str) -> None:
     torch.onnx.export(
@@ -128,26 +134,25 @@ def test_encode_obb_no_obbs():
 # ---- 3. rotated Gaussian shape ----
 
 
-def test_rotated_gaussian_is_elongated():
-    """When w >> h and theta=0, the heatmap should be wider in x than y."""
+def test_obb_heatmap_target_is_circular():
+    """encode_targets_obb produces a CIRCULAR cls heatmap, not elongated.
+    Shape info lives in the reg head (sin2θ/cos2θ); elongated targets confused
+    peak-pick because neighbors along the major axis stole local-max wins."""
     from opndet.config import ModelConfig
     from opndet.encode import encode_targets_obb
 
     cfg = ModelConfig()
-    # Big elongated OBB at center
     cx, cy = cfg.img_w / 2, cfg.img_h / 2
     obbs = np.array([[cx, cy, 200.0, 40.0, 0.0]], dtype=np.float32)
     tgt = encode_targets_obb(obbs, cfg)
     hm = tgt["hm"][0].numpy()
-    Hp, Wp = hm.shape
     cy_g = int(round(cy / cfg.stride))
     cx_g = int(round(cx / cfg.stride))
-    # Half-width of the bright region (>0.1) along x and y at the center row/col
     row = hm[cy_g]
     col = hm[:, cx_g]
     x_extent = float((row > 0.1).sum())
     y_extent = float((col > 0.1).sum())
-    assert x_extent > y_extent * 1.5, f"expect elongated: x={x_extent} y={y_extent}"
+    assert x_extent == y_extent, f"expect circular: x={x_extent} y={y_extent}"
 
 
 # ---- 4. OBB loss differentiability ----
@@ -203,7 +208,7 @@ def test_obb_loss_skips_round_angle_supervision():
 # ---- 5. -pro presets build & export at opset 13 (7-channel) ----
 
 
-@pytest.mark.parametrize("preset", PRO_PRESETS)
+@pytest.mark.parametrize("preset", ALL_OBB_PRESETS)
 def test_pro_preset_builds_obb(preset: str):
     from opndet.presets import resolve
     from opndet.yaml_build import build_model_from_yaml
@@ -220,7 +225,7 @@ def test_pro_preset_builds_obb(preset: str):
     assert (out[:, 5:7] >= -1).all() and (out[:, 5:7] <= 1).all()
 
 
-@pytest.mark.parametrize("preset", PRO_PRESETS)
+@pytest.mark.parametrize("preset", ALL_OBB_PRESETS)
 def test_pro_preset_obb_exports_opset13(preset: str):
     from opndet.export import allowed_ops_for_tier
     from opndet.presets import resolve

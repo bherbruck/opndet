@@ -142,6 +142,7 @@ Plus variants:
 - `bbox-x-flow` — 4-channel CellPose-style flow head, server-only; planned, design doc only
 - `-tp` (e.g. `bbox-f-tp`) — temporal-prior input variant, 4-channel input
 - `-pro` (planned, see ROADMAP §1.8) — kitchen-sink-of-everything per size point
+- `-obb` (`bbox-{f,p,n,s}-obb`) — base architecture (no SPPF/PAFPN/decoupled head) + 7-ch OBB head (`obj + ltrb + Tanh angle`). Edge tier, opset-13/Myriad-X safe. Leaner than `-pro` for tightest MCU footprint with orientation. Same OBB output contract as `-pro`; same encode/decode/loss path. Requires `opndet sam-obb` labels and curriculum `w_wh: 0.1` from ep 0 to avoid sub-cell-precision stall.
 
 All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except hm2 / flow / -pro variants which have different output shape). Differ in backbone widths/depths and neck/head channels.
 

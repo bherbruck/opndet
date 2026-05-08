@@ -306,11 +306,11 @@ def encode_targets_obb(
                 continue
             r_px = gaussian_radius(bw, bh)
             base_sigma = max(min_sigma, r_px / s / 3.0)
-            # Scale sigmas by aspect so the heatmap's footprint matches the OBB.
-            ar = max(bw, bh) / max(min(bw, bh), 1.0)
-            sigma_major = max(min_sigma, base_sigma * math.sqrt(ar))
-            sigma_minor = max(min_sigma, base_sigma / math.sqrt(ar))
-            _draw_rotated_gaussian(hm, ix, iy, sigma_major, sigma_minor, float(theta))
+            # Circular cls heatmap: shape info lives in the reg head (sin2θ/cos2θ),
+            # NOT in the heatmap target. Elongated targets confuse peak-pick because
+            # neighbors along the major axis get high supervision values and steal
+            # the local-max winner. Box rotation still flows through reg channels.
+            _draw_rotated_gaussian(hm, ix, iy, base_sigma, base_sigma, 0.0)
             x1, y1, x2, y2 = obb_to_aabb(cx_px, cy_px, bw, bh, float(theta))
             cx_cell = (ix + 0.5) * s
             cy_cell = (iy + 0.5) * s
