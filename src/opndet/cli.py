@@ -206,6 +206,25 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sam_obb(args: argparse.Namespace) -> int:
+    from opndet.sam_preprocess import run as sam_run
+    stats = sam_run(
+        coco_json=args.coco,
+        images_dir=args.images,
+        out_dir=args.out,
+        sam_model=args.sam_model,
+        device=args.device,
+        max_images=args.max_images,
+        progress_every=args.progress_every,
+    )
+    print(f"processed={stats.n_images_processed} skipped={stats.n_images_skipped} "
+          f"obj={stats.n_objects_processed} obb={stats.n_obb_extracted} "
+          f"round={stats.n_aabb_fallback} drop={stats.n_invalid_dropped} "
+          f"errors={len(stats.errors)} ({stats.duration_seconds}s)")
+    print(f"manifest: {Path(args.out) / 'manifest.json'}")
+    return 0
+
+
 def _cmd_quantize(args: argparse.Namespace) -> int:
     from opndet.quantize import parity_check, quantize_onnx
     info = quantize_onnx(args.onnx, args.out, args.calib, n_calib=args.n_calib, quant_format=args.format)
@@ -382,6 +401,21 @@ def main(argv: list[str] | None = None) -> int:
     pmn.add_argument("--out", default=None,
                      help="Output dir (default: <ckpt-dir>/hard_negatives_<ckpt-stem>)")
     pmn.set_defaults(func=_cmd_mine_negatives)
+
+    pso = sub.add_parser("sam-obb",
+                         help="Preprocess: SAM2 + COCO AABBs → YOLOv8-OBB *.txt files. "
+                              "One-shot per dataset, idempotent. "
+                              "Output OBB coords may extend outside [0,1] for objects "
+                              "truncated at frame edges — intentional.")
+    pso.add_argument("--coco", required=True, help="Path to COCO _annotations.coco.json")
+    pso.add_argument("--images", required=True, help="Directory of images referenced by the COCO file")
+    pso.add_argument("--out", required=True, help="Output dir for per-image *.txt + manifest.json")
+    pso.add_argument("--sam-model", default="sam2_b",
+                     help="SAM2 size: sam2_t|s|b|l or sam2.1_t|s|b|l, or raw HF id (default: sam2_b)")
+    pso.add_argument("--device", default="cuda", help="cuda or cpu")
+    pso.add_argument("--max-images", type=int, default=None, help="Cap number of images (debug)")
+    pso.add_argument("--progress-every", type=int, default=25, help="Print progress every N images")
+    pso.set_defaults(func=_cmd_sam_obb)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
     pq.add_argument("--onnx", required=True, help="Input fp32 ONNX")
