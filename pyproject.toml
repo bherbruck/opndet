@@ -4,18 +4,23 @@ version = "0.1.0"
 description = "Tiny single-class object detector. OpenVINO 2022 opset compatible. No NMS."
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.0",
-    "numpy>=1.24",
-    "scipy>=1.10",
-    "onnx>=1.14",
-    "onnxruntime>=1.16",
-    "onnxscript>=0.1",
-    "pillow>=10.0",
-    "opencv-python-headless>=4.8",
-    "pyyaml>=6.0",
-    "tensorboard>=2.13",
-    "tqdm>=4.65",
-    "matplotlib>=3.6",
+    # Major-pinned to stop bleeding-edge breakage from Colab base-image rolls.
+    # `~=X.Y` means `>=X.Y, <X+1` (PEP 440 "compatible release", pip's closest
+    # analog to Cargo/Poetry's `^`). Explicit `>=X, <Y` used where we need to
+    # block a specific bad release below the next-major boundary.
+    # See docs/engineering-decisions.md "Dep pinning" for the why.
+    "torch >= 2.0, < 2.12",            # 2.11 current; block 2.12 until validated
+    "numpy >= 1.24, < 2.3",            # 2.3+ broke `_blas_supports_fpe` interop with scipy
+    "scipy ~= 1.10",                   # >= 1.10, < 2
+    "onnx ~= 1.14",                    # >= 1.14, < 2
+    "onnxruntime ~= 1.16",             # >= 1.16, < 2
+    "onnxscript >= 0.1, < 2",
+    "pillow >= 10.0, < 12",            # 12+ broke gradio + others; not worth chasing
+    "opencv-python-headless ~= 4.8",   # >= 4.8, < 5
+    "pyyaml ~= 6.0",                   # >= 6.0, < 7
+    "tensorboard >= 2.13, < 2.20",     # 2.20+ restructured `compat.notf` import path
+    "tqdm ~= 4.65",                    # >= 4.65, < 5
+    "matplotlib ~= 3.6",               # >= 3.6, < 4
 ]
 
 [project.optional-dependencies]

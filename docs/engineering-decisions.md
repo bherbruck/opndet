@@ -158,6 +158,29 @@ Training continues even if tensorboard import fails. Scalars still flow to DuckD
 
 ---
 
+## Dep pinning (pyproject.toml has upper bounds)
+
+opndet's `pyproject.toml` uses major-pin upper bounds (`<2.12`, `< 2.3`, `~=4.8`) on every dep, NOT the more common `>=` floors-only style. This is intentional.
+
+**Why:** Colab and other shared-runtime environments roll their base-image package versions on no announced schedule. We had ~5 separate breakages in a single week from Colab silently bumping numpy 2.3→2.4, torch 2.10→2.11, tensorboard 2.19→2.20, protobuf 6→7, pillow 11→12, fsspec 2025→2026. Each cascade broke `pip install opndet` because our floors-only `>=` deps let pip resolve ANY new upstream version. Force-reinstall made it worse — even our pinned torch in install-cell-1 was overridden by opndet's transitive resolution in install-cell-2.
+
+**The fix is upper bounds.** PEP 440 supports two styles:
+- `~= X.Y` is "compatible release" (pip's closest analog to Cargo/Poetry `^`): `~=2.10` = `>=2.10, <3`. Locks at the next-major boundary.
+- `>= X, < Y` is explicit. Used when we need a non-major-aligned ceiling (e.g. `numpy < 2.3` even though numpy 3 doesn't exist yet).
+
+We use a mixed style: `~=` where the next-major boundary is the right block; explicit `>=, <` where we need to block a specific bad release.
+
+**The trade-off:** users get bug-fix updates within the current major, but no silent breaking changes. When a new major comes out and we want to validate it, we expand the bound — we don't chase upstream daily.
+
+**When to update the bounds:**
+- An upstream dep ships a major version that we WANT to use (e.g. torch 2.12 ships a real perf win)
+- Validate locally + update the upper bound in pyproject.toml + bump opndet version
+- Don't preemptively widen "just to support latest" — there's no benefit if no opndet feature requires the newer dep
+
+**Optional deps** (`dev`, `video`, `dashboard` in `[project.optional-dependencies]`) aren't bounded as strictly because they affect single subcommands; if `opndet dashboard` breaks because fastapi shipped a major, that's contained.
+
+---
+
 ## Optimizer choice
 
 ### `optimizer: adamw` is the default. `optimizer: musgd` is opt-in for server-tier `-pro`.
