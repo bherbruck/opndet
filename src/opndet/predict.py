@@ -41,7 +41,7 @@ def preprocess(
     If in_ch==4 and prior is None, a zero prior (cold-start) is used.
     """
     img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_lb, _ = letterbox(img, np.zeros((0, 4), dtype=np.float32), h, w)
+    img_lb, _, _ = letterbox(img, np.zeros((0, 4), dtype=np.float32), h, w)
     f = img_lb.astype(np.float32) / 255.0
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)

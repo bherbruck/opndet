@@ -82,7 +82,7 @@ def perturbation_stability(
         if img_bgr is None:
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img_lb, gt_lb = letterbox(img_rgb, s.boxes.copy(), img_h, img_w)
+        img_lb, gt_lb, _ = letterbox(img_rgb, s.boxes.copy(), img_h, img_w)
         if gt_lb.shape[0] == 0:
             continue
         n_gt_total += gt_lb.shape[0]

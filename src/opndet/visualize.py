@@ -238,16 +238,30 @@ def save_layered_vis(
             db.add_overlay(ep, tag, i, "obj_heat", obj_path)
             if i < len(gt_boxes) and gt_boxes[i].shape[0] > 0:
                 gt_meta = None
+                from opndet.decode import OBBDetection
                 if gt_obbs_per is not None and i < len(gt_obbs_per) and len(gt_obbs_per[i]) > 0:
                     # Per-row meta: corners + theta. JS renderer reads `corners` to
                     # draw a rotated quad; falls back to AABB row if absent.
-                    from opndet.decode import OBBDetection
                     gt_meta = {}
                     for j, gt in enumerate(gt_obbs_per[i]):
                         cx, cy, aw, ah, theta = (float(v) for v in gt[:5])
                         det = OBBDetection(cx, cy, aw, ah, theta, 1.0)
                         gt_meta[j] = {"corners": det.to_corners().tolist(),
                                        "theta": theta}
+                elif is_obb:
+                    # OBB model with no OBB labels for this sample → derive
+                    # axis-aligned (θ=0) corners from the AABB so the dashboard
+                    # never shows raw AABB rectangles for OBB-head training.
+                    gt_meta = {}
+                    for j, b in enumerate(gt_boxes[i]):
+                        x1, y1, x2, y2 = (float(v) for v in b[:4])
+                        cx = (x1 + x2) * 0.5
+                        cy = (y1 + y2) * 0.5
+                        w = max(x2 - x1, 1.0)
+                        h = max(y2 - y1, 1.0)
+                        det = OBBDetection(cx, cy, w, h, 0.0, 1.0)
+                        gt_meta[j] = {"corners": det.to_corners().tolist(),
+                                       "theta": 0.0}
                 db.add_boxes(ep, tag, i, "gt", gt_boxes[i], meta=gt_meta)
             if dets_per[i]:
                 if is_obb:

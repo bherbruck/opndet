@@ -179,6 +179,48 @@ def test_angle_err_rad_pi_symmetry():
     assert abs(math.degrees(angle_err_rad(math.radians(30), math.radians(-30))) - 60.0) < 1e-3
 
 
+def test_letterbox_transforms_obbs():
+    """letterbox scales cx/cy/w/h uniformly and pad-shifts cx/cy. theta is invariant."""
+    from opndet.dataset import letterbox
+
+    img = np.zeros((600, 800, 3), dtype=np.uint8)
+    boxes = np.array([[100.0, 50.0, 300.0, 250.0]], dtype=np.float32)
+    obbs = np.array([[200.0, 150.0, 100.0, 40.0, math.radians(30)]], dtype=np.float32)
+    out_img, out_boxes, out_obbs = letterbox(img, boxes, 384, 512, obbs=obbs)
+    # 800x600 → 512x384 needs scale = min(512/800, 384/600) = min(0.64, 0.64) = 0.64
+    # Both axes scale identically — no padding either direction (square aspect match)
+    assert out_img.shape == (384, 512, 3)
+    scale = 384 / 600  # 0.64
+    # cx scales: 200 * 0.64 = 128 (no x-pad since aspect matches)
+    assert abs(out_obbs[0, 0] - 200.0 * scale) < 0.5
+    # cy scales: 150 * 0.64 = 96
+    assert abs(out_obbs[0, 1] - 150.0 * scale) < 0.5
+    # w/h scale uniformly
+    assert abs(out_obbs[0, 2] - 100.0 * scale) < 0.5
+    assert abs(out_obbs[0, 3] - 40.0 * scale) < 0.5
+    # theta unchanged
+    assert abs(out_obbs[0, 4] - math.radians(30)) < 1e-6
+
+
+def test_letterbox_with_padding_shifts_obbs():
+    """Non-square source → asymmetric pad on one axis. Verify cx/cy shift."""
+    from opndet.dataset import letterbox
+
+    img = np.zeros((400, 800, 3), dtype=np.uint8)  # 2:1 aspect
+    boxes = np.array([[100.0, 100.0, 300.0, 300.0]], dtype=np.float32)
+    obbs = np.array([[200.0, 200.0, 80.0, 30.0, math.radians(45)]], dtype=np.float32)
+    out_img, _, out_obbs = letterbox(img, boxes, 384, 512, obbs=obbs)
+    # scale = min(512/800, 384/400) = min(0.64, 0.96) = 0.64
+    # new dims: 512x256. pad_y = (384-256)/2 = 64. pad_x = 0.
+    scale = 0.64
+    pad_y = 64
+    expected_cx = 200.0 * scale + 0  # 128
+    expected_cy = 200.0 * scale + pad_y  # 128 + 64 = 192
+    assert abs(out_obbs[0, 0] - expected_cx) < 0.5
+    assert abs(out_obbs[0, 1] - expected_cy) < 0.5
+    assert abs(out_obbs[0, 4] - math.radians(45)) < 1e-6
+
+
 def test_aug_hflip_transforms_obb():
     """hflip mirrors cx and θ for OBBs. Verifies the OBB GT survives photometric+hflip aug."""
     from opndet.augment import AugConfig, make_augment

@@ -107,8 +107,14 @@ def load_datasets(sources: list[dict] | list[tuple[str, str]]) -> list[Sample]:
     return out
 
 
-def letterbox(img: np.ndarray, boxes: np.ndarray, target_h: int, target_w: int, pad_value: int = 114) -> tuple[np.ndarray, np.ndarray]:
-    """Resize keeping aspect ratio, pad to target. Update boxes (xyxy)."""
+def letterbox(img: np.ndarray, boxes: np.ndarray, target_h: int, target_w: int, pad_value: int = 114,
+              obbs: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Resize keeping aspect ratio, pad to target. Update boxes (xyxy) AND obbs.
+
+    OBB transform: cx/cy/w/h all scale uniformly (same `scale` factor); cx/cy
+    additionally shift by the pad offset. theta is invariant under uniform
+    scale + translation. If obbs is None, returns None for that field.
+    """
     h, w = img.shape[:2]
     c = img.shape[2] if img.ndim == 3 else 1
     scale = min(target_w / w, target_h / h)
@@ -122,7 +128,14 @@ def letterbox(img: np.ndarray, boxes: np.ndarray, target_h: int, target_w: int, 
         boxes = boxes.copy()
         boxes[:, [0, 2]] = boxes[:, [0, 2]] * scale + pad_x
         boxes[:, [1, 3]] = boxes[:, [1, 3]] * scale + pad_y
-    return canvas, boxes
+    if obbs is not None and obbs.shape[0] > 0:
+        obbs = obbs.copy()
+        obbs[:, 0] = obbs[:, 0] * scale + pad_x  # cx
+        obbs[:, 1] = obbs[:, 1] * scale + pad_y  # cy
+        obbs[:, 2] = obbs[:, 2] * scale          # w
+        obbs[:, 3] = obbs[:, 3] * scale          # h
+        # theta unchanged — uniform scale + translation preserves orientation
+    return canvas, boxes, obbs
 
 
 class OpndetDataset(Dataset):
@@ -251,14 +264,20 @@ class OpndetDataset(Dataset):
         out_boxes = np.concatenate(all_boxes, axis=0) if all_boxes else np.zeros((0, 4), dtype=np.float32)
         return canvas, out_boxes
 
-    def _finish(self, img: np.ndarray, boxes: np.ndarray, do_letterbox: bool = True):
+    def _finish(self, img: np.ndarray, boxes: np.ndarray, do_letterbox: bool = True,
+                obbs: np.ndarray | None = None):
+        # OBBs are threaded through aug + letterbox alongside boxes so the
+        # encoded GT lands in the same coords as the canvas image. Without
+        # this, OBB cx/cy stay in original-image coords → encoder cell index
+        # ends up out-of-bounds for non-square images and the GT is dropped.
         if self.aug is not None:
-            img, boxes = self.aug(img, boxes)
+            img, boxes, obbs = self.aug(img, boxes, obbs)
 
         # always letterbox — aug (rotate90 with k=1 or 3) can transpose dims, so the
         # final canvas size must be reasserted regardless of where img came from.
         if do_letterbox or img.shape[:2] != (self.img_h, self.img_w):
-            img, boxes = letterbox(img, boxes, self.img_h, self.img_w)
+            img, boxes, obbs = letterbox(img, boxes, self.img_h, self.img_w, obbs=obbs)
+        self._cur_obbs = obbs if (obbs is not None and obbs.shape[0] > 0) else None
 
         if boxes.shape[0] > 0:
             boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, self.img_w - 1)
@@ -295,13 +314,8 @@ class OpndetDataset(Dataset):
         return img_t, boxes, targets
 
     def __getitem__(self, idx: int):
-        # _cur_obbs: when set, passed to encode_fn alongside boxes (OBB head only).
-        # Two paths preserve orientation:
-        #   - no augmentation at all (val/test or train w/ aug disabled)
-        #   - augmentation pipeline declares itself orient_safe (only photometric
-        #     + cutout, no hflip/vflip/rotate90). The aug callable carries an
-        #     `orient_safe` attr; OBBs are threaded through and cutout's keep
-        #     mask is applied to them in lockstep with boxes.
+        # _finish() owns aug + letterbox; both transform obbs through in lockstep
+        # with boxes. We just hand it the raw sample (image-pixel coords).
         self._cur_obbs = None
         if self.mosaic_prob > 0 and random.random() < self.mosaic_prob:
             img, boxes = self._mosaic(idx)
@@ -312,14 +326,7 @@ class OpndetDataset(Dataset):
             img = img.copy()
         boxes = s.boxes.copy()
         sample_obbs = s.obbs.copy() if getattr(s, "obbs", None) is not None else None
-        if self.aug is not None:
-            img, boxes, sample_obbs = self.aug(img, boxes, sample_obbs)
-            if sample_obbs is not None:
-                self._cur_obbs = sample_obbs
-            return self._finish(img, boxes, do_letterbox=False)
-        if sample_obbs is not None:
-            self._cur_obbs = sample_obbs
-        return self._finish(img, boxes, do_letterbox=True)
+        return self._finish(img, boxes, do_letterbox=True, obbs=sample_obbs)
 
 
 def collate(batch):
