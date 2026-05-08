@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 from opndet._optim import linear_sum_assignment
 
@@ -282,6 +284,96 @@ def loc_bias(matched_pred: np.ndarray, matched_gt: np.ndarray) -> dict:
         "scale_scatter_w": float(dw.std()),
         "scale_scatter_h": float(dh.std()),
     }
+
+
+def rotated_iou(cx1: float, cy1: float, w1: float, h1: float, t1_rad: float,
+                cx2: float, cy2: float, w2: float, h2: float, t2_rad: float) -> float:
+    """IoU between two oriented rectangles via cv2 polygon intersection.
+    theta in radians = rotation of major axis from +x. cv2 angles are in degrees.
+    Robust to near-zero areas; returns 0 on degenerate input.
+    """
+    if w1 <= 0 or h1 <= 0 or w2 <= 0 or h2 <= 0:
+        return 0.0
+    r1 = ((float(cx1), float(cy1)), (float(w1), float(h1)), float(math.degrees(t1_rad)))
+    r2 = ((float(cx2), float(cy2)), (float(w2), float(h2)), float(math.degrees(t2_rad)))
+    ret, inter = cv2.rotatedRectangleIntersection(r1, r2)
+    if ret == 0 or inter is None or len(inter) < 3:
+        return 0.0
+    inter_area = float(cv2.contourArea(inter))
+    a1 = float(w1) * float(h1)
+    a2 = float(w2) * float(h2)
+    return inter_area / max(a1 + a2 - inter_area, 1e-9)
+
+
+def angle_err_rad(t1: float, t2: float) -> float:
+    """Angular error wrapped to [0, π/2]. OBB has π/2 symmetry — flipping the
+    major axis by π yields the same rectangle, so errors >π/2 fold back."""
+    d = abs(float(t1) - float(t2)) % math.pi
+    return min(d, math.pi - d)
+
+
+def aabb_theta_to_rotated_wh(aw: float, ah: float, theta_rad: float) -> tuple[float, float]:
+    """Invert (enclosing AABB w/h, θ) → (rotated rect w/h). Encoder stores AABB
+    bounding the OBB; metrics need the rotated rect dims for cv2 polygon IoU.
+    Singular at |cos 2θ|≈0 (θ≈±45°) — fall back to AABB dims (visually a square)."""
+    c = abs(math.cos(theta_rad))
+    s = abs(math.sin(theta_rad))
+    det = c * c - s * s
+    if abs(det) > 1e-3:
+        w = (c * float(aw) - s * float(ah)) / det
+        h = (-s * float(aw) + c * float(ah)) / det
+        return max(0.0, w), max(0.0, h)
+    return float(aw), float(ah)
+
+
+def obb_summary(pred_obbs: np.ndarray, gt_obbs: np.ndarray,
+                iou_thresh: float = 0.3) -> dict:
+    """Per-image OBB diagnostics. pred/gt: [N, 5] = (cx, cy, w_aabb, h_aabb, theta_rad)
+    matching the encode/decode contract (cx/cy/w/h are the enclosing AABB).
+
+    Hungarian-matches preds→GTs minimizing 1 - rotated_iou; matches below
+    iou_thresh count as unmatched. Returns rotated_iou + angle_err on matched
+    pairs only — diagnostic, not a Precision/Recall replacement.
+    """
+    n_p = int(pred_obbs.shape[0])
+    n_g = int(gt_obbs.shape[0])
+    out = {"n_match": 0, "obb_iou_sum": 0.0, "ang_err_sum": 0.0,
+           "ang_err_le_10_count": 0, "ang_err_le_30_count": 0,
+           "obb_ious": np.zeros(0, dtype=np.float32),
+           "ang_errs_deg": np.zeros(0, dtype=np.float32)}
+    if n_p == 0 or n_g == 0:
+        return out
+    iou_mat = np.zeros((n_p, n_g), dtype=np.float64)
+    for i in range(n_p):
+        wp, hp = aabb_theta_to_rotated_wh(pred_obbs[i, 2], pred_obbs[i, 3], pred_obbs[i, 4])
+        for j in range(n_g):
+            wg, hg = aabb_theta_to_rotated_wh(gt_obbs[j, 2], gt_obbs[j, 3], gt_obbs[j, 4])
+            iou_mat[i, j] = rotated_iou(
+                pred_obbs[i, 0], pred_obbs[i, 1], wp, hp, pred_obbs[i, 4],
+                gt_obbs[j, 0], gt_obbs[j, 1], wg, hg, gt_obbs[j, 4],
+            )
+    cost = 1.0 - iou_mat
+    rows, cols = linear_sum_assignment(cost)
+    iou_keep = []
+    ang_keep = []
+    for r, c in zip(rows, cols):
+        if iou_mat[r, c] < iou_thresh:
+            continue
+        iou_keep.append(float(iou_mat[r, c]))
+        e_rad = angle_err_rad(pred_obbs[r, 4], gt_obbs[c, 4])
+        ang_keep.append(math.degrees(e_rad))
+    if not iou_keep:
+        return out
+    iou_arr = np.asarray(iou_keep, dtype=np.float32)
+    ang_arr = np.asarray(ang_keep, dtype=np.float32)
+    out["n_match"] = int(iou_arr.shape[0])
+    out["obb_iou_sum"] = float(iou_arr.sum())
+    out["ang_err_sum"] = float(ang_arr.sum())
+    out["ang_err_le_10_count"] = int((ang_arr <= 10.0).sum())
+    out["ang_err_le_30_count"] = int((ang_arr <= 30.0).sum())
+    out["obb_ious"] = iou_arr
+    out["ang_errs_deg"] = ang_arr
+    return out
 
 
 def calibration_bins(scores: np.ndarray, is_tp: np.ndarray, n_bins: int = 10) -> dict:

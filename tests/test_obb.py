@@ -121,6 +121,80 @@ def test_encode_decode_obb_roundtrip():
         assert max_err < 2.0, f"OBB corners off by {max_err}"
 
 
+def test_gt_obbs_from_targets_roundtrip():
+    """Verify the encode→decode chain used by metrics + dashboard GT corners."""
+    from opndet.config import ModelConfig
+    from opndet.decode import gt_obbs_from_targets
+    from opndet.encode import encode_targets_obb
+
+    cfg = ModelConfig()
+    obbs = np.array([
+        [200.0, 150.0, 100.0, 40.0, math.radians(30)],
+        [80.0,  80.0,   60.0, 25.0, math.radians(75)],
+    ], dtype=np.float32)
+    tgt = encode_targets_obb(obbs, cfg)
+    pos_b = tgt["pos"].unsqueeze(0).numpy()
+    obb_b = tgt["obb"].unsqueeze(0).numpy()
+    gt = gt_obbs_from_targets(pos_b, obb_b, cfg.img_h, cfg.img_w, cfg.stride)
+    assert len(gt) == 1
+    assert gt[0].shape == (2, 5)
+    decoded = sorted(gt[0].tolist())
+    expected = sorted(obbs.tolist())
+    for (cx, cy, _, _, th), (gx, gy, _, _, gth) in zip(decoded, expected):
+        assert abs(cx - gx) < 2.0
+        assert abs(cy - gy) < 2.0
+        d = abs(((th - gth) + math.pi / 2) % math.pi - math.pi / 2)
+        assert d < 1e-2, f"theta mismatch decoded={math.degrees(th):.1f} expected={math.degrees(gth):.1f}"
+
+
+def test_rotated_iou_self_and_orthogonal():
+    """rotated_iou trace check: self-IoU=1, 90°-rotated IoU on a square=1, axis-flipped at 90°=0."""
+    from opndet.metrics import rotated_iou
+
+    # Self-IoU: identical rectangles
+    iou = rotated_iou(100.0, 100.0, 80.0, 30.0, 0.0,
+                      100.0, 100.0, 80.0, 30.0, 0.0)
+    assert iou > 0.999, f"self-IoU should be 1, got {iou}"
+
+    # Orthogonal: same rect rotated 90° on a non-square. Should be small overlap.
+    iou_90 = rotated_iou(100.0, 100.0, 80.0, 30.0, 0.0,
+                         100.0, 100.0, 80.0, 30.0, math.pi / 2)
+    assert iou_90 < 0.5, f"90°-rotated non-square IoU should be small, got {iou_90}"
+
+    # Square at 45° vs 0°: identical rotated by 45° around center → octagonal
+    # intersection. IoU = √2/2 ≈ 0.707 exactly (two unit squares overlapped at 45°).
+    iou_diag = rotated_iou(100.0, 100.0, 50.0, 50.0, 0.0,
+                           100.0, 100.0, 50.0, 50.0, math.pi / 4)
+    assert 0.65 < iou_diag < 0.75, f"square @45° IoU ≈ √2/2 = 0.707, got {iou_diag}"
+
+
+def test_angle_err_rad_pi_symmetry():
+    """Angle error wraps at π/2 — flipping the major axis by π gives the same rectangle."""
+    from opndet.metrics import angle_err_rad
+
+    assert angle_err_rad(0.0, 0.0) == 0.0
+    assert abs(angle_err_rad(0.0, math.pi) - 0.0) < 1e-9
+    assert abs(angle_err_rad(0.0, math.pi / 2) - math.pi / 2) < 1e-9
+    # 30° vs -30° = 60° error, NOT 180-60=120
+    assert abs(math.degrees(angle_err_rad(math.radians(30), math.radians(-30))) - 60.0) < 1e-3
+
+
+def test_obb_summary_perfect_match():
+    """obb_summary on identical pred=GT yields IoU=1, ang_err=0.
+    Inputs follow the (cx, cy, w_aabb, h_aabb, θ) contract — same shape produced
+    by decode_obb / gt_obbs_from_targets. Use θ=0 so AABB==OBB to keep the
+    expected dims hand-computable.
+    """
+    from opndet.metrics import obb_summary
+
+    gt = np.array([[200.0, 150.0, 100.0, 40.0, 0.0]], dtype=np.float32)
+    pred = gt.copy()
+    s = obb_summary(pred, gt, iou_thresh=0.3)
+    assert s["n_match"] == 1
+    assert s["obb_ious"][0] > 0.999
+    assert s["ang_errs_deg"][0] < 0.01
+
+
 def test_encode_obb_no_obbs():
     from opndet.config import ModelConfig
     from opndet.encode import encode_targets_obb

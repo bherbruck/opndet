@@ -242,17 +242,50 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
     decode_threshold filters peaks before AP; 0.05 is plenty since AP is rank-driven and dense
     scenes can produce thousands of low-conf peaks that contribute essentially nothing to AP.
     """
-    from opndet.metrics import hungarian_match
+    from opndet.metrics import hungarian_match, obb_summary
+    from opndet.decode import decode_obb_batch, gt_obbs_from_targets
     model.eval()
     tp = fp = fn = 0
     n_pred = n_gt = 0
     per_image: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-    for imgs, boxes_list, _ in tqdm(loader, desc="val", leave=False):
+    is_obb_model = False
+    obb_match_total = 0
+    obb_iou_sum = 0.0
+    ang_err_sum = 0.0
+    ang_err_le_10 = 0
+    ang_err_le_30 = 0
+    obb_ious_all: list[np.ndarray] = []
+    ang_errs_all: list[np.ndarray] = []
+    for imgs, boxes_list, targets in tqdm(loader, desc="val", leave=False):
         imgs = imgs.to(device, non_blocking=True)
         out = model(imgs)
         out_t = out["output"] if isinstance(out, dict) else out
         out_np = out_t.cpu().numpy()
         dets_per_full = decode_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=decode_threshold)
+
+        # OBB-mode side channel: when the head emits 7-ch, also run rotated-IoU
+        # + angle-error metrics. GT OBBs come from the encoded targets dict
+        # (post-letterbox, same coords as boxes_list), preds via decode_obb_batch.
+        if out_np.shape[1] == 7 and targets is not None and "obb" in targets and "pos" in targets:
+            is_obb_model = True
+            pred_obbs_per = decode_obb_batch(out_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride, threshold=score_thresh)
+            pos_np = targets["pos"].cpu().numpy()
+            obb_np = targets["obb"].cpu().numpy()
+            gt_obbs_per = gt_obbs_from_targets(pos_np, obb_np, cfg_shim.img_h, cfg_shim.img_w, cfg_shim.stride)
+            for pred_dets, gt_obbs_i in zip(pred_obbs_per, gt_obbs_per):
+                if not pred_dets:
+                    continue
+                pred_arr = np.array([[d.cx, d.cy, d.w, d.h, d.theta] for d in pred_dets], dtype=np.float32)
+                summ = obb_summary(pred_arr, gt_obbs_i, iou_thresh=0.3)
+                obb_match_total += summ["n_match"]
+                obb_iou_sum += summ["obb_iou_sum"]
+                ang_err_sum += summ["ang_err_sum"]
+                ang_err_le_10 += summ["ang_err_le_10_count"]
+                ang_err_le_30 += summ["ang_err_le_30_count"]
+                if summ["obb_ious"].size:
+                    obb_ious_all.append(summ["obb_ious"])
+                    ang_errs_all.append(summ["ang_errs_deg"])
+
         for dets_full, gt in zip(dets_per_full, boxes_list):
             scores_full = np.array([d.score for d in dets_full], dtype=np.float32) if dets_full else np.zeros(0, dtype=np.float32)
             boxes_full = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets_full], dtype=np.float32) if dets_full else np.zeros((0, 4), dtype=np.float32)
@@ -376,6 +409,20 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
         f1_opt = 0.0
         threshold_opt = float(score_thresh)
 
+    if is_obb_model and obb_match_total > 0:
+        obb_iou_mean = obb_iou_sum / max(1, obb_match_total)
+        ang_err_deg_mean = ang_err_sum / max(1, obb_match_total)
+        ang_err_le_10_frac = ang_err_le_10 / max(1, obb_match_total)
+        ang_err_le_30_frac = ang_err_le_30 / max(1, obb_match_total)
+        all_ious = np.concatenate(obb_ious_all)
+        all_angs = np.concatenate(ang_errs_all)
+        obb_iou_p50 = float(np.median(all_ious))
+        ang_err_deg_median = float(np.median(all_angs))
+    else:
+        obb_iou_mean = obb_iou_p50 = 0.0
+        ang_err_deg_mean = ang_err_deg_median = 0.0
+        ang_err_le_10_frac = ang_err_le_30_frac = 0.0
+
     return {"precision": precision, "recall": recall, "f1": f1, "map50": map50, "map_50_95": map_50_95,
             "map50_shape": map50_shape, "map_50_95_shape": map_50_95_shape,
             "f1_opt": f1_opt, "threshold_opt": threshold_opt,
@@ -404,7 +451,15 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
             "center_perfect_rate": float(center_perfect_rate),
             "center_within_1cell": float(center_within_1cell),
             "center_within_2cell": float(center_within_2cell),
-            "count_off_le1_frac": float(count_off_le1_frac)}
+            "count_off_le1_frac": float(count_off_le1_frac),
+            # OBB diagnostics (only meaningful when 7-ch head; 0 otherwise).
+            # Hungarian-matched on 1-rotated_iou cost @ 0.3 threshold.
+            "obb_iou_mean": float(obb_iou_mean),
+            "obb_iou_p50": float(obb_iou_p50),
+            "angle_err_deg_mean": float(ang_err_deg_mean),
+            "angle_err_deg_median": float(ang_err_deg_median),
+            "angle_err_le_10_frac": float(ang_err_le_10_frac),
+            "angle_err_le_30_frac": float(ang_err_le_30_frac)}
 
 
 def _bundle_run(out_dir: Path, include_tb: bool = False) -> Path | None:
@@ -1004,14 +1059,22 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     vis_imgs = []
     vis_boxes = []
     vis_trails: list[list] = []
+    vis_obbs: list[np.ndarray] = []
+    from opndet.decode import gt_obbs_from_targets as _gt_obbs_from_targets
     if n_vis > 0 and vis_every > 0:
         val_ds._return_trails = (in_ch == 4)
         for i in range(min(n_vis, len(val_ds))):
             r = val_ds[i]
-            img_t, boxes = r[0], r[1]
+            img_t, boxes, targets = r[0], r[1], r[2]
             vis_imgs.append(img_t)
             vis_boxes.append(boxes)
             vis_trails.append(r[3] if len(r) == 4 else [])
+            if targets is not None and "obb" in targets and "pos" in targets:
+                pos_b = targets["pos"].unsqueeze(0).numpy()
+                obb_b = targets["obb"].unsqueeze(0).numpy()
+                vis_obbs.append(_gt_obbs_from_targets(pos_b, obb_b, img_h, img_w, cfg_shim.stride)[0])
+            else:
+                vis_obbs.append(np.zeros((0, 5), dtype=np.float32))
         val_ds._return_trails = False
     vis_batch = torch.stack(vis_imgs, dim=0) if vis_imgs else None
 
@@ -1019,21 +1082,31 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     test_vis_imgs = []
     test_vis_boxes = []
     test_vis_trails: list[list] = []
+    test_vis_obbs: list[np.ndarray] = []
     if n_test_vis > 0 and test_every > 0 and len(test_ds) > 0:
         test_ds._return_trails = (in_ch == 4)
         for i in range(min(n_test_vis, len(test_ds))):
             r = test_ds[i]
-            img_t, boxes = r[0], r[1]
+            img_t, boxes, targets = r[0], r[1], r[2]
             test_vis_imgs.append(img_t)
             test_vis_boxes.append(boxes)
             test_vis_trails.append(r[3] if len(r) == 4 else [])
+            if targets is not None and "obb" in targets and "pos" in targets:
+                pos_b = targets["pos"].unsqueeze(0).numpy()
+                obb_b = targets["obb"].unsqueeze(0).numpy()
+                test_vis_obbs.append(_gt_obbs_from_targets(pos_b, obb_b, img_h, img_w, cfg_shim.stride)[0])
+            else:
+                test_vis_obbs.append(np.zeros((0, 5), dtype=np.float32))
         test_ds._return_trails = False
     test_vis_batch = torch.stack(test_vis_imgs, dim=0) if test_vis_imgs else None
 
     metric_for_best = str(c.get("metric_for_best", "f1"))
     valid_metrics = ("f1", "map50", "map_50_95", "f1_opt",
                      "f1_cal", "map50_cal", "map_50_95_cal", "f1_opt_cal",
-                     "center_f1", "center_f1_lenient", "center_recall")
+                     "center_f1", "center_f1_lenient", "center_recall",
+                     "obb_iou_mean", "obb_iou_p50",
+                     "angle_err_deg_mean", "angle_err_deg_median",
+                     "angle_err_le_10_frac", "angle_err_le_30_frac")
     if metric_for_best not in valid_metrics:
         raise ValueError(f"metric_for_best must be one of {valid_metrics}, got {metric_for_best}")
     metric_is_cal = metric_for_best.endswith("_cal")
@@ -1190,6 +1263,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         cur_lr = opt.param_groups[0]["lr"]
         print(f"epoch {epoch+1:3d}/{epochs}  lr={cur_lr:.2e}  loss={avg['loss']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}  F1_opt={m['f1_opt']:.3f}@{m['threshold_opt']:.2f}  mAP@.5/.95={m['map50']:.3f}/{m['map_50_95']:.3f}  shape=.{int(m['map50_shape']*1000):03d}/.{int(m['map_50_95_shape']*1000):03d}  (train {dt:.1f}s val {_t_val:.1f}s)")
         print(f"          center: R={m['center_recall']:.3f} P={m['center_precision']:.3f} (lenient {m['center_precision_lenient']:.3f}) F1={m['center_f1']:.3f} (lenient {m['center_f1_lenient']:.3f})  ghost={m['center_ghost_rate']:.1%} dup={m['center_dup_rate']:.1%}  hit(perf/1c/2c)={m['center_perfect_rate']:.1%}/{m['center_within_1cell']:.1%}/{m['center_within_2cell']:.1%}  count±1={m['count_off_le1_frac']:.1%}")
+        if m.get("obb_iou_mean", 0.0) > 0 or m.get("angle_err_deg_mean", 0.0) > 0:
+            print(f"          obb: iou_mean={m['obb_iou_mean']:.3f} iou_p50={m['obb_iou_p50']:.3f}  ang_err_deg(mean/median)={m['angle_err_deg_mean']:.1f}/{m['angle_err_deg_median']:.1f}  ang≤10°={m['angle_err_le_10_frac']:.1%}  ang≤30°={m['angle_err_le_30_frac']:.1%}")
 
         ep = epoch + 1
         writer.add_scalar("lr", cur_lr, ep)
@@ -1323,7 +1398,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                                      _save_layered_vis_path(out_dir, "test/preds", ep),
                                      db, "test/preds", ep,
                                      threshold=vis_thresh_now, device=device,
-                                     trails_per=test_vis_trails)
+                                     trails_per=test_vis_trails,
+                                     gt_obbs_per=test_vis_obbs)
             last_test_epoch = ep
 
         if vis_batch is not None and (ep == 1 or ep % vis_every == 0 or ep == epochs) and _should_fire(last_vis_epoch):
@@ -1350,7 +1426,8 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                                  _save_layered_vis_path(out_dir, "val/preds", ep),
                                  db, "val/preds", ep,
                                  threshold=vis_thresh_now, device=device,
-                                 trails_per=vis_trails)
+                                 trails_per=vis_trails,
+                                 gt_obbs_per=vis_obbs)
             if vis_T != 1.0:
                 _apply_T(eval_model, 1.0)
             last_vis_epoch = ep

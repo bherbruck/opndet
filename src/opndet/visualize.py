@@ -176,6 +176,7 @@ def save_layered_vis(
     threshold: float = 0.05,
     device: torch.device | str = "cpu",
     trails_per: list | None = None,
+    gt_obbs_per: list | None = None,
 ) -> None:
     """Save per-sample LAYERED vis components for the dashboard:
       - sample_<i>_rgb.png        : clean denormalized RGB (no boxes/overlay)
@@ -236,7 +237,18 @@ def save_layered_vis(
                 db.add_overlay(ep, tag, i, "prior_heat", prior_path)
             db.add_overlay(ep, tag, i, "obj_heat", obj_path)
             if i < len(gt_boxes) and gt_boxes[i].shape[0] > 0:
-                db.add_boxes(ep, tag, i, "gt", gt_boxes[i])
+                gt_meta = None
+                if gt_obbs_per is not None and i < len(gt_obbs_per) and len(gt_obbs_per[i]) > 0:
+                    # Per-row meta: corners + theta. JS renderer reads `corners` to
+                    # draw a rotated quad; falls back to AABB row if absent.
+                    from opndet.decode import OBBDetection
+                    gt_meta = {}
+                    for j, gt in enumerate(gt_obbs_per[i]):
+                        cx, cy, aw, ah, theta = (float(v) for v in gt[:5])
+                        det = OBBDetection(cx, cy, aw, ah, theta, 1.0)
+                        gt_meta[j] = {"corners": det.to_corners().tolist(),
+                                       "theta": theta}
+                db.add_boxes(ep, tag, i, "gt", gt_boxes[i], meta=gt_meta)
             if dets_per[i]:
                 if is_obb:
                     # store enclosing AABB for the box row; corners go to meta.

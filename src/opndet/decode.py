@@ -193,3 +193,40 @@ def decode_obb_batch(out: np.ndarray, img_h: int, img_w: int, stride: int, thres
     """out: [B, 7, H', W']."""
     assert out.ndim == 4 and out.shape[1] == 7
     return [decode_obb(out[i], img_h, img_w, stride, threshold) for i in range(out.shape[0])]
+
+
+def gt_obbs_from_targets(pos: np.ndarray, obb: np.ndarray, img_h: int, img_w: int, stride: int) -> list[np.ndarray]:
+    """Reconstruct per-image GT OBBs from encoded targets.
+        pos: [B, 1, H', W']  (or [B, H', W'])  binary GT-cell mask
+        obb: [B, 6, H', W']  (l, t, r, b, sin2θ, cos2θ) at GT cells
+    Returns list[B] of [N, 5] arrays = (cx, cy, w_aabb, h_aabb, theta_rad).
+    Mirrors `decode_obb`'s arithmetic — caller can compare against pred OBBs
+    via metrics.obb_summary on the same (cx, cy, w_aabb, h_aabb, θ) contract.
+    """
+    if pos.ndim == 4:
+        pos = pos[:, 0]
+    out: list[np.ndarray] = []
+    for b in range(pos.shape[0]):
+        ys, xs = np.nonzero(pos[b] > 0.5)
+        if len(ys) == 0:
+            out.append(np.zeros((0, 5), dtype=np.float32))
+            continue
+        l = obb[b, 0, ys, xs]
+        t = obb[b, 1, ys, xs]
+        r = obb[b, 2, ys, xs]
+        bot = obb[b, 3, ys, xs]
+        s2 = obb[b, 4, ys, xs]
+        c2 = obb[b, 5, ys, xs]
+        cx_pix = (xs + 0.5) * stride
+        cy_pix = (ys + 0.5) * stride
+        x1 = cx_pix - l * img_w
+        y1 = cy_pix - t * img_h
+        x2 = cx_pix + r * img_w
+        y2 = cy_pix + bot * img_h
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        aw = np.maximum(x2 - x1, 0.0)
+        ah = np.maximum(y2 - y1, 0.0)
+        theta = np.mod(0.5 * np.arctan2(s2, c2), math.pi)
+        out.append(np.stack([cx, cy, aw, ah, theta], axis=-1).astype(np.float32))
+    return out
