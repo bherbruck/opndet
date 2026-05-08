@@ -31,6 +31,11 @@ class AugConfig:
     cutout_size_frac: tuple[float, float] = (0.05, 0.20)  # hole side as frac of img dim
     # bbox visibility — drop boxes with <min_visible_frac of original area visible
     min_visible_frac: float = 0.5
+    # hard-negative paste (mined via `opndet mine-negatives`)
+    hard_negative_pool: str | None = None      # dir of patch pngs OR mining out_dir
+    hard_negative_prob: float = 0.0            # per-image inject probability
+    hard_negative_count: int = 1               # patches per injection
+    hard_negative_max_tries: int = 16          # how hard to try to find a non-GT spot
     # composite
     enabled: bool = True
 
@@ -172,9 +177,57 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
     return img, boxes
 
 
-def make_augment(cfg: AugConfig):
+def _hard_negative_paste(
+    img: np.ndarray, boxes: np.ndarray, pool: list[np.ndarray],
+    cfg: AugConfig, rng: np.random.Generator,
+) -> np.ndarray:
+    """Paste random pool patches into non-GT regions of img.
+
+    No labels are added: the pasted region is explicit "DON'T FIRE" supervision.
+    Each paste hunts for a window that doesn't overlap any GT bbox; if no spot
+    is found in cfg.hard_negative_max_tries attempts, the paste is skipped
+    silently (image fully covered by GTs is the only realistic skip case).
+    """
+    if not pool:
+        return img
+    H, W = img.shape[:2]
+    for _ in range(int(cfg.hard_negative_count)):
+        patch = pool[int(rng.integers(0, len(pool)))]
+        ph, pw = patch.shape[:2]
+        if ph >= H or pw >= W:
+            continue
+        spot = None
+        for _t in range(int(cfg.hard_negative_max_tries)):
+            y = int(rng.integers(0, H - ph + 1))
+            x = int(rng.integers(0, W - pw + 1))
+            if boxes.shape[0] == 0:
+                spot = (y, x); break
+            # rejection: any GT bbox overlap with the paste rect
+            px1, py1, px2, py2 = x, y, x + pw, y + ph
+            ix1 = np.maximum(boxes[:, 0], px1)
+            iy1 = np.maximum(boxes[:, 1], py1)
+            ix2 = np.minimum(boxes[:, 2], px2)
+            iy2 = np.minimum(boxes[:, 3], py2)
+            inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+            if (inter <= 0).all():
+                spot = (y, x); break
+        if spot is None:
+            continue
+        y, x = spot
+        # patch is BGR (loaded via cv2.imread); training img is RGB. Convert.
+        if patch.ndim == 3 and patch.shape[2] == 3:
+            patch_rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+        else:
+            patch_rgb = patch
+        img[y:y + ph, x:x + pw] = patch_rgb
+    return img
+
+
+def make_augment(cfg: AugConfig, hn_pool: list[np.ndarray] | None = None):
     if not cfg.enabled:
         return None
+
+    pool = hn_pool or []
 
     def aug(img: np.ndarray, boxes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         rng = np.random.default_rng()
@@ -182,6 +235,8 @@ def make_augment(cfg: AugConfig):
         img, boxes = _geometric(img, boxes, cfg, rng)
         if cfg.cutout_prob > 0 and rng.random() < cfg.cutout_prob:
             img, boxes = _cutout(img, boxes, cfg, rng)
+        if pool and cfg.hard_negative_prob > 0 and rng.random() < cfg.hard_negative_prob:
+            img = _hard_negative_paste(img, boxes, pool, cfg, rng)
         return img, boxes
 
     return aug

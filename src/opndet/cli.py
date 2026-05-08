@@ -145,6 +145,28 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mine_negatives(args: argparse.Namespace) -> int:
+    from opndet.mine_negatives import mine
+    out = args.out
+    if out is None:
+        ckpt_p = Path(args.ckpt)
+        out = str(ckpt_p.parent / f"hard_negatives_{ckpt_p.stem}")
+    res = mine(
+        ckpt=args.ckpt,
+        config=args.config,
+        out_dir=out,
+        split=args.split,
+        max_samples=args.max_samples,
+        top_k_per_sample=args.top_k_per_sample,
+        patch_size=args.patch_size,
+        score_thresh=args.score_thresh,
+        clusters=args.clusters,
+        device=args.device,
+    )
+    print(f"\nsummary: {res['n_patches']} patches, {res['n_samples_with_ghosts']} samples with ghosts")
+    return 0
+
+
 def _cmd_calibrate(args: argparse.Namespace) -> int:
     from opndet.calibrate import calibrate_ckpt
     out = calibrate_ckpt(args.ckpt, args.config, split=args.split, save=not args.dry_run)
@@ -342,6 +364,24 @@ def main(argv: list[str] | None = None) -> int:
     pd.add_argument("--host", default="127.0.0.1", help="Bind host")
     pd.add_argument("--port", type=int, default=5000, help="Bind port")
     pd.set_defaults(func=_cmd_dashboard)
+
+    pmn = sub.add_parser("mine-negatives",
+                         help="Mine hard-negative patches from a trained ckpt's ghosts (Grad-CAM-driven). "
+                              "Writes a patch pool + manifest.json suitable for augment's hard_negative_pool.")
+    pmn.add_argument("--ckpt", required=True, help="Trained checkpoint .pt")
+    pmn.add_argument("--config", default=None, help="Training YAML (optional — falls back to ckpt's saved config)")
+    pmn.add_argument("--split", default="val", choices=["train", "val", "test"])
+    pmn.add_argument("--max-samples", type=int, default=500, help="Cap on number of images to scan")
+    pmn.add_argument("--top-k-per-sample", type=int, default=4,
+                     help="Keep up to K highest-score ghosts per image")
+    pmn.add_argument("--patch-size", type=int, default=32, help="Side length of mined patches (px)")
+    pmn.add_argument("--score-thresh", type=float, default=None,
+                     help="Confidence threshold for the ghost test (default: cfg.eval_threshold or 0.3)")
+    pmn.add_argument("--clusters", type=int, default=8, help="K-means cluster count (sklearn). Set to 1 to skip.")
+    pmn.add_argument("--device", default=None, help="cuda or cpu (auto if omitted)")
+    pmn.add_argument("--out", default=None,
+                     help="Output dir (default: <ckpt-dir>/hard_negatives_<ckpt-stem>)")
+    pmn.set_defaults(func=_cmd_mine_negatives)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
     pq.add_argument("--onnx", required=True, help="Input fp32 ONNX")

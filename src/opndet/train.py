@@ -591,7 +591,15 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     aug_dict = dict(c.get("augment") or {})
     tp_cfg = aug_dict.pop("temporal_prior", None)
     aug_cfg = AugConfig(**aug_dict)
-    aug_fn = make_augment(aug_cfg)
+    hn_pool = []
+    if aug_cfg.hard_negative_pool and aug_cfg.hard_negative_prob > 0:
+        from opndet.mine_negatives import load_pool
+        hn_pool = load_pool(aug_cfg.hard_negative_pool)
+        print(f"  hard-negative pool: {aug_cfg.hard_negative_pool}  loaded {len(hn_pool)} patches "
+              f"(p={aug_cfg.hard_negative_prob}, count={aug_cfg.hard_negative_count})")
+        if not hn_pool:
+            print(f"  WARN: hard_negative_pool {aug_cfg.hard_negative_pool} is empty or missing")
+    aug_fn = make_augment(aug_cfg, hn_pool=hn_pool)
 
     model_path = _resolve_preset(c["model_config"])
     model = build_model_from_yaml(model_path).to(device)
