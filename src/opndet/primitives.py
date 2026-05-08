@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from opndet.blocks import _conv_bn_act
 from opndet.registry import register
 
 
@@ -198,6 +199,27 @@ class Conv(nn.Module):
 class Identity(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
+
+
+@register("SPPF")
+class SPPF(nn.Module):
+    """Spatial Pyramid Pooling Fast (YOLOv8). Three sequential MaxPool-k cover
+    receptive fields {1, k, 2k-1, 3k-2}; concat all four, project. opset-13 safe.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, k: int = 5):
+        super().__init__()
+        c_ = in_ch // 2
+        self.cv1 = _conv_bn_act(in_ch, c_, k=1)
+        self.cv2 = _conv_bn_act(c_ * 4, out_ch, k=1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y0 = self.cv1(x)
+        y1 = self.m(y0)
+        y2 = self.m(y1)
+        y3 = self.m(y2)
+        return self.cv2(torch.cat([y0, y1, y2, y3], dim=1))
 
 
 ACTIVATIONS: dict[str, type[nn.Module]] = {

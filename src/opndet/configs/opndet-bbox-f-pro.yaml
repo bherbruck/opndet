@@ -1,16 +1,16 @@
 # opndet-bbox-f-pro: kitchen-sink-of-everything flagship variant.
 #
-# PHASE 0 STUB — currently a near-copy of opndet-bbox-f with soft_obj exposed as a
-# named tap point. Phases 1-6 (see ROADMAP §1.8) layer in YOLO-family
-# improvements: SPPF, PAFPN, decoupled head, ltrb regression, TAL/STAL/ProgLoss,
-# OBB output, hard-negative-mining augmentation, optionally MuSGD optimizer.
+# PHASE 1 — Bedrock architecture refresh (ROADMAP §1.8):
+#   - SPPF block at p4
+#   - PAFPN neck (top-down + bottom-up + final fuse-back-to-stride-4)
+#   - Decoupled head (parallel cls + reg branches off nout)
+#   - ltrb regression (raw[:,1:5] = (l, t, r, b), image-normalized in [0,1])
 #
-# Tier: edge. All upgrades respect opset-13 / Myriad-VPU compatibility.
-
-# opndet-bbox-f: femto variant. Targeting ~25K params for the smallest viable
-# detector that still actually detects. Honest take: quality drops noticeably
-# below pico — use only when memory is critical (sub-1MB int8 deployment).
-# Stride 4, output [1, 5, 96, 128].
+# Output: [1, 5, H/4, W/4] = (obj_peak, l, t, r, b). Use decode_ltrb() at inference.
+#
+# Tier: edge. All ops opset-13 + Myriad-VPU safe (Conv, BN, ReLU6, MaxPool,
+# Add, Concat, Sub, Mul, Resize-nearest, Sigmoid, Slice). NO SiLU, NO attention,
+# NO half_pixel resize.
 
 model:
   in_ch: 3
@@ -23,33 +23,57 @@ model:
     - {name: p3,   from: p2,   module: CSPBlock,  args: {in_ch: 16,  out_ch: 24, n: 1, s: 2}}
     - {name: p4,   from: p3,   module: CSPBlock,  args: {in_ch: 24,  out_ch: 32, n: 1, s: 2}}
 
-    - {name: lat4, from: p4,   module: ConvBnAct, args: {in_ch: 32,  out_ch: 16, k: 1}}
+    - {name: p4s,  from: p4,   module: SPPF,      args: {in_ch: 32,  out_ch: 32, k: 5}}
+
+    - {name: lat4, from: p4s,  module: ConvBnAct, args: {in_ch: 32,  out_ch: 16, k: 1}}
     - {name: lat3, from: p3,   module: ConvBnAct, args: {in_ch: 24,  out_ch: 16, k: 1}}
     - {name: lat2, from: p2,   module: ConvBnAct, args: {in_ch: 16,  out_ch: 16, k: 1}}
     - {name: lat1, from: p1,   module: ConvBnAct, args: {in_ch: 8,   out_ch: 16, k: 1}}
 
-    - {name: up4,   from: lat4,        module: ResizeNearest2x, args: {}}
-    - {name: add3,  from: [up4, lat3], module: Add,             args: {}}
-    - {name: fuse3, from: add3,        module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
-    - {name: up3,   from: fuse3,       module: ResizeNearest2x, args: {}}
-    - {name: add2,  from: [up3, lat2], module: Add,             args: {}}
-    - {name: fuse2, from: add2,        module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
-    - {name: up2,   from: fuse2,       module: ResizeNearest2x, args: {}}
-    - {name: add1,  from: [up2, lat1], module: Add,             args: {}}
-    - {name: nout,  from: add1,        module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: t4,   from: lat4,        module: Identity,        args: {}}
+    - {name: u4,   from: t4,          module: ResizeNearest2x, args: {}}
+    - {name: a3,   from: [u4, lat3],  module: Add,             args: {}}
+    - {name: t3,   from: a3,          module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: u3,   from: t3,          module: ResizeNearest2x, args: {}}
+    - {name: a2,   from: [u3, lat2],  module: Add,             args: {}}
+    - {name: t2,   from: a2,          module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: u2,   from: t2,          module: ResizeNearest2x, args: {}}
+    - {name: a1,   from: [u2, lat1],  module: Add,             args: {}}
+    - {name: t1,   from: a1,          module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
 
-    - {name: trunk, from: nout,  module: ConvBnAct, args: {in_ch: 16, out_ch: 16, k: 3}}
-    - {name: raw,   from: trunk, module: Conv,      args: {in_ch: 16, out_ch: 5,  k: 1, bias_init: [-2.19, 0.0, 0.0, 0.0, 0.0]}}
+    - {name: d1,   from: t1,          module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3, s: 2}}
+    - {name: ab2,  from: [d1, t2],    module: Add,             args: {}}
+    - {name: b2,   from: ab2,         module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: d2,   from: b2,          module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3, s: 2}}
+    - {name: ab3,  from: [d2, t3],    module: Add,             args: {}}
+    - {name: b3,   from: ab3,         module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: d3,   from: b3,          module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3, s: 2}}
+    - {name: ab4,  from: [d3, t4],    module: Add,             args: {}}
+    - {name: b4,   from: ab4,         module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+
+    - {name: b4u1, from: b4,          module: ResizeNearest2x, args: {}}
+    - {name: b4u2, from: b4u1,        module: ResizeNearest2x, args: {}}
+    - {name: b4u3, from: b4u2,        module: ResizeNearest2x, args: {}}
+    - {name: nadd, from: [t1, b4u3],  module: Add,             args: {}}
+    - {name: nout, from: nadd,        module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+
+    - {name: cls1, from: nout, module: ConvBnAct, args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: cls2, from: cls1, module: ConvBnAct, args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: cls,  from: cls2, module: Conv,      args: {in_ch: 16, out_ch: 1, k: 1, bias_init: -2.19}}
+
+    - {name: reg1, from: nout, module: ConvBnAct, args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: reg2, from: reg1, module: ConvBnAct, args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: reg,  from: reg2, module: Conv,      args: {in_ch: 16, out_ch: 4, k: 1}}
+
+    - {name: raw,  from: [cls, reg], module: Concat, args: {dim: 1}}
 
     - {name: obj_r, from: raw,   module: SplitChannels,       args: {start: 0, end: 1}}
-    - {name: soft_obj, from: obj_r, module: Sigmoid,             args: {}}
+    - {name: soft_obj, from: obj_r, module: Sigmoid,          args: {}}
 
     - {name: obj,   from: obj_r, module: SigmoidPeakSuppress, args: {k: 5, eps: 5.0e-3}}
-    - {name: cxy_r, from: raw,   module: SplitChannels,       args: {start: 1, end: 3}}
-    - {name: cxy,   from: cxy_r, module: Sigmoid,             args: {}}
-    - {name: wh_r,  from: raw,   module: SplitChannels,       args: {start: 3, end: 5}}
-    - {name: wh,    from: wh_r,  module: Sigmoid,             args: {}}
-    - {name: out,   from: [obj, cxy, wh], module: Concat,     args: {dim: 1}}
+    - {name: ltrb_r, from: raw,  module: SplitChannels,       args: {start: 1, end: 5}}
+    - {name: ltrb,   from: ltrb_r, module: Sigmoid,           args: {}}
+    - {name: out,    from: [obj, ltrb], module: Concat,       args: {dim: 1}}
 
   outputs:
     - {name: output, from: out, activation: none}

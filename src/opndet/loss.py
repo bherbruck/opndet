@@ -7,6 +7,28 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def _decode_pred_ltrb_xyxy(ltrb_pred: torch.Tensor, img_h: int, img_w: int, stride: int) -> torch.Tensor:
+    """Decode predicted (l, t, r, b) image-normalized to absolute xyxy in pixels.
+    ltrb_pred: [B, 4, H, W] post-sigmoid in [0,1]. Cell centers are (ix+0.5, iy+0.5)*stride.
+    """
+    B, _, H, W = ltrb_pred.shape
+    device = ltrb_pred.device
+    ys = torch.arange(H, device=device, dtype=ltrb_pred.dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+    xs = torch.arange(W, device=device, dtype=ltrb_pred.dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+    cx_px = (xs + 0.5) * stride
+    cy_px = (ys + 0.5) * stride
+    l = ltrb_pred[:, 0:1] * img_w
+    t = ltrb_pred[:, 1:2] * img_h
+    r = ltrb_pred[:, 2:3] * img_w
+    b = ltrb_pred[:, 3:4] * img_h
+    return torch.cat([cx_px - l, cy_px - t, cx_px + r, cy_px + b], dim=1)
+
+
+def _decode_gt_ltrb_xyxy(ltrb_gt: torch.Tensor, img_h: int, img_w: int, stride: int) -> torch.Tensor:
+    """Same as _decode_pred_ltrb_xyxy but for GT ltrb tensor."""
+    return _decode_pred_ltrb_xyxy(ltrb_gt, img_h, img_w, stride)
+
+
 def _decode_pred_xyxy(cxy_pred: torch.Tensor, wh_pred: torch.Tensor, cxy_gt: torch.Tensor, pos_mask: torch.Tensor, img_h: int, img_w: int, stride: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode predicted (cxy_rel, wh_norm) to absolute xyxy at positive cells.
     Returns (pred_xyxy, gt_xyxy_image_coords) only at positive cells.
@@ -196,7 +218,7 @@ class OpndetBboxLoss(nn.Module):
         w_wh: float = 5.0,
         focal_alpha: float = 2.0,
         focal_beta: float = 4.0,
-        wh_loss: str = "l1",            # l1 | giou | ciou | nwd
+        wh_loss: str = "l1",            # l1 | giou | ciou | diou | nwd | ltrb
         cls_loss: str = "focal",        # focal | vfl
         vfl_alpha: float = 0.75,
         vfl_gamma: float = 2.0,
@@ -236,11 +258,45 @@ class OpndetBboxLoss(nn.Module):
 
     def forward(self, raw: torch.Tensor, tgt: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         hm_logit = raw[:, 0:1]
-        cxy_logit = raw[:, 1:3]
-        wh_logit = raw[:, 3:5]
 
         pos = tgt["pos"]
         n_pos = pos.sum().clamp(min=1.0)
+
+        # ltrb mode: raw[:, 1:5] is (l, t, r, b) post-sigmoid.
+        # The cxy term is subsumed: each ltrb cell encodes both center offset
+        # and box extents jointly (cell-center-to-edge distances).
+        if self.wh_loss == "ltrb":
+            ltrb_logit = raw[:, 1:5]
+            ltrb_pred = torch.sigmoid(ltrb_logit)
+            pred_xyxy = _decode_pred_ltrb_xyxy(ltrb_pred, self.img_h, self.img_w, self.stride)
+            gt_xyxy = _decode_gt_ltrb_xyxy(tgt["ltrb"], self.img_h, self.img_w, self.stride)
+            # DIoU on reconstructed boxes — center+containment penalty without aspect blow-up.
+            l_box = (_bbox_iou(pred_xyxy, gt_xyxy, mode="diou") * pos).sum() / n_pos
+            if self.cls_loss == "vfl":
+                iou_target = _iou_only(pred_xyxy, gt_xyxy) * pos
+                l_hm = varifocal_loss(hm_logit, pos, iou_target, alpha=self.vfl_alpha, gamma=self.vfl_gamma)
+            else:
+                l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
+            l_cxy = l_box.detach() * 0.0  # placeholder so downstream logging keys still exist
+            total = self.w_hm * l_hm + self.w_wh * l_box
+            out = {"loss": total, "l_hm": l_hm.detach(), "l_cxy": l_cxy, "l_wh": l_box.detach()}
+            if self.count_w > 0 or self.convex_w > 0:
+                hm_sig = torch.sigmoid(hm_logit)
+            if self.count_w > 0:
+                peaks = _peak_suppress(hm_sig, k=self.peak_kernel, eps=self.peak_eps)
+                pred_count = peaks.flatten(1).sum(dim=1)
+                gt_count = pos.flatten(1).sum(dim=1)
+                l_count = (pred_count - gt_count).abs().mean()
+                out["loss"] = out["loss"] + self.count_w * l_count
+                out["l_count"] = l_count.detach()
+            if self.convex_w > 0:
+                l_convex = convexity_loss(hm_sig, pos, k=self.convex_r)
+                out["loss"] = out["loss"] + self.convex_w * l_convex
+                out["l_convex"] = l_convex.detach()
+            return out
+
+        cxy_logit = raw[:, 1:3]
+        wh_logit = raw[:, 3:5]
 
         cxy_pred = torch.sigmoid(cxy_logit)
         l_cxy = (F.l1_loss(cxy_pred, tgt["cxy"], reduction="none") * pos).sum() / n_pos

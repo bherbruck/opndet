@@ -120,5 +120,61 @@ def encode_targets(
     return out
 
 
+def encode_targets_ltrb(
+    boxes: np.ndarray,
+    cfg: ModelConfig,
+    min_sigma: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """ltrb variant of encode_targets used by `-pro` presets.
+
+    Single positive cell per GT (the center cell), as in encode_targets. The
+    regression target switches semantics from (cx_offset, cy_offset, w_norm,
+    h_norm) to (l, t, r, b): image-normalized distances from the cell *center*
+    (ix+0.5, iy+0.5)*stride to the four box edges. Each in [0, 1] (clamped).
+
+    Returns dict with:
+      hm   : [1, H', W']  gaussian heatmap targets in [0,1]
+      ltrb : [4, H', W']  image-normalized (l, t, r, b) distances; valid where pos
+      pos  : [1, H', W']  1.0 at positive (center) cells
+    """
+    H, W = cfg.img_h, cfg.img_w
+    s = cfg.stride
+    Hp, Wp = H // s, W // s
+    hm = np.zeros((Hp, Wp), dtype=np.float32)
+    ltrb = np.zeros((4, Hp, Wp), dtype=np.float32)
+    pos = np.zeros((Hp, Wp), dtype=np.float32)
+
+    if len(boxes) > 0:
+        for x1, y1, x2, y2 in boxes:
+            bw = max(0.0, x2 - x1)
+            bh = max(0.0, y2 - y1)
+            if bw < 1.0 or bh < 1.0:
+                continue
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+            cx_g = cx / s
+            cy_g = cy / s
+            ix = int(cx_g)
+            iy = int(cy_g)
+            if ix < 0 or iy < 0 or ix >= Wp or iy >= Hp:
+                continue
+            r_px = gaussian_radius(bw, bh)
+            sigma = max(min_sigma, r_px / s / 3.0)
+            _draw_gaussian(hm, ix, iy, sigma)
+            cx_cell = (ix + 0.5) * s
+            cy_cell = (iy + 0.5) * s
+            ltrb[0, iy, ix] = float(np.clip((cx_cell - x1) / W, 0.0, 1.0))
+            ltrb[1, iy, ix] = float(np.clip((cy_cell - y1) / H, 0.0, 1.0))
+            ltrb[2, iy, ix] = float(np.clip((x2 - cx_cell) / W, 0.0, 1.0))
+            ltrb[3, iy, ix] = float(np.clip((y2 - cy_cell) / H, 0.0, 1.0))
+            pos[iy, ix] = 1.0
+
+    return {
+        "hm": torch.from_numpy(hm).unsqueeze(0),
+        "ltrb": torch.from_numpy(ltrb),
+        "pos": torch.from_numpy(pos).unsqueeze(0),
+    }
+
+
 def collate_targets(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     return {k: torch.stack([it[k] for it in items], dim=0) for k in items[0]}

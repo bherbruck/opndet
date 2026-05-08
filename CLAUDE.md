@@ -118,7 +118,7 @@ opndet's presets split into two tiers based on deployment-target opset constrain
 - Still maintains opset-13 export for ONNX Runtime + OpenVINO 2022 CPU/GPU compatibility.
 - `bbox-x` uses `peak_kernel=7` (vs k=5 elsewhere) for tighter duplicate suppression.
 
-**`-pro` variants** (planned, see ROADMAP §1.8) layer the YOLO-family + OBB + hard-negative-mining wins on top of each base size. Edge-tier `-pro` keeps opset-13 compat; server-tier `-pro` adds attention / SiLU / half-pixel resize.
+**`-pro` variants** (see ROADMAP §1.8) layer the YOLO-family + OBB + hard-negative-mining wins on top of each base size. Edge-tier `-pro` keeps opset-13 compat; server-tier `-pro` adds attention / SiLU / half-pixel resize. **Phase 1 shipped:** SPPF at p4, PAFPN neck (top-down + bottom-up + fuse-back-to-stride-4), decoupled head (parallel cls + reg branches off `nout`), and ltrb regression. The output tensor stays `[1, 5, H/4, W/4]` but channel semantics change to `(obj_peak, l, t, r, b)` — image-normalized cell-center-to-edge distances. Use `decode_ltrb()` (in `decode.py`) at inference. Encoded targets via `encode_targets_ltrb()` (in `encode.py`); train with `wh_loss: ltrb` in `OpndetBboxLoss` (DIoU on reconstructed boxes).
 
 ### Bundled presets and size points
 
