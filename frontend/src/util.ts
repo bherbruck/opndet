@@ -41,11 +41,16 @@ export function groupTags(tags: string[]): { group: string; tags: string[] }[] {
     .map(([group, tags]) => ({ group, tags: tags.sort() }));
 }
 
-// EMA smoothing à la TensorBoard's slider. weight in [0,1); 0 = no smoothing.
+// Debiased EMA, à la TensorBoard's smoothing slider. weight in [0,1); 0 = none.
+// `last` MUST start at 0 (not series[0]) — the `debias = 1 - weight^(k+1)`
+// correction assumes a zero seed; seeding with series[0] makes it over-correct
+// the warm-up (the first point comes out ≈ v0/(1-weight) — well above any real
+// value). With the zero seed it's exactly a backward-weighted moving average
+// (weights weight^k), so the smoothed line always stays inside [min, max].
 export function emaSmooth(series: Point[], weight: number): Point[] {
   if (weight <= 0 || series.length === 0) return series;
   const out: Point[] = [];
-  let last = series[0].value;
+  let last = 0;
   let debias = 0;
   for (const p of series) {
     if (Number.isFinite(p.value)) {
