@@ -155,6 +155,12 @@ epochs: 100
 #   collapse. Don't start until the heatmap loss has converged.
 #
 # augment:                        # full per-tier defaults already set; override here if needed
+#   scale_jitter: [0.7, 1.3]      # random zoom about the image center (affine, no rotation →
+#                                 #   OBB-SAFE: θ is invariant under uniform scale, w,h scale by it).
+#                                 #   [1.0, 1.0] = off. Boxes that slide (mostly) off-frame are
+#                                 #   dropped via min_visible_frac. (OBB presets ship with this off
+#                                 #   — set it here to enable; unlike hflip/rot90 it's fine for OBB.)
+#   translate_frac: 0.1           # random shift, fraction of img dim (each axis). 0 = off.
 #   mosaic_prob: 0.0              # bbox-f/p default; bbox-s+ default 0.1; bbox-h+ default 0.3
 #   cutout_prob: 0.0
 #   temporal_prior:               # auto-on when model_config has in_ch:4 (e.g. bbox-f-tp).

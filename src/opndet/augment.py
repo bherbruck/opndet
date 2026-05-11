@@ -83,24 +83,6 @@ def _photometric(img: np.ndarray, cfg: AugConfig, rng: np.random.Generator) -> n
     return img
 
 
-def _box_orig_areas(boxes: np.ndarray) -> np.ndarray:
-    if boxes.shape[0] == 0:
-        return np.zeros(0, dtype=np.float32)
-    w = (boxes[:, 2] - boxes[:, 0]).clip(min=0)
-    h = (boxes[:, 3] - boxes[:, 1]).clip(min=0)
-    return w * h
-
-
-def _filter_visible(boxes: np.ndarray, orig_areas: np.ndarray, min_frac: float) -> np.ndarray:
-    if boxes.shape[0] == 0:
-        return boxes
-    new_w = (boxes[:, 2] - boxes[:, 0]).clip(min=0)
-    new_h = (boxes[:, 3] - boxes[:, 1]).clip(min=0)
-    new_area = new_w * new_h
-    keep = (orig_areas <= 0) | (new_area / np.maximum(orig_areas, 1e-9) >= min_frac)
-    return boxes[keep]
-
-
 def _cutout(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator,
             obbs: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Paste random rectangles of mean-gray over the image, then drop boxes whose
@@ -212,6 +194,55 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
             obbs[:, 1] = obb_cy
             obbs[:, 4] = obb_theta
         w, h = cur_w, cur_h
+
+    # --- scale + translate (affine, NO rotation) -----------------------------
+    # OBB-safe: a uniform scale + translation leaves θ unchanged; w,h scale by s;
+    # centers shift. Boxes that end up (mostly) outside the frame are dropped via
+    # min_visible_frac (clipped-area / original-area). No-op when scale_jitter is
+    # (1,1) AND translate_frac is 0. (Unlike rotate90, this one is fine for OBB —
+    # it's why the OBB presets can opt into it without the θ-augmenter caveat.)
+    lo, hi = cfg.scale_jitter
+    do_scale = lo != 1.0 or hi != 1.0
+    do_trans = cfg.translate_frac > 0.0
+    if do_scale or do_trans:
+        ch, cw = img.shape[:2]
+        s = float(rng.uniform(lo, hi)) if do_scale else 1.0
+        tx = float(rng.uniform(-cfg.translate_frac, cfg.translate_frac) * cw) if do_trans else 0.0
+        ty = float(rng.uniform(-cfg.translate_frac, cfg.translate_frac) * ch) if do_trans else 0.0
+        if s != 1.0 or tx != 0.0 or ty != 0.0:
+            ccx, ccy = cw * 0.5, ch * 0.5
+            M = np.array([[s, 0.0, ccx - s * ccx + tx],
+                          [0.0, s, ccy - s * ccy + ty]], dtype=np.float32)
+            bval = 114 if img.dtype == np.uint8 else 114.0 / 255.0
+            img = cv2.warpAffine(img, M, (cw, ch), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=(bval, bval, bval))
+            keep = None
+            if boxes.shape[0]:
+                bx = boxes.astype(np.float64).copy()
+                bx[:, [0, 2]] = s * (bx[:, [0, 2]] - ccx) + ccx + tx
+                bx[:, [1, 3]] = s * (bx[:, [1, 3]] - ccy) + ccy + ty
+                # area of the *transformed* box (pre-clip) — i.e. what "fully visible"
+                # means after the scale. Comparing clipped-area to this (not to the
+                # pre-scale area) correctly keeps a zoomed-OUT box (smaller but whole)
+                # and drops a zoomed-IN box that slid mostly off the frame.
+                pre_area = (bx[:, 2] - bx[:, 0]).clip(min=0) * (bx[:, 3] - bx[:, 1]).clip(min=0)
+                cl = bx.copy()
+                cl[:, [0, 2]] = cl[:, [0, 2]].clip(0, cw)
+                cl[:, [1, 3]] = cl[:, [1, 3]].clip(0, ch)
+                new_area = (cl[:, 2] - cl[:, 0]).clip(min=0) * (cl[:, 3] - cl[:, 1]).clip(min=0)
+                keep = (pre_area <= 1e-9) | (new_area / np.maximum(pre_area, 1e-9) >= cfg.min_visible_frac)
+                boxes = cl[keep].astype(np.float32)
+            if obbs is not None and obbs.shape[0]:
+                ob = obbs.astype(np.float64).copy()
+                ob[:, 0] = s * (ob[:, 0] - ccx) + ccx + tx
+                ob[:, 1] = s * (ob[:, 1] - ccy) + ccy + ty
+                ob[:, 2] *= s
+                ob[:, 3] *= s
+                # θ (col 4) unchanged. drop in sync with `boxes` (= the OBB's AABB
+                # envelope for OBB models → same N) when available.
+                if keep is not None and keep.shape[0] == ob.shape[0]:
+                    ob = ob[keep]
+                obbs = ob.astype(np.float32)
 
     return img, boxes, obbs
 

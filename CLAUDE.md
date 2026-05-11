@@ -82,7 +82,7 @@ The dataset returns a 3-tuple `(img_tensor, boxes_xyxy, target_dict)`. `collate(
 ### Augmentation contract
 
 - **Photometric** (`src/opndet/augment.py::_photometric`): brightness, contrast, gamma, hue, saturation, grayscale, blur, noise. Mutate img only.
-- **Geometric** (`_geometric`): hflip, vflip, rotate90, scale_jitter, translate. Mutate img AND boxes.
+- **Geometric** (`_geometric`): hflip, vflip, rotate90, scale_jitter, translate. Mutate img AND boxes (and OBBs). `scale_jitter`/`translate` are an affine *without rotation* — **OBB-safe** (uniform scale ⇒ θ invariant, w/h scale by it; translation shifts centers), so they can be enabled even on the `-obb` presets (which ship with them off); `hflip`/`vflip`/`rotate90` are **not** OBB-safe-yet (the θ handling for those is wired in `_geometric` but the OBB presets keep them off). Boxes that slide (mostly) out of frame after scale/translate are dropped via `min_visible_frac` (clipped-area / transformed-box-area).
 - **Cutout** (`_cutout`): random gray rectangles, drops boxes whose visible area falls below `min_visible_frac`.
 - **Mosaic** (in `OpndetDataset._mosaic`, not in augment.py — needs access to other samples): combines 4 images into one, transforms boxes per quadrant, drops invisible boxes.
 - **`min_visible_frac` filter** is the contract: any aug that reduces a GT box's visible area below this threshold must drop the box from labels. Don't supervise the model on invisible objects.
