@@ -133,6 +133,13 @@ def _cmd_predict(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_profile(args: argparse.Namespace) -> int:
+    from opndet.profile import profile
+    profile(ckpt=args.ckpt, model=args.model, images=args.images,
+            out=args.out, n=args.n, device=args.device)
+    return 0
+
+
 def _cmd_analyze(args: argparse.Namespace) -> int:
     from opndet.analyze import run as analyze_run
     from opndet.presets import resolve
@@ -398,6 +405,18 @@ def main(argv: list[str] | None = None) -> int:
     pa.add_argument("--threshold", type=float, default=0.5,
                     help="Detection score threshold for which detections get Grad-CAM")
     pa.set_defaults(func=_cmd_analyze)
+
+    pp = sub.add_parser("profile", help='"What\'s actually doing the work?" — per-layer activity '
+                                          "(mean|act|, live-channel fraction) + ablation-Δ (heatmap "
+                                          "change when a layer is zeroed) over a batch of images, "
+                                          "as a standalone HTML report.")
+    pp.add_argument("--ckpt", required=True, help="Trained checkpoint .pt")
+    pp.add_argument("--model", default=None, help="Preset name or YAML path (default: ckpt's saved config)")
+    pp.add_argument("--images", required=True, help="An image file, or a directory of images (recursed)")
+    pp.add_argument("--n", type=int, default=8, help="Max images to average over (0 = all)")
+    pp.add_argument("--out", default=None, help="Output HTML (default: <ckpt-dir>/<ckpt-stem>_profile.html)")
+    pp.add_argument("--device", default=None, help="cuda or cpu (default: auto)")
+    pp.set_defaults(func=_cmd_profile)
 
     pd = sub.add_parser("dashboard", help="Run-metrics web viewer (DuckDB-backed). "
                                             "Pass a single run dir or a runs parent — "
