@@ -132,7 +132,7 @@ export function App() {
             onChange={isImages ? (a) => setImgRun(a[0] ?? imgRun) : setSelected}
           />
         </aside>
-        <main className="min-w-0 flex-1 overflow-y-auto p-3">
+        <main className="min-w-0 flex-1 overflow-y-auto">
           {tab === "scalars" && <ScalarsTab selected={sel} tags={tagsQ.data ?? null} scalars={scalarsQ.data ?? null} />}
           {tab === "images" && <ImagesTab runs={runs} imgRun={imgRun} refetchInterval={refetchInterval} />}
           {tab === "config" && <ConfigTab selected={sel} />}

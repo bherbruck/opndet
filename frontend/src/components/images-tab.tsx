@@ -93,14 +93,14 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [lbIdx, stepEpoch]);
 
-  if (runs.length === 0) return <div className="px-1 py-8 text-fgdim">no runs found yet…</div>;
+  if (runs.length === 0) return <div className="p-3.5 text-fgdim">no runs found yet…</div>;
 
   const busy = tagsQ.isFetching || epochsQ.isFetching || samplesQ.isFetching;
   const lbSample = lbIdx == null ? undefined : samples.find((s) => s.sample_idx === lbIdx);
 
   return (
     <div>
-      <div className="mb-3 flex flex-wrap items-center gap-3.5">
+      <div className="sticky top-0 z-10 flex flex-wrap items-center gap-3.5 border-b border-line bg-bg px-3.5 py-2.5">
         <span className="flex items-center gap-1.5 font-semibold">
           <span className="h-2.5 w-2.5 rounded-[2px]" style={{ background: runColor(imgRun) }} />
           {imgRun || "(no run)"}
@@ -129,27 +129,29 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
         {busy && <span className="text-fgdim">…</span>}
       </div>
 
-      {!hasTag ? (
-        <div className="text-fgdim">{imageTags.length === 0 ? `no image samples logged for "${imgRun}".` : "pick a tag."}</div>
-      ) : ep == null ? (
-        <div className="text-fgdim">no epochs with samples.</div>
-      ) : samples.length === 0 ? (
-        <div className="text-fgdim">no samples at ep {ep}.</div>
-      ) : (
-        <div className="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(240px,1fr))]">
-          {samples.map((s) => (
-            <button
-              key={s.sample_idx}
-              type="button"
-              className="relative block cursor-zoom-in overflow-hidden rounded border border-line2 hover:border-accent"
-              onClick={() => setLbIdx(s.sample_idx)}
-            >
-              <SampleView src={s.rgb_url} boxes={s.boxes} />
-              <span className="absolute top-0.5 left-1 text-[10px] text-[#cfe] [text-shadow:0_0_3px_#000]">#{s.sample_idx}</span>
-            </button>
-          ))}
-        </div>
-      )}
+      <div className="p-3.5">
+        {!hasTag ? (
+          <div className="text-fgdim">{imageTags.length === 0 ? `no image samples logged for "${imgRun}".` : "pick a tag."}</div>
+        ) : ep == null ? (
+          <div className="text-fgdim">no epochs with samples.</div>
+        ) : samples.length === 0 ? (
+          <div className="text-fgdim">no samples at ep {ep}.</div>
+        ) : (
+          <div className="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(240px,1fr))]">
+            {samples.map((s) => (
+              <button
+                key={s.sample_idx}
+                type="button"
+                className="relative block cursor-zoom-in overflow-hidden rounded border border-line2 hover:border-accent"
+                onClick={() => setLbIdx(s.sample_idx)}
+              >
+                <SampleView src={s.rgb_url} boxes={s.boxes} />
+                <span className="absolute top-0.5 left-1 text-[10px] text-[#cfe] [text-shadow:0_0_3px_#000]">#{s.sample_idx}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
 
       {lbSample && (
         <Lightbox

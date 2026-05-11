@@ -23,8 +23,8 @@ export function ConfigTab({ selected }: Props) {
   });
 
   if (selected.length === 0)
-    return <div className="px-1 py-8 text-fgdim">select one or more runs in the sidebar.</div>;
-  if (!cfgQ.data) return <div className="px-1 py-8 text-fgdim">loading…</div>;
+    return <div className="p-3.5 text-fgdim">select one or more runs in the sidebar.</div>;
+  if (!cfgQ.data) return <div className="p-3.5 text-fgdim">loading…</div>;
   const cfgs = cfgQ.data;
 
   const keys = [...new Set(selected.flatMap((r) => Object.keys(cfgs[r] ?? {})))].sort();
@@ -32,7 +32,7 @@ export function ConfigTab({ selected }: Props) {
   const rows = diffOnly && selected.length > 1 ? keys.filter(differs) : keys;
 
   return (
-    <div>
+    <div className="p-3.5">
       <label className="mb-2 flex items-center gap-1.5 text-fgdim">
         <input type="checkbox" checked={diffOnly} onChange={(e) => setDiffOnly(e.target.checked)} disabled={selected.length < 2} />
         show only differing keys

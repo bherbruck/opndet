@@ -28,7 +28,7 @@ export function SqlTab({ runs, selected }: Props) {
   const names = runs.map((r) => r.name);
 
   return (
-    <div>
+    <div className="p-3.5">
       <textarea
         className="h-28 w-full resize-y rounded border border-line2 bg-bg2 p-2 font-mono text-[12px] text-fg"
         spellCheck={false}
