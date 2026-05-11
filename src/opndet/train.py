@@ -589,7 +589,10 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         def add_text(self, *a, **kw): pass
         def flush(self, *a, **kw): pass
         def close(self, *a, **kw): pass
-    if bool(c.get("tensorboard", True)):
+    # Default OFF: the dashboard reads the DuckDB store, not tfevents, so a TB
+    # log is dead weight (and `auto_bundle` already skips it). Set `tensorboard:
+    # true` if you actually want a .tfevents log.
+    if bool(c.get("tensorboard", False)):
         try:
             from torch.utils.tensorboard import SummaryWriter
             writer = SummaryWriter(log_dir=str(tb_dir))
@@ -599,7 +602,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             print(f"tensorboard disabled ({type(e).__name__}: {e}); scalars still flow to DB / dashboard")
     else:
         writer = _NoOpWriter()
-        print("tensorboard: off (per config)")
+        print("tensorboard: off (default — scalars/images go to the DuckDB store / dashboard; set tensorboard: true for a .tfevents log)")
 
     # DuckDB metrics store (queryable companion to TB). Writes alongside TB —
     # both stay in the run dir. Default on; opt out with `metrics_db: false`.

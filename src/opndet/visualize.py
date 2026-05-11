@@ -189,6 +189,13 @@ def save_layered_vis(
     import json
     from opndet.decode import decode_batch, decode_obb_batch
     out_sub.mkdir(parents=True, exist_ok=True)
+    # The clean RGB of a val/test sample is byte-identical every viz epoch (no aug
+    # on val/test), so write it ONCE to a stable per-(tag,sample) path — not a
+    # fresh copy per epoch (that's what made the run dir balloon with images).
+    # Only the model-output overlays (obj_heat) and the random-synth prior go in
+    # the per-epoch dir; db.add_image just re-references the stable rgb each epoch.
+    shared_dir = out_sub.parent
+    shared_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
     out = model(imgs.to(device))
     out_t = out["output"] if isinstance(out, dict) else out
@@ -202,9 +209,11 @@ def save_layered_vis(
     has_prior = imgs.shape[1] >= 4
     H, W = imgs.shape[2], imgs.shape[3]
     for i in range(imgs.shape[0]):
-        rgb = _denorm(imgs[i])  # clean RGB, no annotations
-        rgb_path = out_sub / f"sample_{i}_rgb.png"
-        cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        # clean RGB → stable path, written once (skip if it already exists)
+        rgb_path = shared_dir / f"sample_{i}_rgb.png"
+        if not rgb_path.exists():
+            rgb = _denorm(imgs[i])  # clean RGB, no annotations
+            cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
         prior_path = None
         if has_prior:

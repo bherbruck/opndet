@@ -79,10 +79,15 @@ epochs: 100
 # auto_bundle: true               # default true — zip run dir at end (skips tfevents). On Colab,
 #                                 #   also triggers files.download() automatically.
 # bundle_include_tb: false        # default false — set true to include tfevents in the zip (big)
+# tensorboard: false              # default OFF — the dashboard reads the DuckDB store, not
+#                                 #   tfevents, so a .tfevents log is dead weight. Set true if
+#                                 #   you actually want one (e.g. to use `tensorboard --logdir`).
 #
 # metrics_db: true                # default true — write a queryable DuckDB store at
-#                                 #   <out_dir>/metrics.duckdb alongside TB. Backs the
-#                                 #   `opndet dashboard` viewer.
+#                                 #   <out_dir>/metrics.duckdb. Backs the `opndet dashboard` viewer.
+#                                 #   (Per-sample vis: the clean RGB of a val/test sample is written
+#                                 #   ONCE per (tag,sample) under vis/<tag>/, not a copy per epoch —
+#                                 #   only the model-output heatmap overlays are per-epoch.)
 # dashboard: false                # set true to auto-spawn the dashboard FastAPI server
 #                                 #   on training start. In Colab it embeds as an iframe
 #                                 #   in the calling cell. Subprocess gets cleaned up at exit.

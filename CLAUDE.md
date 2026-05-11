@@ -159,7 +159,7 @@ All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except h
 ## Files at a glance
 
 - `cli.py` — argparse subcommand router; entry point for the `opndet` script.
-- `train.py` — training loop. Lazy imports tensorboard with no-op fallback when import fails (Colab numpy/tensorboard mismatches). Auto-increment `out_dir`, resume, trajectory-patience, curriculum w/ alias map, cosine LR + warmup, in-process Colab `files.download()`. Reads `optimizer: adamw|musgd` from config (default adamw).
+- `train.py` — training loop. TensorBoard is **off by default** (`tensorboard: true` to enable; the dashboard reads the DuckDB store, not tfevents) — and lazy-imported with a no-op-writer fallback when import fails (Colab numpy/tensorboard mismatches). Auto-increment `out_dir`, resume, trajectory-patience, curriculum w/ alias map, cosine LR + warmup, in-process Colab `files.download()`. Reads `optimizer: adamw|musgd` from config (default adamw).
 - `optim_muon.py` — Muon + MuSGD optimizers (ROADMAP §1.8 Phase 6). Opt-in via `optimizer: musgd`; routes >=2D-flattenable conv weights to Muon, everything else to AdamW.
 - `assigner.py` — TAL / STAL task-aligned per-cell positive assigner for box regression (ROADMAP §1.8 Phase 3). Opt-in via `assigner: tal|stal` in train.yaml; default `peak` keeps the existing single-positive-per-GT path. Drives REGRESSION-side assignment only — cls supervision stays Gaussian heatmap (see docs/engineering-decisions.md "Assigner choice"). Default for `-pro` presets is `stal` + `curriculum: progloss` (auto-balancing loss weights).
 - `model.py` / `blocks.py` — hand-coded reference model (kept for parity tests).
@@ -169,7 +169,7 @@ All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except h
 - `decode.py` — client-side bbox decoder (no NMS).
 - `dataset.py` — COCO loader, OpndetDataset, mosaic, collate.
 - `augment.py` — photometric + geometric + cutout, with min_visible_frac filter.
-- `visualize.py` — render predictions onto images for TensorBoard / DuckDB / dashboard.
+- `visualize.py` — render predictions onto images for the DuckDB store / dashboard. `save_layered_vis` writes the clean RGB of each val/test sample ONCE to a stable `vis/<tag>/sample_<i>_rgb.png` (it's deterministic — no aug on val/test), and only the per-epoch model-output overlays (`obj_heat`, the 4-ch prior) go under `vis/<tag>/ep_<NNN>/` — so the run dir doesn't balloon with N_epochs identical RGB copies.
 - `export.py` — torch.onnx.export(opset=13, dynamo=False) + opset-safety check + parity test. `--diagnostic` mode adds all named-layer outputs for the webui's explain mode.
 - `predict.py` — single-image / video inference + visualization.
 - `analyze.py` — postmortem CLI: per-layer activation slider + Grad-CAM HTML report on saved ckpts.
