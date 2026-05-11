@@ -339,6 +339,7 @@ def mine_into_pool(
     top_k_per_sample: int = 4,
     max_total: int = 500,
     max_scan: int = 400,
+    ghost_radius_frac: float = 0.5,
     epoch_tag: int = 0,
 ) -> int:
     """Lightweight in-training hard-negative miner (no Grad-CAM).
@@ -385,9 +386,13 @@ def mine_into_pool(
                     gcy = (gb[:, 1] + gb[:, 3]) * 0.5
                     gw = np.clip(gb[:, 2] - gb[:, 0], 1.0, None)
                     gh = np.clip(gb[:, 3] - gb[:, 1], 1.0, None)
+                    # A pred is a ghost if its center is outside this radius of EVERY GT
+                    # center. Lower ghost_radius_frac → flag phantoms that sit *between*
+                    # real objects (e.g. the "egg" hallucinated in the gap between 4 eggs)
+                    # instead of forgiving them as slightly-off detections.
                     radii = np.maximum(
                         np.full(gw.shape, max(8.0, 2.0 * det_stride), dtype=np.float32),
-                        (0.5 * np.minimum(gw, gh)).astype(np.float32),
+                        (float(ghost_radius_frac) * np.minimum(gw, gh)).astype(np.float32),
                     )
                     dd = np.sqrt((pcx[:, None] - gcx[None, :]) ** 2 + (pcy[:, None] - gcy[None, :]) ** 2)
                     nearest = dd.argmin(axis=1)

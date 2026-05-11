@@ -101,6 +101,32 @@ def _draw_gaussian(hm: np.ndarray, cx: int, cy: int, sigma: float) -> None:
     hm[y0:y1, x0:x1] = np.maximum(hm[y0:y1, x0:x1], g)
 
 
+def _draw_obj_blob(hm: np.ndarray, ix: int, iy: int, bw_px: float, bh_px: float, theta: float,
+                   stride: int, min_sigma: float, blob_frac: float) -> None:
+    """Draw the objectness target blob at cell (ix, iy).
+
+    blob_frac <= 0  → legacy CornerNet: isotropic Gaussian, σ = IoU-shift radius
+                      / 3 — a tight bump usually much smaller than the object
+                      (the "nipple").
+    blob_frac > 0   → an *oriented elliptical* Gaussian sized to the box:
+                      σ_major ≈ blob_frac · bw / stride along the box's local x
+                      (rotated by theta), σ_minor ≈ blob_frac · bh / stride. At
+                      ~0.15-0.25 the dome roughly covers the object, so the
+                      pre-peak-suppression heatmap looks object-shaped. Still a
+                      single-peaked dome (max at center — never a flat-topped
+                      mask, or peak suppression breaks). Caveat: for touching
+                      objects the dome tails overlap and *soften* the negative
+                      pressure in the gaps between them — keep blob_frac modest.
+    """
+    if blob_frac > 0.0:
+        sx = max(min_sigma, blob_frac * bw_px / stride)   # along the box's local x (theta dir)
+        sy = max(min_sigma, blob_frac * bh_px / stride)
+        _draw_rotated_gaussian(hm, ix, iy, sx, sy, float(theta))
+    else:
+        sigma = max(min_sigma, gaussian_radius(bw_px, bh_px) / stride / 3.0)
+        _draw_gaussian(hm, ix, iy, sigma)
+
+
 def _render_dist_target(boxes: np.ndarray, Hp: int, Wp: int, s: int) -> np.ndarray:
     """Per-pixel distance target at output resolution. For each GT, renders the inscribed
     ellipse with values that ramp linearly from 1 at center to 0 at the boundary, then
@@ -163,9 +189,7 @@ def encode_targets(
             iy = int(cy_g)
             if ix < 0 or iy < 0 or ix >= Wp or iy >= Hp:
                 continue
-            r_px = gaussian_radius(bw, bh)
-            sigma = max(min_sigma, r_px / s / 3.0)
-            _draw_gaussian(hm, ix, iy, sigma)
+            _draw_obj_blob(hm, ix, iy, bw, bh, 0.0, s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0))
             cxy[0, iy, ix] = cx_g - ix
             cxy[1, iy, ix] = cy_g - iy
             wh[0, iy, ix] = bw / W
@@ -222,9 +246,7 @@ def encode_targets_ltrb(
             iy = int(cy_g)
             if ix < 0 or iy < 0 or ix >= Wp or iy >= Hp:
                 continue
-            r_px = gaussian_radius(bw, bh)
-            sigma = max(min_sigma, r_px / s / 3.0)
-            _draw_gaussian(hm, ix, iy, sigma)
+            _draw_obj_blob(hm, ix, iy, bw, bh, 0.0, s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0))
             cx_cell = (ix + 0.5) * s
             cy_cell = (iy + 0.5) * s
             ltrb[0, iy, ix] = float(np.clip((cx_cell - x1) / W, 0.0, 1.0))
@@ -311,9 +333,7 @@ def encode_targets_obb(
             iy = int(cy_g)
             if ix < 0 or iy < 0 or ix >= Wp or iy >= Hp:
                 continue
-            r_px = gaussian_radius(bw, bh)
-            base_sigma = max(min_sigma, r_px / s / 3.0)
-            _draw_rotated_gaussian(hm, ix, iy, base_sigma, base_sigma, 0.0)
+            _draw_obj_blob(hm, ix, iy, bw, bh, float(theta), s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0))
             reg[0, iy, ix] = float(np.clip(cx_g - ix, 0.0, 1.0))
             reg[1, iy, ix] = float(np.clip(cy_g - iy, 0.0, 1.0))
             reg[2, iy, ix] = float(np.clip(bw / W, 0.0, 1.0))

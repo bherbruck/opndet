@@ -101,14 +101,16 @@ def _detect_peak_op(model: torch.nn.Module) -> tuple[int | None, float | None]:
 
 
 class _CfgShim:
-    """encode_targets needs an object with img_h/img_w/stride/out_h/out_w."""
+    """encode_targets needs an object with img_h/img_w/stride/out_h/out_w (and an
+    optional hm_blob_frac for the object-shaped-heatmap encoding)."""
 
-    def __init__(self, img_h: int, img_w: int, stride: int):
+    def __init__(self, img_h: int, img_w: int, stride: int, hm_blob_frac: float = 0.0):
         self.img_h = img_h
         self.img_w = img_w
         self.stride = stride
         self.out_h = img_h // stride
         self.out_w = img_w // stride
+        self.hm_blob_frac = float(hm_blob_frac)
 
 
 def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -679,7 +681,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         model.load_state_dict(resume_state["model"])
     in_ch, img_h, img_w = model.input_shape
     stride = int(c.get("model", {}).get("stride", 4))
-    cfg_shim = _CfgShim(img_h, img_w, stride=stride)
+    cfg_shim = _CfgShim(img_h, img_w, stride=stride, hm_blob_frac=float(c.get("hm_blob_frac", 0.0)))
     n_params = sum(p.numel() for p in model.parameters())
     has_dist = "dist" in getattr(model, "aliases", {})
     print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}{'  (dist head)' if has_dist else ''}")
@@ -1381,6 +1383,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                     top_k_per_sample=int(auto_mine_cfg.get("top_k_per_sample", 4)),
                     max_total=int(auto_mine_cfg.get("max_pool", 500)),
                     max_scan=int(auto_mine_cfg.get("max_scan", 400)),
+                    ghost_radius_frac=float(auto_mine_cfg.get("ghost_radius_frac", 0.5)),
                     epoch_tag=ep,
                 )
                 from opndet.mine_negatives import load_pool as _load_pool

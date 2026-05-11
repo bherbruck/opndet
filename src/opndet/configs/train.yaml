@@ -80,9 +80,26 @@ epochs: 100
 #                                 #   in the calling cell. Subprocess gets cleaned up at exit.
 # dashboard_port: 5000            # bind port for the auto-spawned dashboard
 #
+# hm_blob_frac: 0.0               # >0 makes the objectness GT an *object-shaped* dome instead of
+#                                 #   a tight CornerNet bump: an oriented elliptical Gaussian with
+#                                 #   σ ≈ hm_blob_frac·{w,h}/stride (rotated by θ for OBB heads). At
+#                                 #   ~0.15-0.25 the dome roughly covers the object, so the pre-peak-
+#                                 #   suppression heatmap looks like a soft segmentation. Still a
+#                                 #   single-peaked dome (peak suppression unaffected). CAVEAT: for
+#                                 #   touching objects the dome tails overlap and soften the negative
+#                                 #   pressure in the GAPS between them → keep it modest or you make
+#                                 #   "phantom in the hole" hallucinations worse. Pair with cls_loss:
+#                                 #   soft_hm so the surrounding cells are actually learned, not just
+#                                 #   permitted.
+#
 # loss:
 #   wh_loss: ciou                 # default
-#   cls_loss: vfl                 # default — bimodal confidence
+#   cls_loss: vfl                 # default — bimodal confidence. Also: focal | soft_hm.
+#                                 #   soft_hm = Quality Focal Loss toward the FULL Gaussian → the
+#                                 #   model learns an object-shaped objectness dome (not a 1-cell
+#                                 #   nipple). Best with hm_blob_frac > 0. (vfl had cold-start
+#                                 #   collapse on zero-IoU positives; focal/soft_hm don't.)
+#   qfl_beta: 2.0                 # focal exponent for soft_hm only
 #   count_weight: 0.05            # >0 enables count-aware loss term
 #   convexity_weight: 0.2         # >0 enforces centered, radially-symmetric peaks (convex-object prior)
 #   convexity_radius: 2           # MAX window radius in heatmap cells — size it to your BIGGEST
@@ -101,6 +118,11 @@ epochs: 100
 #   max_pool: 500                 #   pool is FIFO-capped (oldest patches age out)
 #   max_scan: 400                 #   images scanned per mine pass
 #   top_k_per_sample: 4           #   max patches per image
+#   ghost_radius_frac: 0.5        #   a pred counts as a ghost if its center is outside
+#                                 #   max(8px, 2·stride, this·min(gt_w,gt_h)) of EVERY GT center.
+#                                 #   Lower it (~0.3) to catch phantoms that sit *between* real
+#                                 #   objects (e.g. an "egg" hallucinated in the gap between 4 eggs)
+#                                 #   rather than forgiving them as slightly-off detections.
 #   patch_size: 32                #   crop size (px)
 #   paste_prob: 0.2               #   per-sample probability the dataloader pastes a mined patch
 #   paste_count: 1                #   patches pasted per sample when it fires

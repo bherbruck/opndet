@@ -280,6 +280,24 @@ def focal_heatmap_loss(pred_logit: torch.Tensor, gt: torch.Tensor, alpha: float 
     return (pos_loss.sum() + neg_loss.sum()) / n_pos
 
 
+def quality_focal_loss(pred_logit: torch.Tensor, target: torch.Tensor, beta: float = 2.0) -> torch.Tensor:
+    """Quality Focal Loss (GFL): regress a *soft* target ∈ [0,1] (here the full
+    Gaussian heatmap) with focal-style downweighting of well-predicted cells.
+    Unlike center-only focal — which hard-supervises ONLY the exact peak cell and
+    merely *softens* the negative penalty on its neighbours — QFL makes every cell
+    a real target, so the model learns an object-*shaped* objectness dome, not a
+    1-cell nipple. Normalized by the count of exact-1.0 cells (object centers) so
+    the magnitude matches focal_heatmap_loss / varifocal_loss (w_hm stays
+    comparable). Works as a `cls_loss: soft_hm` mode, ideally paired with
+    `hm_blob_frac > 0` so the target dome actually covers the object.
+    """
+    p = torch.sigmoid(pred_logit).clamp(1e-6, 1 - 1e-6)
+    bce = -(target * torch.log(p) + (1.0 - target) * torch.log(1.0 - p))
+    qfl = (target - p).abs().pow(beta) * bce
+    n_pos = target.eq(1.0).float().sum().clamp(min=1.0)
+    return qfl.sum() / n_pos
+
+
 class OpndetBboxLoss(nn.Module):
     def __init__(
         self,
@@ -292,6 +310,7 @@ class OpndetBboxLoss(nn.Module):
         cls_loss: str = "focal",        # focal | vfl
         vfl_alpha: float = 0.75,
         vfl_gamma: float = 2.0,
+        qfl_beta: float = 2.0,           # only used when cls_loss == "soft_hm"
         repulsion_weight: float = 0.0,
         nwd_c: float = 12.8,
         count_weight: float = 0.0,
@@ -314,6 +333,7 @@ class OpndetBboxLoss(nn.Module):
         self.cls_loss = cls_loss
         self.vfl_alpha = vfl_alpha
         self.vfl_gamma = vfl_gamma
+        self.qfl_beta = qfl_beta
         self.rep_w = repulsion_weight
         self.nwd_c = nwd_c
         self.count_w = count_weight
@@ -385,6 +405,8 @@ class OpndetBboxLoss(nn.Module):
                 # VFL needs IoU as cls target — use 1 - probiou loss = ProbIoU (∈ [0, 1]).
                 iou_target = (1.0 - iou_loss).detach() * pos2d
                 l_hm = varifocal_loss(hm_logit, pos, iou_target.unsqueeze(1), alpha=self.vfl_alpha, gamma=self.vfl_gamma)
+            elif self.cls_loss == "soft_hm":
+                l_hm = quality_focal_loss(hm_logit, tgt["hm"], beta=self.qfl_beta)
             else:
                 l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
             total = self.w_hm * l_hm + self.w_wh * (l_box + ang_aux_w * l_angle)
@@ -421,6 +443,8 @@ class OpndetBboxLoss(nn.Module):
             if self.cls_loss == "vfl":
                 iou_target = _iou_only(pred_xyxy, gt_xyxy) * pos
                 l_hm = varifocal_loss(hm_logit, pos, iou_target, alpha=self.vfl_alpha, gamma=self.vfl_gamma)
+            elif self.cls_loss == "soft_hm":
+                l_hm = quality_focal_loss(hm_logit, tgt["hm"], beta=self.qfl_beta)
             else:
                 l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
             l_cxy = l_box.detach() * 0.0  # placeholder so downstream logging keys still exist
@@ -471,6 +495,8 @@ class OpndetBboxLoss(nn.Module):
         if self.cls_loss == "vfl":
             iou_target = _iou_only(pred_xyxy, gt_xyxy) * pos
             l_hm = varifocal_loss(hm_logit, pos, iou_target, alpha=self.vfl_alpha, gamma=self.vfl_gamma)
+        elif self.cls_loss == "soft_hm":
+            l_hm = quality_focal_loss(hm_logit, tgt["hm"], beta=self.qfl_beta)
         else:
             l_hm = focal_heatmap_loss(hm_logit, tgt["hm"], self.alpha, self.beta)
 
