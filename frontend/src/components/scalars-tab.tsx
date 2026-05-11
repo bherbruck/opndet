@@ -11,7 +11,7 @@ interface Props {
 }
 
 export function ScalarsTab({ selected, tags, scalars }: Props) {
-  const [smoothing, setSmoothing] = useLocalStorage("opndet.smoothing", 0.6);
+  const [smoothing, setSmoothing] = useLocalStorage("opndet.smoothing", 0);
   const [logY, setLogY] = useLocalStorage("opndet.logY", false);
   const [collapsed, setCollapsed] = useLocalStorage<Record<string, boolean>>("opndet.groupsCollapsed", {});
   const [filter, setFilter] = useState("");
