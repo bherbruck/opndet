@@ -867,6 +867,13 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         loss_kw.setdefault("wh_loss", "obb")
     elif has_ltrb:
         loss_kw.setdefault("wh_loss", "ltrb")
+    # repulsion (RepGT, a box-geometry loss) is only wired into the standard
+    # (cx,cy,w,h) head — the obb/ltrb branches don't construct the axis-aligned
+    # pred boxes it needs, so `repulsion_weight` is a silent no-op there. Warn.
+    if float(loss_kw.get("repulsion_weight", 0.0)) > 0.0 and loss_kw.get("wh_loss") in ("obb", "ltrb"):
+        print(f"  WARN: loss.repulsion_weight={loss_kw['repulsion_weight']} is IGNORED for the "
+              f"{loss_kw['wh_loss']} head (repulsion only runs on the cxy/wh head). "
+              f"Use loss.peak_sharpen_weight for the touching-peak problem instead.")
     # Auto-mirror the model's peak op so count-aware loss sees the same sparse map as inference.
     # User can still override by setting peak_kernel/peak_eps explicitly in the yaml's `loss:` block.
     peak_k, peak_eps = _detect_peak_op(model)
