@@ -12,6 +12,11 @@ data:
   sources:
     - {coco: data/site_a/_annotations.coco.json, images: data/site_a}
   # split_ratios: [0.8, 0.1, 0.1]   # default
+  # image_filter: data/scenario1.txt  # text file of image names (basename or stem,
+                                       # one per line, # comments ok). Keeps only
+                                       # those images across all sources. Omit /
+                                       # empty file = use everything. Applies the
+                                       # same way for train, eval, calibrate.
 
 epochs: 100
 

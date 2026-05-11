@@ -638,7 +638,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     print(f"device: {device}")
 
     print("loading data ...")
-    samples = load_datasets(c["data"]["sources"])
+    samples = load_datasets(c["data"]["sources"], image_filter=c["data"].get("image_filter"))
     print(f"total samples: {len(samples)}")
     ratios = tuple(c["data"].get("split_ratios", [0.8, 0.1, 0.1]))
     train_s, val_s, test_s = split_samples(samples, ratios=ratios, seed=seed)

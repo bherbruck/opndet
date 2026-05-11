@@ -85,12 +85,39 @@ def load_coco_single_class(coco_path: str | Path, image_root: str | Path,
     return samples
 
 
-def load_datasets(sources: list[dict] | list[tuple[str, str]]) -> list[Sample]:
+def _read_image_filter(path: str | Path) -> tuple[set[str], int]:
+    """Parse a text file of image names (one per line). Blank lines and `#`-comments
+    skipped. Returns (match_set, n_entries) where match_set holds basenames + stems
+    of every entry so the filter matches whether the list uses `foo.jpg` or `foo`.
+    Missing file raises (typo protection)."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"data.image_filter file not found: {p}")
+    match: set[str] = set()
+    n = 0
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        n += 1
+        match.add(line)
+        match.add(Path(line).name)
+        match.add(Path(line).stem)
+    return match, n
+
+
+def load_datasets(sources: list[dict] | list[tuple[str, str]],
+                  image_filter: str | Path | None = None) -> list[Sample]:
     """Load and concatenate multiple COCO sources.
 
     sources: list of either {"coco": path, "images": dir, "obb_dir": dir?} dicts
     or (coco, dir) tuples. Returns a single merged Sample list. Single-class
     collapse is per-source then merged.
+
+    image_filter: optional path to a text file listing image names (basename or
+    stem, one per line). When given, only samples whose image matches a listed
+    name are kept — applied to the merged list across all sources. None / empty
+    file → keep everything.
     """
     out: list[Sample] = []
     for src in sources:
@@ -104,6 +131,17 @@ def load_datasets(sources: list[dict] | list[tuple[str, str]]) -> list[Sample]:
         out.extend(load_coco_single_class(coco, root, obb_dir=obb_dir))
         suffix = f" (+OBB from {obb_dir})" if obb_dir else ""
         print(f"  loaded {len(out) - before} samples from {coco}{suffix}")
+
+    if image_filter:
+        match, n_entries = _read_image_filter(image_filter)
+        if n_entries == 0:
+            print(f"  image_filter {image_filter}: empty — keeping all {len(out)} samples")
+            return out
+        kept = [s for s in out if s.image_path.name in match or s.image_path.stem in match]
+        print(f"  image_filter {image_filter}: {n_entries} entries → kept {len(kept)}/{len(out)} samples")
+        if not kept:
+            raise ValueError(f"image_filter {image_filter} matched 0 samples — check the names")
+        return kept
     return out
 
 
