@@ -102,29 +102,69 @@ def _draw_gaussian(hm: np.ndarray, cx: int, cy: int, sigma: float) -> None:
 
 
 def _draw_obj_blob(hm: np.ndarray, ix: int, iy: int, bw_px: float, bh_px: float, theta: float,
-                   stride: int, min_sigma: float, blob_frac: float) -> None:
+                   stride: int, min_sigma: float, blob_frac: float, target_shape: str = "gaussian") -> None:
     """Draw the objectness target blob at cell (ix, iy).
 
-    blob_frac <= 0  → legacy CornerNet: isotropic Gaussian, σ = IoU-shift radius
-                      / 3 — a tight bump usually much smaller than the object
-                      (the "nipple").
-    blob_frac > 0   → an *oriented elliptical* Gaussian sized to the box:
-                      σ_major ≈ blob_frac · bw / stride along the box's local x
-                      (rotated by theta), σ_minor ≈ blob_frac · bh / stride. At
-                      ~0.15-0.25 the dome roughly covers the object, so the
-                      pre-peak-suppression heatmap looks object-shaped. Still a
-                      single-peaked dome (max at center — never a flat-topped
-                      mask, or peak suppression breaks). Caveat: for touching
-                      objects the dome tails overlap and *soften* the negative
-                      pressure in the gaps between them — keep blob_frac modest.
+    target_shape == "ellipse" → a *domed ellipse* fitted to the box: 1.0 at the
+        center, linearly ramping to 0 at the box's inscribed-ellipse boundary,
+        0 in the box corners and beyond, rotated by theta. Single-peaked (peak
+        suppression unaffected) and — unlike a Gaussian whose tail never reaches
+        0 — it hits exactly 0 at the object edge, so it does NOT bleed into the
+        gaps between touching objects. (Same family as _render_dist_target,
+        generalized to rotation, painted per-box.) `blob_frac` ignored here.
+
+    Otherwise a Gaussian:
+      blob_frac <= 0  → legacy CornerNet: isotropic, σ = IoU-shift radius / 3 —
+                        a tight bump usually much smaller than the object.
+      blob_frac > 0   → oriented elliptical Gaussian, σ ≈ blob_frac·{w,h}/stride.
+                        Object-shaped-ish but the tail bleeds into gaps — keep modest.
     """
-    if blob_frac > 0.0:
+    if target_shape == "ellipse":
+        a = bw_px / (2.0 * stride)
+        b = bh_px / (2.0 * stride)
+        _draw_rotated_dome(hm, ix, iy, a, b, float(theta))
+    elif blob_frac > 0.0:
         sx = max(min_sigma, blob_frac * bw_px / stride)   # along the box's local x (theta dir)
         sy = max(min_sigma, blob_frac * bh_px / stride)
         _draw_rotated_gaussian(hm, ix, iy, sx, sy, float(theta))
     else:
         sigma = max(min_sigma, gaussian_radius(bw_px, bh_px) / stride / 3.0)
         _draw_gaussian(hm, ix, iy, sigma)
+
+
+def _draw_rotated_dome(hm: np.ndarray, cx: int, cy: int, a: float, b: float, theta: float) -> None:
+    """Domed ellipse on a stride-cell grid: 1.0 at (cx,cy), linearly ramping to 0
+    at the ellipse boundary (semi-axes a,b in cells, major along theta), 0 outside
+    the ellipse. Single-peaked (the center cell is the unique max); hits exactly 0
+    at the boundary so touching objects' domes don't bleed into the gap between
+    them. Max-aggregated onto hm."""
+    h, w = hm.shape
+    a = max(1.0, float(a))
+    b = max(1.0, float(b))
+    rad = int(math.ceil(max(a, b))) + 1
+    x0, x1 = max(0, cx - rad), min(w, cx + rad + 1)
+    y0, y1 = max(0, cy - rad), min(h, cy + rad + 1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    ys, xs = np.ogrid[y0:y1, x0:x1]
+    dx = (xs - cx).astype(np.float32)
+    dy = (ys - cy).astype(np.float32)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    xp = dx * cos_t + dy * sin_t      # along the box's local x (major / theta dir)
+    yp = -dx * sin_t + dy * cos_t
+    r = np.sqrt((xp / a) ** 2 + (yp / b) ** 2)   # 0 at center, 1 at the ellipse boundary
+    g = np.clip(1.0 - r, 0.0, 1.0).astype(np.float32)
+    hm[y0:y1, x0:x1] = np.maximum(hm[y0:y1, x0:x1], g)
+
+
+def _box_near_edge(x1: float, y1: float, x2: float, y2: float, W: int, H: int, margin: float) -> bool:
+    """True if the box comes within `margin` (fraction of the image) of any edge —
+    i.e. it's clipped or near-clipped. Used to fall back from the ellipse target to
+    a plain Gaussian for edge objects (rendering a clean egg-ellipse for the
+    visible chunk of a half-egg would put the peak at the wrong place)."""
+    if margin <= 0.0:
+        return False
+    return x1 < margin * W or y1 < margin * H or x2 > (1.0 - margin) * W or y2 > (1.0 - margin) * H
 
 
 def _render_dist_target(boxes: np.ndarray, Hp: int, Wp: int, s: int) -> np.ndarray:
@@ -189,7 +229,10 @@ def encode_targets(
             iy = int(cy_g)
             if ix < 0 or iy < 0 or ix >= Wp or iy >= Hp:
                 continue
-            _draw_obj_blob(hm, ix, iy, bw, bh, 0.0, s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0))
+            shape = getattr(cfg, "hm_target", "gaussian")
+            if shape == "ellipse" and _box_near_edge(x1, y1, x2, y2, W, H, float(getattr(cfg, "hm_ellipse_edge_margin", 0.1))):
+                shape = "gaussian"
+            _draw_obj_blob(hm, ix, iy, bw, bh, 0.0, s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0), shape)
             cxy[0, iy, ix] = cx_g - ix
             cxy[1, iy, ix] = cy_g - iy
             wh[0, iy, ix] = bw / W
@@ -246,7 +289,10 @@ def encode_targets_ltrb(
             iy = int(cy_g)
             if ix < 0 or iy < 0 or ix >= Wp or iy >= Hp:
                 continue
-            _draw_obj_blob(hm, ix, iy, bw, bh, 0.0, s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0))
+            shape = getattr(cfg, "hm_target", "gaussian")
+            if shape == "ellipse" and _box_near_edge(x1, y1, x2, y2, W, H, float(getattr(cfg, "hm_ellipse_edge_margin", 0.1))):
+                shape = "gaussian"
+            _draw_obj_blob(hm, ix, iy, bw, bh, 0.0, s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0), shape)
             cx_cell = (ix + 0.5) * s
             cy_cell = (iy + 0.5) * s
             ltrb[0, iy, ix] = float(np.clip((cx_cell - x1) / W, 0.0, 1.0))
@@ -333,7 +379,17 @@ def encode_targets_obb(
             iy = int(cy_g)
             if ix < 0 or iy < 0 or ix >= Wp or iy >= Hp:
                 continue
-            _draw_obj_blob(hm, ix, iy, bw, bh, float(theta), s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0))
+            shape = getattr(cfg, "hm_target", "gaussian")
+            if shape == "ellipse":
+                # edge check on the OBB's axis-aligned envelope
+                ct, st = math.cos(float(theta)), math.sin(float(theta))
+                aabb_w = abs(bw * ct) + abs(bh * st)
+                aabb_h = abs(bw * st) + abs(bh * ct)
+                ex1, ey1 = float(cx_px) - aabb_w / 2, float(cy_px) - aabb_h / 2
+                ex2, ey2 = float(cx_px) + aabb_w / 2, float(cy_px) + aabb_h / 2
+                if _box_near_edge(ex1, ey1, ex2, ey2, W, H, float(getattr(cfg, "hm_ellipse_edge_margin", 0.1))):
+                    shape = "gaussian"
+            _draw_obj_blob(hm, ix, iy, bw, bh, float(theta), s, min_sigma, getattr(cfg, "hm_blob_frac", 0.0), shape)
             reg[0, iy, ix] = float(np.clip(cx_g - ix, 0.0, 1.0))
             reg[1, iy, ix] = float(np.clip(cy_g - iy, 0.0, 1.0))
             reg[2, iy, ix] = float(np.clip(bw / W, 0.0, 1.0))

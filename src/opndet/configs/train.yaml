@@ -80,17 +80,24 @@ epochs: 100
 #                                 #   in the calling cell. Subprocess gets cleaned up at exit.
 # dashboard_port: 5000            # bind port for the auto-spawned dashboard
 #
-# hm_blob_frac: 0.0               # >0 makes the objectness GT an *object-shaped* dome instead of
-#                                 #   a tight CornerNet bump: an oriented elliptical Gaussian with
-#                                 #   σ ≈ hm_blob_frac·{w,h}/stride (rotated by θ for OBB heads). At
-#                                 #   ~0.15-0.25 the dome roughly covers the object, so the pre-peak-
-#                                 #   suppression heatmap looks like a soft segmentation. Still a
-#                                 #   single-peaked dome (peak suppression unaffected). CAVEAT: for
-#                                 #   touching objects the dome tails overlap and soften the negative
-#                                 #   pressure in the GAPS between them → keep it modest or you make
-#                                 #   "phantom in the hole" hallucinations worse. Pair with cls_loss:
-#                                 #   soft_hm so the surrounding cells are actually learned, not just
-#                                 #   permitted.
+# hm_target: gaussian             # objectness GT shape. "gaussian" (default) = the CornerNet bump
+#                                 #   (or, if hm_blob_frac > 0, an oriented elliptical Gaussian).
+#                                 #   "ellipse" = a domed ellipse FITTED to the GT box: 1.0 at the
+#                                 #   center, linearly ramping to 0 at the box's inscribed-ellipse
+#                                 #   boundary, 0 in the box corners and beyond, rotated by θ. The
+#                                 #   raw heatmap then reads like a soft segmentation, AND — unlike a
+#                                 #   Gaussian whose tail never reaches 0 — it hits exactly 0 at the
+#                                 #   object edge, so it does NOT bleed into the gaps between touching
+#                                 #   objects (the right choice for crowded scenes). Pair with
+#                                 #   cls_loss: soft_hm so the model regresses the whole ramp.
+# hm_ellipse_edge_margin: 0.1     # (hm_target: ellipse only) objects whose box comes within this
+#                                 #   fraction of any image edge fall back to a plain Gaussian —
+#                                 #   the visible chunk of a clipped object isn't egg-shaped, so
+#                                 #   rendering a clean ellipse for it would put the peak wrong. 0 = off.
+# hm_blob_frac: 0.0               # (hm_target: gaussian only) >0 → oriented elliptical Gaussian with
+#                                 #   σ ≈ hm_blob_frac·{w,h}/stride. Object-shaped-ish, but the tail
+#                                 #   bleeds into gaps between touching objects → keep modest, or
+#                                 #   prefer hm_target: ellipse which doesn't have that problem.
 #
 # loss:
 #   wh_loss: ciou                 # default

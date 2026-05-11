@@ -104,13 +104,16 @@ class _CfgShim:
     """encode_targets needs an object with img_h/img_w/stride/out_h/out_w (and an
     optional hm_blob_frac for the object-shaped-heatmap encoding)."""
 
-    def __init__(self, img_h: int, img_w: int, stride: int, hm_blob_frac: float = 0.0):
+    def __init__(self, img_h: int, img_w: int, stride: int, hm_blob_frac: float = 0.0,
+                 hm_target: str = "gaussian", hm_ellipse_edge_margin: float = 0.1):
         self.img_h = img_h
         self.img_w = img_w
         self.stride = stride
         self.out_h = img_h // stride
         self.out_w = img_w // stride
         self.hm_blob_frac = float(hm_blob_frac)
+        self.hm_target = str(hm_target)
+        self.hm_ellipse_edge_margin = float(hm_ellipse_edge_margin)
 
 
 def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -681,7 +684,9 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         model.load_state_dict(resume_state["model"])
     in_ch, img_h, img_w = model.input_shape
     stride = int(c.get("model", {}).get("stride", 4))
-    cfg_shim = _CfgShim(img_h, img_w, stride=stride, hm_blob_frac=float(c.get("hm_blob_frac", 0.0)))
+    cfg_shim = _CfgShim(img_h, img_w, stride=stride, hm_blob_frac=float(c.get("hm_blob_frac", 0.0)),
+                        hm_target=str(c.get("hm_target", "gaussian")),
+                        hm_ellipse_edge_margin=float(c.get("hm_ellipse_edge_margin", 0.1)))
     n_params = sum(p.numel() for p in model.parameters())
     has_dist = "dist" in getattr(model, "aliases", {})
     print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}{'  (dist head)' if has_dist else ''}")
