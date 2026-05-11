@@ -100,7 +100,8 @@ export function Chart({ title, series, smoothing, logY, height = 220 }: Props) {
       width: host.clientWidth || 360,
       height,
       legend: { show: false },
-      cursor: { focus: { prox: 30 } },
+      // drag a box (x+y) to zoom into a region; double-click resets.
+      cursor: { focus: { prox: 30 }, drag: { x: true, y: true, uni: 12 } },
       scales: { y: { distr: logY ? 3 : 1 } },
       plugins: [tooltipPlugin()],
       axes: [
