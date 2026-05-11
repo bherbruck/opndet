@@ -109,8 +109,10 @@ export function Chart({ title, series, smoothing, logY, height = 220 }: Props) {
       scales: { x: { time: false }, y: { distr: logY ? 3 : 1 } },
       plugins: [tooltipPlugin()],
       axes: [
-        { stroke: "#8b97a3", grid: { stroke: "#222a33" }, ticks: { stroke: "#2a333d" } },
-        { stroke: "#8b97a3", grid: { stroke: "#222a33" }, ticks: { stroke: "#2a333d" }, size: 52 },
+        // x: no label, so reclaim uPlot's default 50px reserve down to just
+        // ticks + tick-text height.
+        { stroke: "#8b97a3", grid: { stroke: "#222a33" }, ticks: { stroke: "#2a333d", size: 4 }, gap: 3, size: 26 },
+        { stroke: "#8b97a3", grid: { stroke: "#222a33" }, ticks: { stroke: "#2a333d", size: 4 }, gap: 3, size: 46 },
       ],
       series: [
         { label: "ep" },
