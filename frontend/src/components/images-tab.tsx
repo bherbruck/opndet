@@ -80,9 +80,20 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
     },
     [epochs],
   );
+  const stepSample = useCallback(
+    (delta: number) => {
+      setLbIdx((cur) => {
+        if (samples.length === 0 || cur == null) return cur;
+        const i = samples.findIndex((s) => s.sample_idx === cur);
+        const j = Math.max(0, Math.min(samples.length - 1, (i < 0 ? 0 : i) + delta));
+        return samples[j].sample_idx;
+      });
+    },
+    [samples],
+  );
 
-  // ↑/→ next epoch, ↓/← prev — but not while typing, and not while the lightbox
-  // is open (it forwards arrow keys itself so it doesn't double-step).
+  // On the grid (no "current image"), arrows step the epoch — but not while
+  // typing, and not while the lightbox is open (it forwards arrows itself).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (lbIdx != null || isTyping(e.target)) return;
@@ -156,9 +167,10 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
       {lbSample && (
         <Lightbox
           sample={lbSample}
-          caption={`${imgRun} · ${imgTag} · ep ${ep} · #${lbIdx} · (${epIdx + 1}/${epochs.length})`}
+          caption={`${imgRun} · ${imgTag} · ep ${ep} (${epIdx + 1}/${epochs.length}) · #${lbIdx}`}
           onClose={() => setLbIdx(null)}
           onStepEpoch={stepEpoch}
+          onStepSample={samples.length > 1 ? stepSample : undefined}
         />
       )}
     </div>

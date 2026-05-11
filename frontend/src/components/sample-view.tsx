@@ -12,11 +12,10 @@ interface Props {
   onLoadNatural?: (w: number, h: number) => void;
 }
 
-// Original dashboard palette / line thickness — keep these.
+// Original dashboard palette — keep these.
 const COLOR_BY_KIND: Record<string, string> = {
   pred: "#39c860", gt: "#ff5edb", tp: "#39c860", fp: "#ff6b35", fn: "#3aa6ff", trail: "#ffffff",
 };
-const LINE_W = 2; // device-independent: canvas is sized to the *rendered* px, not natural
 
 /** corners may arrive as [[x,y]*4] or as a flat [x0,y0,x1,y1,x2,y2,x3,y3]. */
 function cornerPairs(b: Box): number[][] | null {
@@ -31,8 +30,7 @@ function cornerPairs(b: Box): number[][] | null {
 }
 
 function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box[]) {
-  // Match the canvas bitmap to its rendered CSS size → 2px lines stay 2px at
-  // any zoom/thumbnail size; scale the context so we can draw in natural coords.
+  // Bitmap = rendered CSS size; draw in natural coords via ctx.scale.
   const rw = Math.max(1, Math.round(canvas.clientWidth));
   const rh = Math.max(1, Math.round(canvas.clientHeight || (rw * natH) / natW));
   if (canvas.width !== rw) canvas.width = rw;
@@ -42,21 +40,31 @@ function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, rw, rh);
   ctx.scale(rw / natW, rh / natH);
-  ctx.font = `${(12 * natW) / rw}px ui-monospace, monospace`; // ~12 rendered px
-  ctx.textBaseline = "alphabetic";
+
+  // zoom = rendered px per natural px. Line/text widths are specified in
+  // *rendered* px and converted back to natural units (÷ zoom) so they scale
+  // up when the image is blown up (fit > 1×) but never go thinner than the
+  // floor on thumbnails (zoom < 1).
+  const zoom = rw / natW;
+  const px = (renderedPx: number, floorPx = renderedPx) => Math.max(floorPx, renderedPx * zoom) / zoom;
+  const lw = px(2);          // box stroke ≈ 2px, scales with zoom
+  ctx.lineJoin = "round";
+  ctx.textBaseline = "top";
+  ctx.font = `${px(13)}px ui-monospace, monospace`;
+
   for (const b of boxes) {
     const color = COLOR_BY_KIND[b.kind] ?? "#ffffff";
     if (b.kind === "trail") {
       ctx.strokeStyle = color;
-      ctx.lineWidth = (1 * natW) / rw;
+      ctx.lineWidth = px(1);
       ctx.beginPath(); ctx.moveTo(b.x1, b.y1); ctx.lineTo(b.x2, b.y2); ctx.stroke();
       ctx.fillStyle = color;
-      ctx.beginPath(); ctx.arc(b.x1, b.y1, (1.5 * natW) / rw, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(b.x2, b.y2, (2.5 * natW) / rw, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(b.x1, b.y1, px(1.5), 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(b.x2, b.y2, px(2.5), 0, Math.PI * 2); ctx.fill();
       continue;
     }
     ctx.strokeStyle = color;
-    ctx.lineWidth = (LINE_W * natW) / rw;
+    ctx.lineWidth = lw;
     const poly = cornerPairs(b);
     if (poly) {
       ctx.beginPath();
@@ -71,7 +79,8 @@ function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box
       ctx.fillStyle = color;
       const lx = poly ? Math.min(...poly.map((p) => p[0])) : b.x1;
       const ly = poly ? Math.min(...poly.map((p) => p[1])) : b.y1;
-      ctx.fillText(b.score.toFixed(2), lx + 2, ly + (12 * natW) / rw);
+      // top-left, just inside the box border
+      ctx.fillText(b.score.toFixed(2), lx + lw + px(1), ly + lw + px(1));
     }
   }
 }
