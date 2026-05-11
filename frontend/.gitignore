@@ -1,0 +1,26 @@
+# dashboard SPA — build deps & caches. NOTE: the built bundle is emitted to
+# ../src/opndet/dashboard_static/ (committed, ships in the wheel), not here.
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+bun-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# build caches
+.vite
+*.tsbuildinfo
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.sw?

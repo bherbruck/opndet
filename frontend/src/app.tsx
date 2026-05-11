@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, type RunInfo, type ScalarsBulk, type TagsBulk } from "./api";
-import { loadLS, saveLS, timeAgo } from "./util";
+import { useEffect, useMemo, useRef } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useLocalStorage } from "usehooks-ts";
+import { api } from "./api";
+import { timeAgo } from "./util";
 import { RunSidebar } from "./components/run-sidebar";
 import { ScalarsTab } from "./components/scalars-tab";
 import { ImagesTab } from "./components/images-tab";
@@ -23,142 +25,86 @@ const REFRESH_OPTS = [
 ];
 
 export function App() {
-  const [runs, setRuns] = useState<RunInfo[]>([]);
-  const [selected, setSelected] = useState<string[]>(() => loadLS<string[]>("opndet.selected", []));
-  const [tab, setTab] = useState<Tab>(() => loadLS<Tab>("opndet.tab", "scalars"));
-  const [refreshMs, setRefreshMs] = useState<number>(() => loadLS<number>("opndet.refreshMs", 30000));
-  const [tags, setTags] = useState<TagsBulk | null>(null);
-  const [scalars, setScalars] = useState<ScalarsBulk | null>(null);
-  const [lastSync, setLastSync] = useState<number>(0);
-  const [err, setErr] = useState<string | null>(null);
-  const knownRef = useRef<string[]>(loadLS<string[]>("opndet.known", []));
+  const [selected, setSelected] = useLocalStorage<string[]>("opndet.selected", []);
+  const [tab, setTab] = useLocalStorage<Tab>("opndet.tab", "scalars");
+  const [refreshMs, setRefreshMs] = useLocalStorage<number>("opndet.refreshMs", 30000);
+  const [known, setKnown] = useLocalStorage<string[]>("opndet.known", []);
+  const refetchInterval = refreshMs > 0 ? refreshMs : false;
 
-  useEffect(() => saveLS("opndet.selected", selected), [selected]);
-  useEffect(() => saveLS("opndet.tab", tab), [tab]);
-  useEffect(() => saveLS("opndet.refreshMs", refreshMs), [refreshMs]);
+  const runsQ = useQuery({
+    queryKey: ["runs"],
+    queryFn: api.runs,
+    refetchInterval,
+    select: (rs) => [...rs].sort((a, b) => b.mtime - a.mtime),
+  });
+  const runs = useMemo(() => runsQ.data ?? [], [runsQ.data]);
+  const runNames = useMemo(() => runs.map((r) => r.name), [runs]);
 
-  const refreshRuns = useCallback(async () => {
-    const list = await api.runs();
-    list.sort((a, b) => b.mtime - a.mtime);
-    setRuns(list);
-    // Auto-select runs that appeared since we last looked. Runs the user
-    // explicitly unchecked stay in `known`, so they don't pop back.
-    const names = list.map((r) => r.name);
-    const fresh = names.filter((n) => !knownRef.current.includes(n));
-    knownRef.current = names;
-    saveLS("opndet.known", names);
-    if (fresh.length) {
-      setSelected((prev) => {
-        const next = [...new Set([...prev.filter((n) => names.includes(n)), ...fresh])];
-        return next;
-      });
-    } else {
-      // Drop selections for runs that disappeared.
-      setSelected((prev) => prev.filter((n) => names.includes(n)));
-    }
-    return names;
-  }, []);
-
-  const refreshData = useCallback(async (sel: string[]) => {
-    if (sel.length === 0) {
-      setTags(null);
-      setScalars(null);
-      return;
-    }
-    const [t, s] = await Promise.all([api.tagsBulk(sel), api.scalarsBulk(sel)]);
-    setTags(t);
-    setScalars(s);
-  }, []);
-
-  const syncAll = useCallback(async () => {
-    try {
-      const names = await refreshRuns();
-      // Any newly auto-selected run lands in `selected` state and the
-      // selection effect re-fetches; here just refresh what's already shown.
-      await refreshData(selected.filter((n) => names.includes(n)));
-      setLastSync(Date.now());
-      setErr(null);
-    } catch (e) {
-      setErr(String(e));
-    }
-  }, [refreshRuns, refreshData, selected]);
-
-  // Initial load.
+  // Auto-select runs that appeared since we last looked; drop ones that vanished.
+  // Runs the user explicitly unchecked stay in `known`, so they don't pop back.
+  const knownRef = useRef(known);
+  knownRef.current = known;
   useEffect(() => {
-    syncAll();
-  }, []);
+    if (runNames.length === 0) return;
+    const fresh = runNames.filter((n) => !knownRef.current.includes(n));
+    setKnown(runNames);
+    setSelected((prev) => {
+      const kept = prev.filter((n) => runNames.includes(n));
+      return fresh.length ? [...new Set([...kept, ...fresh])] : kept;
+    });
+  }, [runNames.join("|")]);
 
-  // Re-fetch data when the selection changes (debounced a touch).
-  useEffect(() => {
-    const id = setTimeout(() => {
-      refreshData(selected).then(() => setLastSync(Date.now())).catch((e) => setErr(String(e)));
-    }, 60);
-    return () => clearTimeout(id);
-  }, [selected, refreshData]);
+  const sel = useMemo(() => selected.filter((n) => runNames.includes(n)), [selected, runNames]);
 
-  // Autorefresh loop — paused when the tab is hidden.
-  useEffect(() => {
-    if (refreshMs <= 0) return;
-    let alive = true;
-    const tick = async () => {
-      if (!alive) return;
-      if (document.visibilityState === "visible") {
-        try {
-          const names = await refreshRuns();
-          await refreshData(selected.filter((n) => names.includes(n)));
-          setLastSync(Date.now());
-          setErr(null);
-        } catch (e) {
-          setErr(String(e));
-        }
-      }
-    };
-    const id = setInterval(tick, refreshMs);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, [refreshMs, refreshRuns, refreshData, selected]);
+  const tagsQ = useQuery({
+    queryKey: ["tagsBulk", sel],
+    queryFn: () => api.tagsBulk(sel),
+    enabled: sel.length > 0,
+    placeholderData: keepPreviousData,
+    refetchInterval,
+  });
+  const scalarsQ = useQuery({
+    queryKey: ["scalarsBulk", sel],
+    queryFn: () => api.scalarsBulk(sel),
+    enabled: sel.length > 0,
+    placeholderData: keepPreviousData,
+    refetchInterval,
+  });
 
-  const csvUrl = useMemo(() => api.scalarsCsvUrl(selected), [selected]);
+  const csvUrl = useMemo(() => api.scalarsCsvUrl(sel), [sel]);
+  const lastSync = Math.max(runsQ.dataUpdatedAt, tagsQ.dataUpdatedAt, scalarsQ.dataUpdatedAt);
+  const fetching = runsQ.isFetching || tagsQ.isFetching || scalarsQ.isFetching;
+  const err = (runsQ.error ?? tagsQ.error ?? scalarsQ.error)?.toString();
   const rootName = document.title.includes("·") ? document.title.split("·")[1].trim() : "runs";
 
   return (
     <div className="flex h-full flex-col">
-      {/* header */}
       <header className="flex flex-none items-center gap-3.5 border-b border-line bg-bg1 px-3.5 py-2">
         <span className="font-bold text-white">
           opndet <span className="font-normal text-fgdim">· {rootName}</span>
         </span>
         <span className="text-fgdim">
-          {runs.length} run{runs.length === 1 ? "" : "s"} · {selected.length} shown
+          {runs.length} run{runs.length === 1 ? "" : "s"} · {sel.length} shown
         </span>
         {err && <span className="text-warn">⚠ {err}</span>}
         <span className="flex-1" />
-        <span className="text-fgdim">{lastSync ? `synced ${timeAgo(lastSync / 1000)}` : "…"}</span>
+        <span className="text-fgdim">
+          {fetching ? "syncing…" : lastSync ? `synced ${timeAgo(lastSync / 1000)}` : "…"}
+        </span>
         <label className="flex items-center gap-1.5 text-fgdim">
           auto
-          <select
-            className="field"
-            value={refreshMs}
-            onChange={(e) => setRefreshMs(Number(e.target.value))}
-          >
+          <select className="field" value={refreshMs} onChange={(e) => setRefreshMs(Number(e.target.value))}>
             {REFRESH_OPTS.map((o) => (
-              <option key={o.ms} value={o.ms}>
-                {o.label}
-              </option>
+              <option key={o.ms} value={o.ms}>{o.label}</option>
             ))}
           </select>
         </label>
-        <button type="button" className="btn" onClick={syncAll}>
+        <button type="button" className="btn" onClick={() => { runsQ.refetch(); tagsQ.refetch(); scalarsQ.refetch(); }}>
           refresh
         </button>
-        <a className="btn no-underline" href={csvUrl}>
-          csv
-        </a>
+        <a className="btn no-underline" href={csvUrl}>csv</a>
       </header>
 
-      {/* tabs */}
       <nav className="flex flex-none gap-1 border-b border-line bg-bg1 px-3.5 pt-1.5">
         {TABS.map((t) => (
           <button
@@ -172,16 +118,15 @@ export function App() {
         ))}
       </nav>
 
-      {/* body */}
       <div className="flex min-h-0 flex-1">
         <aside className="w-[250px] flex-none overflow-y-auto border-r border-line bg-bg1 p-2">
           <RunSidebar runs={runs} selected={selected} onChange={setSelected} />
         </aside>
         <main className="min-w-0 flex-1 overflow-y-auto p-3">
-          {tab === "scalars" && <ScalarsTab selected={selected} tags={tags} scalars={scalars} />}
-          {tab === "images" && <ImagesTab selected={selected} tags={tags} />}
-          {tab === "config" && <ConfigTab selected={selected} />}
-          {tab === "sql" && <SqlTab runs={runs} selected={selected} />}
+          {tab === "scalars" && <ScalarsTab selected={sel} tags={tagsQ.data ?? null} scalars={scalarsQ.data ?? null} />}
+          {tab === "images" && <ImagesTab selected={sel} tags={tagsQ.data ?? null} refetchInterval={refetchInterval} />}
+          {tab === "config" && <ConfigTab selected={sel} />}
+          {tab === "sql" && <SqlTab runs={runs} selected={sel} />}
         </main>
       </div>
     </div>

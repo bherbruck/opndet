@@ -51,6 +51,16 @@ async function getJSON<T>(url: string): Promise<T> {
   return (await r.json()) as T;
 }
 
+async function postJSON<T>(url: string, body: unknown): Promise<T> {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`${url} → ${r.status}`);
+  return (await r.json()) as T;
+}
+
 const qs = (o: Record<string, string | undefined>) =>
   Object.entries(o)
     .filter(([, v]) => v != null && v !== "")
@@ -60,22 +70,19 @@ const qs = (o: Record<string, string | undefined>) =>
 export const api = {
   runs: () => getJSON<RunInfo[]>("/api/runs"),
   health: () => getJSON<{ ok: boolean; root: string; n_runs: number }>("/api/health"),
-  tagsBulk: (runs: string[]) => getJSON<TagsBulk>(`/api/tags/bulk?${qs({ runs: runs.join(",") })}`),
+  // bulk reads are POST: run/tag lists can get long, and these are live-polled
+  // training metrics — caching them would be wrong anyway.
+  tagsBulk: (runs: string[]) => postJSON<TagsBulk>("/api/tags/bulk", { runs }),
   scalarsBulk: (runs: string[], tags?: string[]) =>
-    getJSON<ScalarsBulk>(`/api/scalars/bulk?${qs({ runs: runs.join(","), tags: tags?.join(",") })}`),
-  epochs: (run: string, tag: string) =>
-    getJSON<number[]>(`/api/epochs?${qs({ run, tag })}`),
+    postJSON<ScalarsBulk>("/api/scalars/bulk", { runs, tags: tags ?? [] }),
+  epochs: (run: string, tag: string) => getJSON<number[]>(`/api/epochs?${qs({ run, tag })}`),
   samples: (run: string, tag: string, ep: number) =>
     getJSON<Sample[]>(`/api/samples?${qs({ run, tag, ep: String(ep) })}`),
   config: (run: string) => getJSON<Record<string, string>>(`/api/config?${qs({ run })}`),
-  sql: async (run: string, query: string): Promise<SqlResult> => {
-    const r = await fetch(`/api/sql?${qs({ run })}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query }),
-    });
-    return (await r.json()) as SqlResult;
-  },
+  sql: (run: string, query: string) =>
+    postJSON<SqlResult>(`/api/sql?${qs({ run })}`, { query }).catch(
+      (e): SqlResult => ({ columns: [], rows: [], truncated: false, error: String(e) }),
+    ),
   scalarsCsvUrl: (runs: string[], tags?: string[]) =>
     `/api/export/scalars.csv?${qs({ runs: runs.join(","), tags: tags?.join(",") })}`,
 };

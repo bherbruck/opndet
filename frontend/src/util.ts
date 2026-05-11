@@ -59,26 +59,3 @@ export function emaSmooth(series: Point[], weight: number): Point[] {
   return out;
 }
 
-export function fmtNum(v: number | null | undefined): string {
-  if (v == null || !Number.isFinite(v)) return "—";
-  const a = Math.abs(v);
-  if (a !== 0 && (a < 1e-3 || a >= 1e6)) return v.toExponential(3);
-  return Number(v.toPrecision(6)).toString();
-}
-
-// localStorage-backed persistence; tolerant of disabled storage.
-export function loadLS<T>(key: string, fallback: T): T {
-  try {
-    const v = localStorage.getItem(key);
-    return v == null ? fallback : (JSON.parse(v) as T);
-  } catch {
-    return fallback;
-  }
-}
-export function saveLS(key: string, val: unknown): void {
-  try {
-    localStorage.setItem(key, JSON.stringify(val));
-  } catch {
-    /* ignore */
-  }
-}

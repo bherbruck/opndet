@@ -1,6 +1,6 @@
 import { useState } from "react";
+import { useLocalStorage } from "usehooks-ts";
 import { api, type RunInfo, type SqlResult } from "../api";
-import { loadLS, saveLS } from "../util";
 
 interface Props {
   runs: RunInfo[];
@@ -10,7 +10,7 @@ interface Props {
 const DEFAULT_Q = "SELECT tag, count(*) AS n, min(ep) AS first_ep, max(ep) AS last_ep\nFROM scalars GROUP BY tag ORDER BY tag";
 
 export function SqlTab({ runs, selected }: Props) {
-  const [query, setQuery] = useState<string>(() => loadLS("opndet.sqlQuery", DEFAULT_Q));
+  const [query, setQuery] = useLocalStorage("opndet.sqlQuery", DEFAULT_Q);
   const [target, setTarget] = useState<string>(selected[0] ?? runs[0]?.name ?? "");
   const [res, setRes] = useState<SqlResult | null>(null);
   const [running, setRunning] = useState(false);
@@ -18,11 +18,8 @@ export function SqlTab({ runs, selected }: Props) {
   const run = async () => {
     if (!target) return;
     setRunning(true);
-    saveLS("opndet.sqlQuery", query);
     try {
       setRes(await api.sql(target, query));
-    } catch (e) {
-      setRes({ columns: [], rows: [], truncated: false, error: String(e) });
     } finally {
       setRunning(false);
     }

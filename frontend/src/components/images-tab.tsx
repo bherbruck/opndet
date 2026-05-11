@@ -1,50 +1,46 @@
 import { useEffect, useMemo, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useLocalStorage } from "usehooks-ts";
 import { api, type Sample, type TagsBulk } from "../api";
-import { loadLS, runColor, saveLS } from "../util";
+import { runColor } from "../util";
 import { Lightbox } from "./lightbox";
 
 interface Props {
   selected: string[];
   tags: TagsBulk | null;
+  refetchInterval: number | false;
 }
 
-export function ImagesTab({ selected, tags }: Props) {
+export function ImagesTab({ selected, tags, refetchInterval }: Props) {
   const imageTags = tags?.images ?? [];
-  const [imgTag, setImgTag] = useState<string>(() => loadLS("opndet.imgTag", ""));
-  const [epochsByRun, setEpochsByRun] = useState<Record<string, number[]>>({});
+  const [imgTag, setImgTag] = useLocalStorage("opndet.imgTag", "");
   const [ep, setEp] = useState<number | null>(null);
-  const [samplesByRun, setSamplesByRun] = useState<Record<string, Sample[]>>({});
   const [lb, setLb] = useState<{ sample: Sample; caption: string } | null>(null);
-  const [loading, setLoading] = useState(false);
 
   // Keep imgTag valid as the available tags change.
   useEffect(() => {
     if (imageTags.length === 0) return;
-    if (!imgTag || !imageTags.includes(imgTag)) {
-      const t = imageTags[0];
-      setImgTag(t);
-      saveLS("opndet.imgTag", t);
-    }
-  }, [imageTags, imgTag]);
+    if (!imgTag || !imageTags.includes(imgTag)) setImgTag(imageTags[0]);
+  }, [imageTags, imgTag, setImgTag]);
 
-  // Which selected runs actually have this image tag.
   const runsWithTag = useMemo(
     () => selected.filter((r) => (tags?.per_run?.[r]?.images ?? []).includes(imgTag)),
     [selected, tags, imgTag],
   );
 
-  // Fetch epoch lists when the tag / run set changes.
-  useEffect(() => {
-    if (!imgTag || runsWithTag.length === 0) {
-      setEpochsByRun({});
-      return;
-    }
-    let alive = true;
-    Promise.all(runsWithTag.map((r) => api.epochs(r, imgTag).then((e) => [r, e] as const).catch(() => [r, []] as const)))
-      .then((pairs) => { if (alive) setEpochsByRun(Object.fromEntries(pairs)); });
-    return () => { alive = false; };
-  }, [imgTag, runsWithTag]);
-
+  const epochsQ = useQuery({
+    queryKey: ["epochs", imgTag, runsWithTag],
+    enabled: !!imgTag && runsWithTag.length > 0,
+    placeholderData: keepPreviousData,
+    refetchInterval,
+    queryFn: async () => {
+      const pairs = await Promise.all(
+        runsWithTag.map((r) => api.epochs(r, imgTag).then((e) => [r, e] as const).catch(() => [r, []] as const)),
+      );
+      return Object.fromEntries(pairs) as Record<string, number[]>;
+    },
+  });
+  const epochsByRun = epochsQ.data ?? {};
   const allEpochs = useMemo(
     () => [...new Set(Object.values(epochsByRun).flat())].sort((a, b) => a - b),
     [epochsByRun],
@@ -56,24 +52,23 @@ export function ImagesTab({ selected, tags }: Props) {
     setEp((cur) => (cur != null && allEpochs.includes(cur) ? cur : allEpochs[allEpochs.length - 1]));
   }, [allEpochs]);
 
-  // Fetch samples for the chosen epoch.
-  useEffect(() => {
-    if (!imgTag || ep == null || runsWithTag.length === 0) { setSamplesByRun({}); return; }
-    let alive = true;
-    setLoading(true);
-    Promise.all(
-      runsWithTag.map((r) =>
-        ((epochsByRun[r] ?? []).includes(ep) ? api.samples(r, imgTag, ep) : Promise.resolve([]))
-          .then((s) => [r, s] as const)
-          .catch(() => [r, []] as const),
-      ),
-    ).then((pairs) => {
-      if (!alive) return;
-      setSamplesByRun(Object.fromEntries(pairs));
-      setLoading(false);
-    });
-    return () => { alive = false; };
-  }, [imgTag, ep, runsWithTag, epochsByRun]);
+  const samplesQ = useQuery({
+    queryKey: ["samples", imgTag, ep, runsWithTag],
+    enabled: !!imgTag && ep != null && runsWithTag.length > 0,
+    placeholderData: keepPreviousData,
+    queryFn: async () => {
+      const e = ep as number;
+      const pairs = await Promise.all(
+        runsWithTag.map((r) =>
+          ((epochsByRun[r] ?? []).includes(e) ? api.samples(r, imgTag, e) : Promise.resolve([]))
+            .then((s) => [r, s] as const)
+            .catch(() => [r, []] as const),
+        ),
+      );
+      return Object.fromEntries(pairs) as Record<string, Sample[]>;
+    },
+  });
+  const samplesByRun = samplesQ.data ?? {};
 
   if (selected.length === 0)
     return <div className="px-1 py-8 text-fgdim">select one or more runs in the sidebar.</div>;
@@ -88,11 +83,7 @@ export function ImagesTab({ selected, tags }: Props) {
       <div className="mb-3 flex flex-wrap items-center gap-3.5">
         <label className="flex items-center gap-1.5 text-fgdim">
           tag
-          <select
-            className="field"
-            value={imgTag}
-            onChange={(e) => { setImgTag(e.target.value); saveLS("opndet.imgTag", e.target.value); }}
-          >
+          <select className="field" value={imgTag} onChange={(e) => setImgTag(e.target.value)}>
             {imageTags.map((t) => <option key={t} value={t}>{t}</option>)}
           </select>
         </label>
@@ -107,7 +98,7 @@ export function ImagesTab({ selected, tags }: Props) {
             <span className="w-16 text-right text-fg">{ep} <span className="text-fgdim">({epIdx + 1}/{allEpochs.length})</span></span>
           </label>
         )}
-        {loading && <span className="text-fgdim">loading…</span>}
+        {(epochsQ.isFetching || samplesQ.isFetching) && <span className="text-fgdim">loading…</span>}
       </div>
 
       {runsWithTag.length === 0 ? (

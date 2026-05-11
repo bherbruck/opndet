@@ -416,12 +416,20 @@ def build_app(root_dir: Path) -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
 
-    @app.get("/api/tags/bulk")
-    def api_tags_bulk(runs: str = Query("")) -> dict[str, Any]:
+    def _name_list(payload: dict, key: str) -> list[str]:
+        """Pull a run/tag name list from a JSON body — accepts a list or a
+        comma-separated string under `key`."""
+        v = payload.get(key, [])
+        if isinstance(v, str):
+            v = v.split(",")
+        return [str(x).strip() for x in (v or []) if str(x).strip()]
+
+    @app.post("/api/tags/bulk")
+    def api_tags_bulk(payload: dict) -> dict[str, Any]:
         """One round-trip: union scalar+image tags across all requested runs,
         plus per-run breakdown so the frontend can tell which run owns
-        which tag without re-fetching."""
-        names = [r.strip() for r in runs.split(",") if r.strip()]
+        which tag without re-fetching. Body: {"runs": [...]}."""
+        names = _name_list(payload, "runs")
         all_runs = _discover_runs(root_dir)
         per_run: dict[str, dict[str, list[str]]] = {}
         scalar_set, image_set = set(), set()
@@ -443,15 +451,13 @@ def build_app(root_dir: Path) -> FastAPI:
             "per_run": per_run,
         }
 
-    @app.get("/api/scalars/bulk")
-    def api_scalars_bulk(
-        runs: str = Query(""),
-        tags: str = Query("", description="comma-separated tag list; omit for all"),
-    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    @app.post("/api/scalars/bulk")
+    def api_scalars_bulk(payload: dict) -> dict[str, dict[str, list[dict[str, Any]]]]:
         """One request returns the full {tag: {run: [{ep,value}]}} matrix.
-        Replaces N per-tag /api/scalars/runs round-trips."""
-        run_names = [r.strip() for r in runs.split(",") if r.strip()]
-        tag_filter = [t.strip() for t in tags.split(",") if t.strip()]
+        Body: {"runs": [...], "tags": [...]?} — omit/empty tags for all tags.
+        POST (not GET) so large run/tag lists don't blow the URL-length limit."""
+        run_names = _name_list(payload, "runs")
+        tag_filter = _name_list(payload, "tags")
         all_runs = _discover_runs(root_dir)
         # collect: dict[tag][run] -> list[(ep,value)]
         out: dict[str, dict[str, list[dict[str, Any]]]] = {}

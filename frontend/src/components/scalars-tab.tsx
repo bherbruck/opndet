@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
+import { useLocalStorage } from "usehooks-ts";
 import type { ScalarsBulk, TagsBulk } from "../api";
-import { groupTags, loadLS, saveLS } from "../util";
+import { groupTags } from "../util";
 import { Chart, type ChartSeries } from "./chart";
 
 interface Props {
@@ -10,27 +11,22 @@ interface Props {
 }
 
 export function ScalarsTab({ selected, tags, scalars }: Props) {
-  const [smoothing, setSmoothing] = useState<number>(() => loadLS("opndet.smoothing", 0.6));
-  const [logY, setLogY] = useState<boolean>(() => loadLS("opndet.logY", false));
+  const [smoothing, setSmoothing] = useLocalStorage("opndet.smoothing", 0.6);
+  const [logY, setLogY] = useLocalStorage("opndet.logY", false);
+  const [collapsed, setCollapsed] = useLocalStorage<Record<string, boolean>>("opndet.groupsCollapsed", {});
   const [filter, setFilter] = useState("");
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => loadLS("opndet.groupsCollapsed", {}));
 
-  const setSmooth = (v: number) => { setSmoothing(v); saveLS("opndet.smoothing", v); };
-  const setLog = (v: boolean) => { setLogY(v); saveLS("opndet.logY", v); };
-  const toggleGroup = (g: string) =>
-    setCollapsed((c) => { const n = { ...c, [g]: !c[g] }; saveLS("opndet.groupsCollapsed", n); return n; });
+  const toggleGroup = (g: string) => setCollapsed((c) => ({ ...c, [g]: !c[g] }));
 
   const groups = useMemo(() => {
     const all = tags?.scalars ?? [];
     const f = filter.trim().toLowerCase();
-    const filtered = f ? all.filter((t) => t.toLowerCase().includes(f)) : all;
-    return groupTags(filtered);
+    return groupTags(f ? all.filter((t) => t.toLowerCase().includes(f)) : all);
   }, [tags, filter]);
 
   if (selected.length === 0)
     return <div className="px-1 py-8 text-fgdim">select one or more runs in the sidebar.</div>;
-  if (!tags || !scalars)
-    return <div className="px-1 py-8 text-fgdim">loading…</div>;
+  if (!tags || !scalars) return <div className="px-1 py-8 text-fgdim">loading…</div>;
   if ((tags.scalars ?? []).length === 0)
     return <div className="px-1 py-8 text-fgdim">no scalars logged yet for these runs.</div>;
 
@@ -39,21 +35,13 @@ export function ScalarsTab({ selected, tags, scalars }: Props) {
       <div className="mb-2.5 flex flex-wrap items-center gap-3.5">
         <label className="flex items-center gap-1.5 text-fgdim">
           smoothing
-          <input
-            type="range" min={0} max={0.99} step={0.01} value={smoothing}
-            onChange={(e) => setSmooth(Number(e.target.value))}
-          />
+          <input type="range" min={0} max={0.99} step={0.01} value={smoothing} onChange={(e) => setSmoothing(Number(e.target.value))} />
           <span className="w-9 text-right text-fg">{smoothing.toFixed(2)}</span>
         </label>
         <label className="flex items-center gap-1.5 text-fgdim">
-          <input type="checkbox" checked={logY} onChange={(e) => setLog(e.target.checked)} /> log-y
+          <input type="checkbox" checked={logY} onChange={(e) => setLogY(e.target.checked)} /> log-y
         </label>
-        <input
-          className="field min-w-[140px] flex-1"
-          placeholder="filter tags…"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-        />
+        <input className="field min-w-[140px] flex-1" placeholder="filter tags…" value={filter} onChange={(e) => setFilter(e.target.value)} />
       </div>
 
       {groups.map(({ group, tags: gtags }) => {

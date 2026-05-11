@@ -76,8 +76,5 @@ datasets/
 # local scratch / notebook recipes
 scratch/
 
-# frontend (dashboard SPA) — build deps; the built bundle in
-# src/opndet/dashboard_static/ IS committed so it ships in the wheel.
-frontend/node_modules/
-frontend/.vite/
-frontend/*.tsbuildinfo
+# the dashboard SPA has its own frontend/.gitignore for build deps/caches;
+# the built bundle in src/opndet/dashboard_static/ IS committed (ships in wheel).
