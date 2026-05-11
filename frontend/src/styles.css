@@ -1,0 +1,62 @@
+@import "tailwindcss";
+@import "uplot/dist/uPlot.min.css";
+
+/* Dark palette as Tailwind theme tokens → use as bg-bg, text-fg, border-line, etc. */
+@theme {
+  --color-bg: #0b0e13;
+  --color-bg1: #11161d;
+  --color-bg2: #161c25;
+  --color-line: #232c37;
+  --color-line2: #2e3a47;
+  --color-fg: #d6dee6;
+  --color-fgdim: #8b97a3;
+  --color-accent: #4f9dff;
+  --color-warn: #e15c5c;
+  --color-ok: #5fd35f;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+/* uPlot text → match the dark theme (its own CSS hard-codes light colors). */
+.u-title {
+  color: var(--color-fg) !important;
+  font: 600 12px var(--font-mono) !important;
+}
+.u-legend {
+  font: 11px var(--font-mono) !important;
+}
+.u-legend th,
+.u-legend td {
+  color: var(--color-fgdim) !important;
+}
+
+@layer components {
+  .btn {
+    @apply cursor-pointer rounded border border-line2 bg-bg2 px-2 py-[3px] text-fg hover:border-accent disabled:cursor-default disabled:opacity-40;
+  }
+  .btn-on {
+    @apply border-accent bg-accent text-[#061018];
+  }
+  .field {
+    @apply rounded border border-line2 bg-bg2 px-2 py-[3px] text-fg;
+  }
+  .tab-btn {
+    @apply rounded-t-md border border-b-0 border-line bg-bg px-3.5 py-[5px] text-fgdim;
+  }
+  .tab-btn-on {
+    @apply border-line2 bg-bg2 text-white;
+  }
+}

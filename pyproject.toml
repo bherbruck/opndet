@@ -39,7 +39,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-opndet = ["configs/*.yaml"]
+opndet = ["configs/*.yaml", "dashboard_static/**/*"]
 
 [tool.ruff]
 line-length = 100

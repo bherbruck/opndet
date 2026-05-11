@@ -175,7 +175,7 @@ All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except h
 - `analyze.py` — postmortem CLI: per-layer activation slider + Grad-CAM HTML report on saved ckpts.
 - `metrics.py` — Hungarian + IoU-free center matching with cell-window radius, ghost/duplicate split.
 - `metrics_db.py` — DuckDB writer per-run for queryable training history.
-- `dashboard.py` — FastAPI dashboard reading the DuckDB stores; multi-run, accordion-grouped charts, lightbox viz.
+- `dashboard.py` — FastAPI backend for the run dashboard: read-only DuckDB endpoints (`/api/*`), per-run shadow-copy + pooled connection, vis assets under `/files/*`, and mounts the built SPA at `/`. The frontend is a Vite+React+TS app in `frontend/` (Tailwind v4, uPlot charts) — `scripts/build_dashboard.sh` builds it into `src/opndet/dashboard_static/` (committed, ships in the wheel). Edit `frontend/src/*`, rebuild, commit the regenerated `dashboard_static/`. `bun run dev` in `frontend/` proxies `/api` + `/files` to a locally-running `opndet dashboard`.
 - `calibrate.py` — Platt-scale T fit on val, baked into ckpt.
 - `eval.py` — full validation report + perturbation stability proxy.
 - `presets.py` — preset name resolution (`bbox-s` → bundled YAML path).
