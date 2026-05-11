@@ -26,6 +26,7 @@ const REFRESH_OPTS = [
 
 export function App() {
   const [selected, setSelected] = useLocalStorage<string[]>("opndet.selected", []);
+  const [imgRun, setImgRun] = useLocalStorage<string>("opndet.imgRun", "");
   const [tab, setTab] = useLocalStorage<Tab>("opndet.tab", "scalars");
   const [refreshMs, setRefreshMs] = useLocalStorage<number>("opndet.refreshMs", 30000);
   const [known, setKnown] = useLocalStorage<string[]>("opndet.known", []);
@@ -35,12 +36,12 @@ export function App() {
     queryKey: ["runs"],
     queryFn: api.runs,
     refetchInterval,
-    select: (rs) => [...rs].sort((a, b) => b.mtime - a.mtime),
+    select: (rs) => [...rs].sort((a, b) => a.mtime - b.mtime), // oldest → newest
   });
   const runs = useMemo(() => runsQ.data ?? [], [runsQ.data]);
   const runNames = useMemo(() => runs.map((r) => r.name), [runs]);
 
-  // Auto-select runs that appeared since we last looked; drop ones that vanished.
+  // Auto-select runs that appeared since last look; drop ones that vanished.
   // Runs the user explicitly unchecked stay in `known`, so they don't pop back.
   const knownRef = useRef(known);
   knownRef.current = known;
@@ -52,6 +53,8 @@ export function App() {
       const kept = prev.filter((n) => runNames.includes(n));
       return fresh.length ? [...new Set([...kept, ...fresh])] : kept;
     });
+    // images view defaults to the newest (currently-running) run.
+    setImgRun((cur) => (cur && runNames.includes(cur) ? cur : runNames[runNames.length - 1]));
   }, [runNames.join("|")]);
 
   const sel = useMemo(() => selected.filter((n) => runNames.includes(n)), [selected, runNames]);
@@ -77,6 +80,8 @@ export function App() {
   const err = (runsQ.error ?? tagsQ.error ?? scalarsQ.error)?.toString();
   const rootName = document.title.includes("·") ? document.title.split("·")[1].trim() : "runs";
 
+  const isImages = tab === "images";
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex flex-none items-center gap-3.5 border-b border-line bg-bg1 px-3.5 py-2">
@@ -84,7 +89,7 @@ export function App() {
           opndet <span className="font-normal text-fgdim">· {rootName}</span>
         </span>
         <span className="text-fgdim">
-          {runs.length} run{runs.length === 1 ? "" : "s"} · {sel.length} shown
+          {runs.length} run{runs.length === 1 ? "" : "s"}{isImages ? "" : ` · ${sel.length} shown`}
         </span>
         {err && <span className="text-warn">⚠ {err}</span>}
         <span className="flex-1" />
@@ -120,11 +125,16 @@ export function App() {
 
       <div className="flex min-h-0 flex-1">
         <aside className="w-[250px] flex-none overflow-y-auto border-r border-line bg-bg1 p-2">
-          <RunSidebar runs={runs} selected={selected} onChange={setSelected} />
+          <RunSidebar
+            runs={runs}
+            mode={isImages ? "single" : "multi"}
+            selected={isImages ? (imgRun ? [imgRun] : []) : selected}
+            onChange={isImages ? (a) => setImgRun(a[0] ?? imgRun) : setSelected}
+          />
         </aside>
         <main className="min-w-0 flex-1 overflow-y-auto p-3">
           {tab === "scalars" && <ScalarsTab selected={sel} tags={tagsQ.data ?? null} scalars={scalarsQ.data ?? null} />}
-          {tab === "images" && <ImagesTab runs={runs} refetchInterval={refetchInterval} />}
+          {tab === "images" && <ImagesTab runs={runs} imgRun={imgRun} refetchInterval={refetchInterval} />}
           {tab === "config" && <ConfigTab selected={sel} />}
           {tab === "sql" && <SqlTab runs={runs} selected={sel} />}
         </main>

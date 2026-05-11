@@ -7,28 +7,57 @@ interface Props {
   overlays?: { kind: string; url: string }[];
   shownOverlays?: Set<string>;
   showBoxes?: boolean;
-  /** CSS width in px for the image (used for lightbox zoom). Omit → fill container. */
+  /** CSS width in px for the image (lightbox zoom). Omit → fill the container. */
   widthPx?: number;
   onLoadNatural?: (w: number, h: number) => void;
 }
 
-const boxColor = (kind: string) =>
-  kind.startsWith("gt") ? "#5fd35f" : kind.startsWith("pred") ? "#4f9dff" : "#e8c14a";
+// Original dashboard palette / line thickness — keep these.
+const COLOR_BY_KIND: Record<string, string> = {
+  pred: "#39c860", gt: "#ff5edb", tp: "#39c860", fp: "#ff6b35", fn: "#3aa6ff", trail: "#ffffff",
+};
+const LINE_W = 2; // device-independent: canvas is sized to the *rendered* px, not natural
 
-function paint(canvas: HTMLCanvasElement, w: number, h: number, boxes: Box[]) {
-  canvas.width = w;
-  canvas.height = h;
+/** corners may arrive as [[x,y]*4] or as a flat [x0,y0,x1,y1,x2,y2,x3,y3]. */
+function cornerPairs(b: Box): number[][] | null {
+  const c = b.corners as unknown;
+  if (Array.isArray(c) && c.length >= 3 && Array.isArray(c[0])) return c as number[][];
+  if (Array.isArray(c) && c.length === 8 && typeof c[0] === "number") {
+    const f = c as number[];
+    return [[f[0], f[1]], [f[2], f[3]], [f[4], f[5]], [f[6], f[7]]];
+  }
+  if (b.points && b.points.length >= 2) return b.points;
+  return null;
+}
+
+function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box[]) {
+  // Match the canvas bitmap to its rendered CSS size → 2px lines stay 2px at
+  // any zoom/thumbnail size; scale the context so we can draw in natural coords.
+  const rw = Math.max(1, Math.round(canvas.clientWidth));
+  const rh = Math.max(1, Math.round(canvas.clientHeight || (rw * natH) / natW));
+  if (canvas.width !== rw) canvas.width = rw;
+  if (canvas.height !== rh) canvas.height = rh;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
-  ctx.clearRect(0, 0, w, h);
-  ctx.lineWidth = Math.max(1.5, Math.round(Math.min(w, h) / 300));
-  ctx.font = `${Math.max(10, Math.round(Math.min(w, h) / 55))}px ui-monospace, monospace`;
-  ctx.textBaseline = "bottom";
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, rw, rh);
+  ctx.scale(rw / natW, rh / natH);
+  ctx.font = `${(12 * natW) / rw}px ui-monospace, monospace`; // ~12 rendered px
+  ctx.textBaseline = "alphabetic";
   for (const b of boxes) {
-    const c = boxColor(b.kind);
-    ctx.strokeStyle = c;
-    ctx.fillStyle = c;
-    const poly = b.corners && b.corners.length >= 3 ? b.corners : b.points && b.points.length >= 2 ? b.points : null;
+    const color = COLOR_BY_KIND[b.kind] ?? "#ffffff";
+    if (b.kind === "trail") {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = (1 * natW) / rw;
+      ctx.beginPath(); ctx.moveTo(b.x1, b.y1); ctx.lineTo(b.x2, b.y2); ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(b.x1, b.y1, (1.5 * natW) / rw, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(b.x2, b.y2, (2.5 * natW) / rw, 0, Math.PI * 2); ctx.fill();
+      continue;
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = (LINE_W * natW) / rw;
+    const poly = cornerPairs(b);
     if (poly) {
       ctx.beginPath();
       ctx.moveTo(poly[0][0], poly[0][1]);
@@ -38,27 +67,40 @@ function paint(canvas: HTMLCanvasElement, w: number, h: number, boxes: Box[]) {
     } else {
       ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
     }
-    if (b.score != null) ctx.fillText(b.score.toFixed(2), b.x1 + 2, Math.max(11, b.y1 - 2));
+    if (b.score != null) {
+      ctx.fillStyle = color;
+      const lx = poly ? Math.min(...poly.map((p) => p[0])) : b.x1;
+      const ly = poly ? Math.min(...poly.map((p) => p[1])) : b.y1;
+      ctx.fillText(b.score.toFixed(2), lx + 2, ly + (12 * natW) / rw);
+    }
   }
 }
 
 /** Image + overlay PNGs + a box/OBB-polyline canvas, all co-registered: the
- * canvas internal resolution is the image's natural size and it's CSS-stretched
- * to whatever the <img> renders at, so boxes line up at any zoom. The <img> is
- * w-full, so the rendered width is controlled by `widthPx` (lightbox) or the
- * parent grid cell (thumbnail). */
+ * canvas bitmap tracks the image's *rendered* size, so boxes align and line
+ * widths stay constant at any zoom or thumbnail size. */
 export function SampleView({
   src, boxes, overlays = [], shownOverlays, showBoxes = true, widthPx, onLoadNatural,
 }: Props) {
+  const wrapRef = useRef<HTMLSpanElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
 
-  useEffect(() => {
+  const repaint = () => {
     if (canvasRef.current && nat) paint(canvasRef.current, nat.w, nat.h, showBoxes ? boxes : []);
+  };
+  // Repaint on data change.
+  useEffect(repaint, [nat, showBoxes, boxes]);
+  // Repaint on rendered-size change (zoom, grid reflow, window resize).
+  useEffect(() => {
+    if (!wrapRef.current) return;
+    const ro = new ResizeObserver(repaint);
+    ro.observe(wrapRef.current);
+    return () => ro.disconnect();
   }, [nat, showBoxes, boxes]);
 
   return (
-    <span className="relative block leading-none" style={widthPx ? { width: widthPx } : undefined}>
+    <span ref={wrapRef} className="relative block leading-none" style={widthPx ? { width: widthPx } : undefined}>
       <img
         className="block h-auto w-full"
         src={src}

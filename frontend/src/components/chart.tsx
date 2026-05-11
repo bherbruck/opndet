@@ -16,6 +16,9 @@ interface Props {
   height?: number;
 }
 
+const fmt = (v: number) =>
+  Math.abs(v) >= 1e6 || (v !== 0 && Math.abs(v) < 1e-3) ? v.toExponential(3) : `${Number(v.toPrecision(5))}`;
+
 // Build uPlot's column-oriented data: shared x = sorted union of epochs,
 // one y array per run aligned to that x (null where the run has no point).
 function buildData(series: ChartSeries[], smoothing: number): uPlot.AlignedData {
@@ -34,12 +37,56 @@ function buildData(series: ChartSeries[], smoothing: number): uPlot.AlignedData 
   return [xs, ...ys] as uPlot.AlignedData;
 }
 
+// Floating hover tooltip — replaces uPlot's legend so the plot gets the space.
+function tooltipPlugin(): uPlot.Plugin {
+  let el: HTMLDivElement | null = null;
+  return {
+    hooks: {
+      init: (u) => {
+        el = document.createElement("div");
+        el.style.cssText =
+          "position:absolute;pointer-events:none;z-index:10;display:none;white-space:nowrap;" +
+          "background:rgba(11,14,19,0.94);border:1px solid #2e3a47;border-radius:4px;padding:4px 7px;" +
+          "font:11px ui-monospace,monospace;color:#d6dee6;line-height:1.35";
+        u.over.appendChild(el);
+      },
+      setCursor: (u) => {
+        const { idx, left, top } = u.cursor;
+        if (!el) return;
+        if (idx == null || left == null || top == null || left < 0) {
+          el.style.display = "none";
+          return;
+        }
+        const xs = u.data[0] as number[];
+        let html = `<b>ep ${xs[idx]}</b>`;
+        for (let s = 1; s < u.series.length; s++) {
+          const v = u.data[s]?.[idx] as number | null | undefined;
+          if (v == null) continue;
+          const ser = u.series[s];
+          const c = typeof ser.stroke === "function" ? ser.stroke(u, s) : (ser.stroke as string);
+          html += `<br><span style="color:${c}">●</span> ${ser.label}: ${fmt(v)}`;
+        }
+        el.innerHTML = html;
+        el.style.display = "block";
+        const ow = u.over.clientWidth, oh = u.over.clientHeight;
+        const w = el.offsetWidth, h = el.offsetHeight;
+        el.style.left = `${left + 10 + w > ow ? left - 10 - w : left + 10}px`;
+        el.style.top = `${top + 10 + h > oh ? Math.max(0, top - 10 - h) : top + 10}px`;
+      },
+      destroy: () => {
+        el?.remove();
+        el = null;
+      },
+    },
+  };
+}
+
 export function Chart({ title, series, smoothing, logY, height = 220 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
-  // uPlot is imperative — we keep the live `series`/`smoothing` in a ref so the
-  // "create plot" effect can read them without listing them as deps (it should
-  // only re-run when the chart's *structure* changes: title, run set, y-scale).
+  // uPlot is imperative — keep the live data in a ref so the "create plot"
+  // effect reads it without listing it as a dep (it should only re-run on a
+  // *structural* change: title, run set, y-scale).
   const liveRef = useRef({ series, smoothing });
   liveRef.current = { series, smoothing };
   const runKey = series.map((s) => s.run).join("|");
@@ -52,12 +99,13 @@ export function Chart({ title, series, smoothing, logY, height = 220 }: Props) {
       title,
       width: host.clientWidth || 360,
       height,
-      cursor: { focus: { prox: 24 } },
-      legend: { live: true },
+      legend: { show: false },
+      cursor: { focus: { prox: 30 } },
       scales: { y: { distr: logY ? 3 : 1 } },
+      plugins: [tooltipPlugin()],
       axes: [
         { stroke: "#8b97a3", grid: { stroke: "#222a33" }, ticks: { stroke: "#2a333d" } },
-        { stroke: "#8b97a3", grid: { stroke: "#222a33" }, ticks: { stroke: "#2a333d" }, size: 56 },
+        { stroke: "#8b97a3", grid: { stroke: "#222a33" }, ticks: { stroke: "#2a333d" }, size: 52 },
       ],
       series: [
         { label: "ep" },
@@ -81,10 +129,11 @@ export function Chart({ title, series, smoothing, logY, height = 220 }: Props) {
     };
   }, [title, logY, height, runKey]);
 
-  // Data / smoothing changes → update in place (no flicker, keeps zoom/pan).
   useEffect(() => {
     plotRef.current?.setData(buildData(series, smoothing));
   }, [series, smoothing]);
 
-  return <div className="w-full" ref={elRef} />;
+  // Reserve the height even while uPlot is (re)creating — otherwise the grid
+  // momentarily collapses on a run-set change and the page scrolls to the top.
+  return <div className="w-full" ref={elRef} style={{ minHeight: height + 30 }} />;
 }
