@@ -64,11 +64,18 @@ def _list_images(p: str | Path, n: int) -> list[Path]:
     return files[:n] if n and n > 0 else files
 
 
-def _heatmap_data_uri(arr2d: np.ndarray, out_hw=(72, 96)) -> str:
+def _heatmap_data_uri(arr2d: np.ndarray, long_side: int = 384) -> str:
+    """Per-cell viridis heatmap as a base64 PNG, NEAREST-scaled so its long side
+    is ~`long_side` px — small layer maps (e.g. p4 at 12×16) become honest big
+    blocks; large ones get downscaled. Big enough to display thumbnail-sized in
+    the table AND blown up in the lightbox without re-pixelating."""
     a = arr2d.astype(np.float32)
     a = a - a.min()
     a = a / (a.max() + 1e-9)
-    a8 = cv2.resize((a * 255).astype(np.uint8), (out_hw[1], out_hw[0]), interpolation=cv2.INTER_NEAREST)
+    h, w = a.shape
+    s = max(1, long_side // max(h, w)) if max(h, w) <= long_side else long_side / max(h, w)
+    nh, nw = max(1, int(round(h * s))), max(1, int(round(w * s)))
+    a8 = cv2.resize((a * 255).astype(np.uint8), (nw, nh), interpolation=cv2.INTER_NEAREST)
     bgr = cv2.applyColorMap(a8, cv2.COLORMAP_VIRIDIS)
     ok, buf = cv2.imencode(".png", bgr)
     return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
@@ -131,7 +138,8 @@ def _render_html(rows, montage, *, ckpt, model_path, total_params, in_ch, img_h,
     trs = []
     for r in rows:
         thumb = montage.get(r["name"])
-        timg = f'<img src="{_heatmap_data_uri(thumb)}" style="height:48px;border-radius:3px">' if thumb is not None else "—"
+        timg = (f'<img class="hm" src="{_heatmap_data_uri(thumb)}" onclick="lb(this.src)" '
+                f'title="click to enlarge">') if thumb is not None else "—"
         ab = r["ablation_delta"]
         ab_cell = (f'{ab:.3f}<br>{_bar(ab, ab_max, "#ff8c42")}' if ab is not None else '<span style="color:#444">—</span>')
         # only flag *learned* layers (with params) as near-dead — the decode
@@ -157,12 +165,18 @@ def _render_html(rows, montage, *, ckpt, model_path, total_params, in_ch, img_h,
  table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #232c37;padding:5px 8px;vertical-align:top}}
  th{{background:#161c25;color:#8b97a3;text-align:left;position:sticky;top:0}}
  .legend{{color:#8b97a3;font-size:12px;margin-top:14px}} .legend b{{color:#d6dee6}}
+ img.hm{{height:var(--hmh,150px);image-rendering:pixelated;border-radius:3px;cursor:zoom-in;border:1px solid #232c37;display:block}}
+ .ctl{{margin:8px 0;color:#8b97a3}} .ctl input{{vertical-align:middle}}
+ #lbk{{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;z-index:99;cursor:zoom-out}}
+ #lbk img{{max-width:96vw;max-height:96vh;image-rendering:pixelated;border:1px solid #2e3a47;border-radius:6px}}
 </style></head><body>
+<div id="lbk" onclick="this.style.display='none'"><img id="lbi"></div>
 <h1>opndet profile — {ckpt.name}</h1>
 <div class="meta">model: <b>{Path(model_path).name}</b> &nbsp;|&nbsp; params: <b>{total_params/1e3:.0f}K</b> &nbsp;|&nbsp; input: <b>{in_ch}×{img_h}×{img_w}</b> &nbsp;|&nbsp; averaged over <b>{n_images}</b> image{'s' if n_images != 1 else ''} &nbsp;|&nbsp; {det_summary}</div>
 <h2>activity down the network</h2>
 {bar_block}
 <h2>per-layer detail</h2>
+<div class="ctl">activation-map size <input type="range" min="80" max="480" value="150" oninput="document.documentElement.style.setProperty('--hmh', this.value + 'px')"> &nbsp;(or click any map for full-screen)</div>
 <table><thead><tr><th>layer</th><th>mean activation map</th><th>mean&#124;a&#124;</th><th>live channels</th><th>ablation-Δ</th><th>chans</th><th>params</th></tr></thead><tbody>
 {''.join(trs)}
 </tbody></table>
@@ -173,6 +187,8 @@ def _render_html(rows, montage, *, ckpt, model_path, total_params, in_ch, img_h,
  Dimmed rows = learned layers that look near-dead (few live channels / ~zero ablation-Δ).
  <br>(Static report; the interactive top-down-DAG explorer is separate / TBD.)
 </div>
+<script>function lb(s){{document.getElementById('lbi').src=s;document.getElementById('lbk').style.display='flex';}}
+document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.getElementById('lbk').style.display='none';}});</script>
 </body></html>"""
 
 
