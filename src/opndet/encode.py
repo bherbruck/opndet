@@ -167,6 +167,41 @@ def _box_near_edge(x1: float, y1: float, x2: float, y2: float, W: int, H: int, m
     return x1 < margin * W or y1 < margin * H or x2 > (1.0 - margin) * W or y2 > (1.0 - margin) * H
 
 
+def _peak_moat(hm: np.ndarray, pos: np.ndarray, r: int, margin: float) -> None:
+    """Carve a moat around every positive (peak) cell: each NON-peak cell within
+    L∞ radius `r` is depressed to <= (peak_value - margin), clamped >= 0.
+
+    Why: PeakSuppress keeps the *unique* window-max — two byte-equal adjacent
+    cells both pass (each IS the max in its own window), giving "two touching
+    detections". The natural Gaussian target only differs by exp(-1/(2σ²)) ≈ 0.97
+    between a peak and its neighbour, and a soft target like the ellipse dome can
+    be high right next to the peak too — so a converged model legitimately
+    reproduces a near-tie. Forcing a >= margin gap into the GT means the fitted
+    model lands the neighbour comfortably below the peak → PeakSuppress fully
+    zeros it. Peaks don't depress each other (two genuinely-adjacent objects keep
+    both peaks); a non-peak cell is clamped by whichever in-range peak leaves it
+    lowest. Mutates `hm` in place. `r` should be the model's peak_kernel // 2.
+    """
+    if margin <= 0.0 or r < 1:
+        return
+    H, W = hm.shape
+    ys, xs = np.nonzero(pos)
+    is_peak = pos > 0
+    for cy, cx in zip(ys.tolist(), xs.tolist()):
+        cap = max(0.0, float(hm[cy, cx]) - margin)
+        y0, y1 = max(0, cy - r), min(H, cy + r + 1)
+        x0, x1 = max(0, cx - r), min(W, cx + r + 1)
+        win = hm[y0:y1, x0:x1]
+        free = ~is_peak[y0:y1, x0:x1]
+        np.minimum(win, np.where(free, cap, win), out=win)
+
+
+def _apply_peak_moat(hm: np.ndarray, pos: np.ndarray, cfg: object) -> None:
+    m = float(getattr(cfg, "hm_peak_moat", 0.0) or 0.0)
+    if m > 0.0:
+        _peak_moat(hm, pos, int(getattr(cfg, "peak_kernel", 5)) // 2, m)
+
+
 def _render_dist_target(boxes: np.ndarray, Hp: int, Wp: int, s: int) -> np.ndarray:
     """Per-pixel distance target at output resolution. For each GT, renders the inscribed
     ellipse with values that ramp linearly from 1 at center to 0 at the boundary, then
@@ -238,6 +273,7 @@ def encode_targets(
             wh[0, iy, ix] = bw / W
             wh[1, iy, ix] = bh / H
             pos[iy, ix] = 1.0
+        _apply_peak_moat(hm, pos, cfg)
 
     out = {
         "hm": torch.from_numpy(hm).unsqueeze(0),
@@ -300,6 +336,7 @@ def encode_targets_ltrb(
             ltrb[2, iy, ix] = float(np.clip((x2 - cx_cell) / W, 0.0, 1.0))
             ltrb[3, iy, ix] = float(np.clip((y2 - cy_cell) / H, 0.0, 1.0))
             pos[iy, ix] = 1.0
+        _apply_peak_moat(hm, pos, cfg)
 
     return {
         "hm": torch.from_numpy(hm).unsqueeze(0),
@@ -399,6 +436,7 @@ def encode_targets_obb(
             pos[iy, ix] = 1.0
             if max(bw, bh) / max(min(bw, bh), 1e-6) >= aspect_round_thresh:
                 ang_mask[iy, ix] = 1.0
+        _apply_peak_moat(hm, pos, cfg)
 
     return {
         "hm": torch.from_numpy(hm).unsqueeze(0),

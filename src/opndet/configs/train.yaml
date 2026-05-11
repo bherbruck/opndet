@@ -111,6 +111,16 @@ epochs: 100
 #                                 #   σ ≈ hm_blob_frac·{w,h}/stride. Object-shaped-ish, but the tail
 #                                 #   bleeds into gaps between touching objects → keep modest, or
 #                                 #   prefer hm_target: ellipse which doesn't have that problem.
+# hm_peak_moat: 0.0               # >0 → carve a moat into the GT around every peak cell: all NON-peak
+#                                 #   cells within peak_kernel//2 are forced ≤ (peak − this). The
+#                                 #   GT-side fix for "two touching detections" — the dome/Gaussian is
+#                                 #   otherwise ~as high on the cell next to the peak as on the peak,
+#                                 #   so a converged model reproduces a near-tie that BOTH pass
+#                                 #   PeakSuppress (it keeps the *unique* window-max). Baking a ≥this
+#                                 #   gap in means the fitted model lands neighbours well below → fully
+#                                 #   zeroed. Two genuinely-adjacent objects keep both peaks (peaks
+#                                 #   don't moat each other). 0.2–0.3 typical. Pairs with — and is more
+#                                 #   reliable than — peak_sharpen_weight (which is the loss-side nudge).
 #
 # loss:
 #   wh_loss: ciou                 # default
