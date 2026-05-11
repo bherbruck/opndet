@@ -19,12 +19,14 @@ Static files: each run's vis assets served under /files/<run_name>/...
 """
 from __future__ import annotations
 
+import threading
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-import traceback
 
 
 def _discover_runs(root: Path) -> dict[str, Path]:
@@ -51,42 +53,99 @@ def _discover_runs(root: Path) -> dict[str, Path]:
         return {}
 
 
-def _open_db(run_dir: Path):
-    """Open the run's metrics.duckdb for read.
+_DB_STAT_THROTTLE_S = 2.0
+_db_cache: dict[str, dict] = {}        # run_dir(resolved) -> {conn, lock, sig, checked, shadow}
+_db_cache_lock = threading.Lock()
 
-    DuckDB takes a process-level file lock even in read_only=True mode, and
-    the writer (training process) holds it for the entire run. So we read
-    from a shadow copy in /tmp keyed by mtime — refreshed lazily when the
-    source file changes. Tradeoff: dashboard sees a snapshot from up to
-    one request ago, never blocks on the writer.
+
+def _stat_sig(p: Path):
+    try:
+        st = p.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        return None
+
+
+class _PooledConn:
+    """Context manager handed back by _open_db: yields a cached, shared read-only
+    DuckDB connection under a per-run lock. __exit__ releases the lock; it never
+    closes the connection (the cache owns it). Keeps the existing
+    `with _open_db(run_dir) as con:` call sites working unchanged."""
+    __slots__ = ("_conn", "_lock")
+
+    def __init__(self, conn, lock):
+        self._conn, self._lock = conn, lock
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self._conn
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        return False
+
+
+def _open_db(run_dir: Path):
+    """Return a context manager yielding a read-only DuckDB connection to a /tmp
+    shadow copy of the run's metrics.duckdb.
+
+    DuckDB takes a process-level file lock even in read_only mode and the writer
+    (training process) holds it for the whole run, so we read from a shadow copy.
+    The copy AND the connection are CACHED per run and refreshed only when the
+    source db or its WAL changes (re-stat'd at most every few seconds). Re-copying
+    the file and re-opening DuckDB on every request was the dashboard's main
+    latency sink — a hot request now just hands back the pooled connection.
     """
     import duckdb
     import shutil
+    import hashlib
+
     src = run_dir / "metrics.duckdb"
     if not src.exists():
         raise HTTPException(404, f"metrics.duckdb missing in {run_dir}")
-    shadow_root = Path("/tmp") / "opndet_dash_shadow"
-    shadow_root.mkdir(parents=True, exist_ok=True)
-    # one shadow file per run dir; encode the resolved path so different
-    # runs (or the same name in different roots) don't collide.
-    import hashlib
-    key = hashlib.sha1(str(run_dir.resolve()).encode()).hexdigest()[:16]
-    shadow = shadow_root / f"{run_dir.name}_{key}.duckdb"
-    # Always copy: DuckDB uses a WAL whose updates don't always bump the
-    # main file's mtime, so an mtime-based cache misses recent commits.
-    # Files are small (KB–few MB); copy is sub-ms.
-    try:
-        shutil.copy2(src, shadow)
-        wal = src.with_suffix(".duckdb.wal")
-        wal_shadow = shadow.with_suffix(".duckdb.wal")
-        if wal.exists():
-            shutil.copy2(wal, wal_shadow)
-        elif wal_shadow.exists():
-            wal_shadow.unlink()  # stale WAL after writer checkpointed
-    except Exception as e:
-        if not shadow.exists():
+    key = str(run_dir.resolve())
+    wal = src.with_suffix(".duckdb.wal")
+    now = time.monotonic()
+
+    with _db_cache_lock:
+        entry = _db_cache.get(key)
+        # Hot path: source checked recently — reuse the pooled connection as-is.
+        if entry is not None and (now - entry["checked"]) < _DB_STAT_THROTTLE_S:
+            return _PooledConn(entry["conn"], entry["lock"])
+        sig = (_stat_sig(src), _stat_sig(wal))
+        if entry is not None and sig == entry["sig"]:
+            entry["checked"] = now
+            return _PooledConn(entry["conn"], entry["lock"])
+
+        # First open, or the db/WAL changed since last refresh: copy to a fresh
+        # shadow file (fresh name so any in-flight reader keeps its own inode)
+        # and open a new connection. The old cache entry's connection is released
+        # when its last in-flight _PooledConn exits (CPython refcount).
+        shadow_root = Path("/tmp") / "opndet_dash_shadow"
+        shadow_root.mkdir(parents=True, exist_ok=True)
+        h = hashlib.sha1(key.encode()).hexdigest()[:16]
+        shadow = shadow_root / f"{run_dir.name}_{h}_{int(now * 1000)}.duckdb"
+        try:
+            shutil.copy2(src, shadow)
+            if wal.exists():
+                shutil.copy2(wal, shadow.with_suffix(".duckdb.wal"))
+        except Exception as e:
+            if entry is not None:                       # serve stale rather than 503
+                entry["checked"] = now
+                return _PooledConn(entry["conn"], entry["lock"])
             raise HTTPException(503, f"metrics.duckdb temporarily unavailable: {e}")
-    return duckdb.connect(str(shadow), read_only=True)
+
+        conn = duckdb.connect(str(shadow), read_only=True)
+        _db_cache[key] = {"conn": conn, "lock": threading.Lock(),
+                          "sig": sig, "checked": now, "shadow": shadow}
+        # Best-effort cleanup of this run's older shadow files (and WALs).
+        for old in shadow_root.glob(f"{run_dir.name}_{h}_*.duckdb*"):
+            if not str(old).startswith(str(shadow)):
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        return _PooledConn(conn, _db_cache[key]["lock"])
 
 
 def build_app(root_dir: Path) -> FastAPI:
