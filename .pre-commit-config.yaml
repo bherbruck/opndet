@@ -1,0 +1,14 @@
+# Run `pre-commit install` once after cloning. Then any commit that touches
+# frontend/ sources auto-rebuilds the dashboard SPA and re-stages the built
+# bundle (src/opndet/dashboard_static/), so the committed bundle never goes
+# stale. Needs bun (or npm) on PATH; non-frontend commits are unaffected.
+repos:
+  - repo: local
+    hooks:
+      - id: build-dashboard
+        name: rebuild dashboard SPA (frontend/ changed)
+        entry: bash -c 'scripts/build_dashboard.sh && git add src/opndet/dashboard_static'
+        language: system
+        pass_filenames: false
+        require_serial: true
+        files: ^frontend/(src/.*|package\.json|bun\.lock|vite\.config\.ts|tsconfig\.json|biome\.json|index\.html)$

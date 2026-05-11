@@ -124,7 +124,7 @@ export function App() {
         </aside>
         <main className="min-w-0 flex-1 overflow-y-auto p-3">
           {tab === "scalars" && <ScalarsTab selected={sel} tags={tagsQ.data ?? null} scalars={scalarsQ.data ?? null} />}
-          {tab === "images" && <ImagesTab selected={sel} tags={tagsQ.data ?? null} refetchInterval={refetchInterval} />}
+          {tab === "images" && <ImagesTab runs={runs} refetchInterval={refetchInterval} />}
           {tab === "config" && <ConfigTab selected={sel} />}
           {tab === "sql" && <SqlTab runs={runs} selected={sel} />}
         </main>
