@@ -149,9 +149,7 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
           <label className="flex items-center gap-1.5" title="hide pred boxes below this score (visual only — doesn't change metrics)">
             conf ≥
             <input type="range" min={0} max={0.95} step={0.05} value={confMin} onChange={(e) => setConfMin(Number(e.target.value))} />
-            <span className="w-9 text-right text-fg">
-              {confMin.toFixed(2)}{confMin > 0 && <button type="button" className="ml-1 text-fgdim hover:text-fg" onClick={() => setConfMin(0)} title="reset">✕</button>}
-            </span>
+            <span className="w-9 text-right text-fg">{confMin.toFixed(2)}</span>
           </label>
           {overlayKinds.map((k) => (
             <label key={k} className="flex items-center gap-1.5">
