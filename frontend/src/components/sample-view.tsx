@@ -1,13 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import type { Box } from "../api";
 
+/** Which annotation layers to render, shared by the grid thumbnails and the
+ * detail view (persisted in localStorage by images-tab). `overlayOpacity`
+ * applies only to the heatmap overlay PNGs. */
+export interface Layers {
+  overlaysOn: Record<string, boolean>; // kind -> shown
+  overlayOpacity: number; // 0..1, heatmap PNGs only
+  gt: boolean; // gt / fn boxes
+  pred: boolean; // pred / tp / fp / trail boxes
+  conf: boolean; // confidence score label
+}
+
 interface Props {
   src: string;
   boxes: Box[];
   overlays?: { kind: string; url: string }[];
-  shownOverlays?: Set<string>;
-  showBoxes?: boolean;
-  /** CSS width in px for the image (lightbox zoom). Omit → fill the container. */
+  layers: Layers;
+  /** CSS width in px for the image. Omit → fill the container. */
   widthPx?: number;
   onLoadNatural?: (w: number, h: number) => void;
 }
@@ -16,6 +26,7 @@ interface Props {
 const COLOR_BY_KIND: Record<string, string> = {
   pred: "#39c860", gt: "#ff5edb", tp: "#39c860", fp: "#ff6b35", fn: "#3aa6ff", trail: "#ffffff",
 };
+const isGtKind = (k: string) => k === "gt" || k === "fn";
 
 /** corners may arrive as [[x,y]*4] or as a flat [x0,y0,x1,y1,x2,y2,x3,y3]. */
 function cornerPairs(b: Box): number[][] | null {
@@ -29,8 +40,7 @@ function cornerPairs(b: Box): number[][] | null {
   return null;
 }
 
-function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box[]) {
-  // Bitmap = rendered CSS size; draw in natural coords via ctx.scale.
+function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box[], layers: Layers) {
   const rw = Math.max(1, Math.round(canvas.clientWidth));
   const rh = Math.max(1, Math.round(canvas.clientHeight || (rw * natH) / natW));
   if (canvas.width !== rw) canvas.width = rw;
@@ -41,18 +51,18 @@ function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box
   ctx.clearRect(0, 0, rw, rh);
   ctx.scale(rw / natW, rh / natH);
 
-  // zoom = rendered px per natural px. Line/text widths are specified in
-  // *rendered* px and converted back to natural units (÷ zoom) so they scale
-  // up when the image is blown up (fit > 1×) but never go thinner than the
-  // floor on thumbnails (zoom < 1).
+  // zoom = rendered px / natural px. Line/text sizes are given in *rendered* px
+  // and converted back to natural units (÷ zoom) so they scale up when the
+  // image is blown up (fit > 1×) but never go thinner than the floor.
   const zoom = rw / natW;
   const px = (renderedPx: number, floorPx = renderedPx) => Math.max(floorPx, renderedPx * zoom) / zoom;
-  const lw = px(2);          // box stroke ≈ 2px, scales with zoom
+  const lw = px(2);
   ctx.lineJoin = "round";
   ctx.textBaseline = "top";
   ctx.font = `${px(13)}px ui-monospace, monospace`;
 
   for (const b of boxes) {
+    if (isGtKind(b.kind) ? !layers.gt : !layers.pred) continue;
     const color = COLOR_BY_KIND[b.kind] ?? "#ffffff";
     if (b.kind === "trail") {
       ctx.strokeStyle = color;
@@ -75,38 +85,33 @@ function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box
     } else {
       ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
     }
-    if (b.score != null) {
+    if (layers.conf && b.score != null) {
       ctx.fillStyle = color;
       const lx = poly ? Math.min(...poly.map((p) => p[0])) : b.x1;
       const ly = poly ? Math.min(...poly.map((p) => p[1])) : b.y1;
-      // top-left, just inside the box border
       ctx.fillText(b.score.toFixed(2), lx + lw + px(1), ly + lw + px(1));
     }
   }
 }
 
-/** Image + overlay PNGs + a box/OBB-polyline canvas, all co-registered: the
- * canvas bitmap tracks the image's *rendered* size, so boxes align and line
- * widths stay constant at any zoom or thumbnail size. */
-export function SampleView({
-  src, boxes, overlays = [], shownOverlays, showBoxes = true, widthPx, onLoadNatural,
-}: Props) {
+/** Image + (optional) heatmap overlay PNGs + a box/OBB-polyline canvas, all
+ * co-registered. The canvas bitmap tracks the *rendered* size, so boxes align
+ * and line widths stay sensible at any thumbnail size or fit-zoom. */
+export function SampleView({ src, boxes, overlays = [], layers, widthPx, onLoadNatural }: Props) {
   const wrapRef = useRef<HTMLSpanElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
 
   const repaint = () => {
-    if (canvasRef.current && nat) paint(canvasRef.current, nat.w, nat.h, showBoxes ? boxes : []);
+    if (canvasRef.current && nat) paint(canvasRef.current, nat.w, nat.h, boxes, layers);
   };
-  // Repaint on data change.
-  useEffect(repaint, [nat, showBoxes, boxes]);
-  // Repaint on rendered-size change (zoom, grid reflow, window resize).
+  useEffect(repaint, [nat, boxes, layers]);
   useEffect(() => {
     if (!wrapRef.current) return;
     const ro = new ResizeObserver(repaint);
     ro.observe(wrapRef.current);
     return () => ro.disconnect();
-  }, [nat, showBoxes, boxes]);
+  }, [nat, boxes, layers]);
 
   return (
     <span ref={wrapRef} className="relative block leading-none" style={widthPx ? { width: widthPx } : undefined}>
@@ -122,9 +127,15 @@ export function SampleView({
         }}
       />
       {overlays
-        .filter((o) => shownOverlays?.has(o.kind))
+        .filter((o) => layers.overlaysOn[o.kind])
         .map((o) => (
-          <img key={o.kind} className="pointer-events-none absolute inset-0 h-full w-full" src={o.url} alt={o.kind} />
+          <img
+            key={o.kind}
+            className="pointer-events-none absolute inset-0 h-full w-full"
+            style={{ opacity: layers.overlayOpacity }}
+            src={o.url}
+            alt={o.kind}
+          />
         ))}
       <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
     </span>
