@@ -117,10 +117,11 @@ epochs: 100
 #   qfl_beta: 2.0                 # focal exponent for soft_hm only
 #   count_weight: 0.05            # >0 enables count-aware loss term
 #   convexity_weight: 0.2         # >0 enforces centered, radially-symmetric peaks (convex-object prior)
-#   convexity_radius: 2           # MAX window radius in heatmap cells — size it to your BIGGEST
-#                                 #   object (≈ 0.5·min(w,h)/stride); the loss auto-narrows the
-#                                 #   effective window per object via its GT box, so too-big is
-#                                 #   harmless, too-small does nothing. Cost: ~(2r+1)² VRAM.
+#   convexity_radius: auto        # CAP on the per-object convexity window (heatmap cells). The
+#                                 #   window is already box-derived per object and auto-scales; this
+#                                 #   just needs to be ≥ the biggest object's radius so it never
+#                                 #   clamps. "auto" (the default) sizes it from the dataset's p99 GT
+#                                 #   box (capped at 12 for VRAM). Set a number to pin it.
 #   repulsion_weight: 0.5         # >0 for crowded touching objects
 #
 # auto_mine:                      # auto hard-negative mining DURING training (off unless set).
@@ -133,12 +134,12 @@ epochs: 100
 #   max_pool: 500                 #   pool is FIFO-capped (oldest patches age out)
 #   max_scan: 400                 #   images scanned per mine pass
 #   top_k_per_sample: 4           #   max patches per image
+#   patch_size: auto              #   crop size (px). "auto" (default) = median GT box short-side.
 #   ghost_radius_frac: 0.5        #   a pred counts as a ghost if its center is outside
 #                                 #   max(8px, 2·stride, this·min(gt_w,gt_h)) of EVERY GT center.
 #                                 #   Lower it (~0.3) to catch phantoms that sit *between* real
 #                                 #   objects (e.g. an "egg" hallucinated in the gap between 4 eggs)
 #                                 #   rather than forgiving them as slightly-off detections.
-#   patch_size: 32                #   crop size (px)
 #   paste_prob: 0.2               #   per-sample probability the dataloader pastes a mined patch
 #   paste_count: 1                #   patches pasted per sample when it fires
 #   WARNING: start_epoch matters — mining before the cls head knows what objects

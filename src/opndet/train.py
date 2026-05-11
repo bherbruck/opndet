@@ -645,6 +645,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     print("loading data ...")
     samples = load_datasets(c["data"]["sources"], image_filter=c["data"].get("image_filter"))
     print(f"total samples: {len(samples)}")
+    # GT box short-side sizes (px) — used to auto-size resolution-relative knobs
+    # (convexity_radius, auto_mine.patch_size) when the yaml leaves them "auto".
+    _box_min_sides = np.array(
+        [min(float(b[2] - b[0]), float(b[3] - b[1]))
+         for s in samples if getattr(s, "boxes", None) is not None and len(s.boxes)
+         for b in s.boxes],
+        dtype=np.float32,
+    )
     ratios = tuple(c["data"].get("split_ratios", [0.8, 0.1, 0.1]))
     train_s, val_s, test_s = split_samples(samples, ratios=ratios, seed=seed)
     print(f"split: train={len(train_s)} val={len(val_s)} test={len(test_s)}")
@@ -657,6 +665,13 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     # `augment.hard_negative_pool`) so the mined patches feed straight back in.
     auto_mine_cfg = c.get("auto_mine")
     if isinstance(auto_mine_cfg, dict) and auto_mine_cfg.get("enabled", True):
+        auto_mine_cfg = dict(auto_mine_cfg)
+        # patch_size auto: a typical object's pixel footprint (so the crop carries
+        # the texture). Resolution-relative → derive it from the data, not a fixed 32.
+        if auto_mine_cfg.get("patch_size") in (None, "auto"):
+            ps = int(round(float(np.median(_box_min_sides)))) if _box_min_sides.size else 32
+            auto_mine_cfg["patch_size"] = max(16, min(128, ps))
+            print(f"auto-mine: patch_size auto → {auto_mine_cfg['patch_size']} px (median GT min-side)")
         _am_pool = str(out_dir / "hard_negatives")
         aug_dict.setdefault("hard_negative_pool", _am_pool)
         aug_dict.setdefault("hard_negative_prob", float(auto_mine_cfg.get("paste_prob", 0.2)))
@@ -824,6 +839,18 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     loss_kw.setdefault("img_h", img_h)
     loss_kw.setdefault("img_w", img_w)
     loss_kw.setdefault("stride", cfg_shim.stride)
+    # convexity_radius is the *cap* on the per-object convexity window (heatmap
+    # cells). The window itself is already box-derived (σ ∝ box/stride) and
+    # auto-scales; the cap just needs to be ≥ the biggest object's radius so it
+    # never clamps. "auto" (or unset) → size it from the dataset's p99 GT box.
+    if loss_kw.get("convexity_radius") in (None, "auto"):
+        if _box_min_sides.size:
+            cr = math.ceil(float(np.percentile(_box_min_sides, 99)) / max(1, cfg_shim.stride) / 2.0) + 1
+        else:
+            cr = 4
+        loss_kw["convexity_radius"] = int(max(2, min(12, cr)))  # cap at 12: (2·12+1)² unfold ~3.9 GB @bs128
+        if float(loss_kw.get("convexity_weight", 0.0)) > 0:
+            print(f"convexity: radius auto → {loss_kw['convexity_radius']} cells (p99 GT min-side / 2 / stride, capped 12)")
     # Auto-route wh_loss to match the head variant. User can override.
     if has_obb:
         loss_kw.setdefault("wh_loss", "obb")
