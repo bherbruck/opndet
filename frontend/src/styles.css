@@ -42,6 +42,17 @@ body {
 .u-legend td {
   color: var(--color-fgdim) !important;
 }
+/* Drag-zoom selection box — uPlot's default is rgba(0,0,0,0.07), invisible on
+ * a dark background. Tint it with the accent so the highlight actually shows. */
+.u-select {
+  background: rgba(79, 157, 255, 0.18) !important;
+  outline: 1px solid rgba(79, 157, 255, 0.55);
+}
+/* Crosshair lines — brighter than uPlot's default grey on dark. */
+.u-cursor-x,
+.u-cursor-y {
+  border-color: rgba(170, 200, 255, 0.45) !important;
+}
 
 @layer components {
   .btn {
