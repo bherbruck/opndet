@@ -95,3 +95,36 @@ def test_soft_hm_cls_loss_runs():
     assert float(out["l_hm"]) > 0
     out["loss"].backward()
     assert raw.grad is not None and torch.isfinite(raw.grad).all()
+
+
+def test_peak_sharpen_loss():
+    from opndet.loss import peak_sharpen_loss
+    B, H, W = 2, 16, 16
+    pos = torch.zeros(B, 1, H, W)
+    pos[:, 0, 8, 8] = 1.0
+    # adjacent near-tie: 0.95 peak, 0.94 neighbor → penalized (0.94 > 0.95-0.15)
+    hm = torch.full((B, 1, H, W), 0.05)
+    hm[:, 0, 8, 8] = 0.95
+    hm[:, 0, 8, 9] = 0.94
+    assert float(peak_sharpen_loss(hm, pos, k=5, margin=0.15)) > 0.1
+    # clean single peak: neighbors well below the margin band → ~0
+    hm2 = torch.full((B, 1, H, W), 0.05)
+    hm2[:, 0, 7:10, 7:10] = 0.6
+    hm2[:, 0, 8, 8] = 0.95
+    assert float(peak_sharpen_loss(hm2, pos, k=5, margin=0.15)) < 1e-4
+
+
+def test_peak_sharpen_wired_into_loss():
+    B, H, W = 1, 16, 16
+    pos = torch.zeros(B, 1, H, W)
+    pos[:, 0, 8, 8] = 1.0
+    tgt = {"pos": pos, "hm": torch.zeros(B, 1, H, W),
+           "cxy": torch.zeros(B, 2, H, W), "wh": torch.full((B, 2, H, W), 0.1)}
+    tgt["hm"][:, 0, 8, 8] = 1.0
+    loss = OpndetBboxLoss(cls_loss="focal", wh_loss="ciou", peak_sharpen_weight=0.5,
+                          peak_sharpen_margin=0.15, img_h=64, img_w=64, stride=4)
+    raw = torch.zeros(1, 5, 16, 16, requires_grad=True)
+    out = loss(raw, tgt)
+    assert "l_peaksharp" in out
+    out["loss"].backward()
+    assert raw.grad is not None and torch.isfinite(raw.grad).all()

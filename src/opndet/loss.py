@@ -280,6 +280,35 @@ def focal_heatmap_loss(pred_logit: torch.Tensor, gt: torch.Tensor, alpha: float 
     return (pos_loss.sum() + neg_loss.sum()) / n_pos
 
 
+def peak_sharpen_loss(hm_pred: torch.Tensor, pos: torch.Tensor, k: int = 5, margin: float = 0.15) -> torch.Tensor:
+    """At each GT-center cell, force the strongest *neighbor* within the peak-
+    suppression window to sit at least `margin` below the cell's own value.
+
+    Why: PeakSuppress keeps any cell within `eps` (~5e-3) of its window max — so
+    when the true object center lands on a cell boundary the model hedges, puts
+    ~equal values on the two adjacent cells (e.g. 0.7253 and 0.7252), and BOTH
+    survive → two adjacent detections (the lower one at a reduced score because
+    the arith mask ramps over the eps band, which is why it *looks* far less
+    confident). `margin >> eps` makes that impossible: a neighbor `margin` below
+    the peak gets a PeakSuppress mask of 0 → fully zeroed. Training-side, zero
+    inference cost — the heatmap-side analog of repulsion. `k` should match the
+    model's peak_kernel.
+
+    hm_pred: [B,1,H,W] post-sigmoid objectness.
+    pos:     [B,1,H,W] positive-cell mask (1 at the GT center cell).
+    """
+    B, _, H, W = hm_pred.shape
+    r = max(1, k // 2)
+    K = 2 * r + 1
+    patches = F.unfold(hm_pred, kernel_size=K, padding=r, stride=1)   # [B, K*K, H*W]
+    patches = patches.clone()
+    patches[:, (K * K) // 2, :] = -1.0                               # exclude self
+    nbr_max = patches.max(dim=1).values.view(B, 1, H, W)
+    over = (nbr_max - (hm_pred - margin)).clamp(min=0.0)             # neighbor too close to (or above) the peak
+    n_pos = pos.sum().clamp(min=1.0)
+    return (over * pos).sum() / n_pos
+
+
 def quality_focal_loss(pred_logit: torch.Tensor, target: torch.Tensor, beta: float = 2.0) -> torch.Tensor:
     """Quality Focal Loss (GFL): regress a *soft* target ∈ [0,1] (here the full
     Gaussian heatmap) with focal-style downweighting of well-predicted cells.
@@ -318,6 +347,8 @@ class OpndetBboxLoss(nn.Module):
         peak_eps: float = 5e-3,
         convexity_weight: float = 0.0,
         convexity_radius: int = 2,
+        peak_sharpen_weight: float = 0.0,      # >0 → force neighbors `peak_sharpen_margin` below each peak
+        peak_sharpen_margin: float = 0.15,
         dist_weight: float = 0.5,
         img_h: int = 384,
         img_w: int = 512,
@@ -341,6 +372,8 @@ class OpndetBboxLoss(nn.Module):
         self.peak_eps = peak_eps
         self.convex_w = convexity_weight
         self.convex_r = convexity_radius
+        self.peak_sharpen_w = peak_sharpen_weight
+        self.peak_sharpen_margin = peak_sharpen_margin
         self.dist_w = dist_weight
         self.img_h = img_h
         self.img_w = img_w
@@ -414,7 +447,7 @@ class OpndetBboxLoss(nn.Module):
                    "l_cxy": l_box.detach() * 0.0,
                    "l_wh": l_box.detach(),
                    "l_angle": l_angle.detach()}
-            if self.count_w > 0 or self.convex_w > 0:
+            if self.count_w > 0 or self.convex_w > 0 or self.peak_sharpen_w > 0:
                 hm_sig = torch.sigmoid(hm_logit)
             if self.count_w > 0:
                 peaks = _peak_suppress(hm_sig, k=self.peak_kernel, eps=self.peak_eps)
@@ -428,6 +461,10 @@ class OpndetBboxLoss(nn.Module):
                 l_convex = convexity_loss(hm_sig, pos, k=self.convex_r, sigma_cells=sig)
                 out["loss"] = out["loss"] + self.convex_w * l_convex
                 out["l_convex"] = l_convex.detach()
+            if self.peak_sharpen_w > 0:
+                l_sharp = peak_sharpen_loss(hm_sig, pos, k=self.peak_kernel, margin=self.peak_sharpen_margin)
+                out["loss"] = out["loss"] + self.peak_sharpen_w * l_sharp
+                out["l_peaksharp"] = l_sharp.detach()
             return out
 
         # ltrb mode: raw[:, 1:5] is (l, t, r, b) post-sigmoid.
@@ -450,7 +487,7 @@ class OpndetBboxLoss(nn.Module):
             l_cxy = l_box.detach() * 0.0  # placeholder so downstream logging keys still exist
             total = self.w_hm * l_hm + self.w_wh * l_box
             out = {"loss": total, "l_hm": l_hm.detach(), "l_cxy": l_cxy, "l_wh": l_box.detach()}
-            if self.count_w > 0 or self.convex_w > 0:
+            if self.count_w > 0 or self.convex_w > 0 or self.peak_sharpen_w > 0:
                 hm_sig = torch.sigmoid(hm_logit)
             if self.count_w > 0:
                 peaks = _peak_suppress(hm_sig, k=self.peak_kernel, eps=self.peak_eps)
@@ -465,6 +502,10 @@ class OpndetBboxLoss(nn.Module):
                 l_convex = convexity_loss(hm_sig, pos, k=self.convex_r, sigma_cells=sig)
                 out["loss"] = out["loss"] + self.convex_w * l_convex
                 out["l_convex"] = l_convex.detach()
+            if self.peak_sharpen_w > 0:
+                l_sharp = peak_sharpen_loss(hm_sig, pos, k=self.peak_kernel, margin=self.peak_sharpen_margin)
+                out["loss"] = out["loss"] + self.peak_sharpen_w * l_sharp
+                out["l_peaksharp"] = l_sharp.detach()
             return out
 
         cxy_logit = raw[:, 1:3]
@@ -508,7 +549,7 @@ class OpndetBboxLoss(nn.Module):
             out["loss"] = out["loss"] + self.rep_w * l_rep
             out["l_rep"] = l_rep.detach()
 
-        if self.count_w > 0 or self.convex_w > 0:
+        if self.count_w > 0 or self.convex_w > 0 or self.peak_sharpen_w > 0:
             hm_sig = torch.sigmoid(hm_logit)
 
         if self.count_w > 0:
@@ -526,6 +567,11 @@ class OpndetBboxLoss(nn.Module):
             l_convex = convexity_loss(hm_sig, pos, k=self.convex_r, sigma_cells=sig)
             out["loss"] = out["loss"] + self.convex_w * l_convex
             out["l_convex"] = l_convex.detach()
+
+        if self.peak_sharpen_w > 0:
+            l_sharp = peak_sharpen_loss(hm_sig, pos, k=self.peak_kernel, margin=self.peak_sharpen_margin)
+            out["loss"] = out["loss"] + self.peak_sharpen_w * l_sharp
+            out["l_peaksharp"] = l_sharp.detach()
 
         # Optional distance-transform aux head: raw has 6 channels, target has "dist".
         # Target-weighted L1: cells get gradient weight proportional to their target value,

@@ -123,6 +123,14 @@ epochs: 100
 #                                 #   clamps. "auto" (the default) sizes it from the dataset's p99 GT
 #                                 #   box (capped at 12 for VRAM). Set a number to pin it.
 #   repulsion_weight: 0.5         # >0 for crowded touching objects
+#   peak_sharpen_weight: 0.0      # >0 → at each GT cell, force the strongest neighbor within the
+#                                 #   peak_kernel window ≥ peak_sharpen_margin BELOW the peak. Stops
+#                                 #   the model hedging two ~equal adjacent cells (true center on a
+#                                 #   cell boundary) → PeakSuppress then fully zeroes the neighbor →
+#                                 #   no "two touching detections" duplicate (the lower one only
+#                                 #   *looks* far less confident — the arith mask amplifies a tiny
+#                                 #   heatmap difference). Heatmap-side analog of repulsion; 0 inference cost.
+#   peak_sharpen_margin: 0.15     # the gap to enforce — must be >> the PeakSuppress eps (5e-3)
 #
 # auto_mine:                      # auto hard-negative mining DURING training (off unless set).
 #   enabled: true                 #   Every `every` epochs (after `start_epoch`), or whenever the
