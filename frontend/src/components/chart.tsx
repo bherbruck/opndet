@@ -100,9 +100,13 @@ export function Chart({ title, series, smoothing, logY, height = 220 }: Props) {
       width: host.clientWidth || 360,
       height,
       legend: { show: false },
-      // drag a box (x+y) to zoom into a region; double-click resets.
-      cursor: { focus: { prox: 30 }, drag: { x: true, y: true, uni: 12 } },
-      scales: { y: { distr: logY ? 3 : 1 } },
+      // drag a box (x+y) to zoom into a region; double-click resets. points:false
+      // kills uPlot's per-series focus dot (it parks one at the origin until you
+      // hover) — the tooltip plugin is the hover readout.
+      cursor: { focus: { prox: 30 }, points: { show: false }, drag: { x: true, y: true, uni: 12 } },
+      // x is epoch numbers, not timestamps — without time:false uPlot renders
+      // them as dates ("12/31/69 7:00pm" = unix 0).
+      scales: { x: { time: false }, y: { distr: logY ? 3 : 1 } },
       plugins: [tooltipPlugin()],
       axes: [
         { stroke: "#8b97a3", grid: { stroke: "#222a33" }, ticks: { stroke: "#2a333d" } },
