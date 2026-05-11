@@ -851,6 +851,17 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         loss_kw["convexity_radius"] = int(max(2, min(12, cr)))  # cap at 12: (2·12+1)² unfold ~3.9 GB @bs128
         if float(loss_kw.get("convexity_weight", 0.0)) > 0:
             print(f"convexity: radius auto → {loss_kw['convexity_radius']} cells (p99 GT min-side / 2 / stride, capped 12)")
+    # hm_target: ellipse already encodes "be object-shaped and centered", so the
+    # convexity regularizer is largely redundant on top of it — default it OFF
+    # (user can still set loss.convexity_weight explicitly to add it back).
+    if str(c.get("hm_target", "gaussian")) == "ellipse":
+        if "convexity_weight" not in loss_kw:
+            loss_kw["convexity_weight"] = 0.0
+            print("convexity: weight defaulted to 0.0 — hm_target: ellipse already enforces "
+                  "centered, object-shaped peaks (set loss.convexity_weight to add the regularizer back)")
+        elif float(loss_kw.get("convexity_weight", 0.0)) > 0.0:
+            print(f"note: loss.convexity_weight={loss_kw['convexity_weight']} with hm_target: ellipse is "
+                  "largely redundant — the ellipse target already centers the heatmap; consider lowering it")
     # Auto-route wh_loss to match the head variant. User can override.
     if has_obb:
         loss_kw.setdefault("wh_loss", "obb")
