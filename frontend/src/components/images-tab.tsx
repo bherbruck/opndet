@@ -26,9 +26,10 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
   const [showGt, setShowGt] = useLocalStorage("opndet.layerGt", true);
   const [showPred, setShowPred] = useLocalStorage("opndet.layerPred", true);
   const [showConf, setShowConf] = useLocalStorage("opndet.layerConf", true);
+  const [confMin, setConfMin] = useLocalStorage("opndet.layerConfMin", 0);
   const layers: Layers = useMemo(
-    () => ({ overlaysOn, overlayOpacity, gt: showGt, pred: showPred, conf: showConf }),
-    [overlaysOn, overlayOpacity, showGt, showPred, showConf],
+    () => ({ overlaysOn, overlayOpacity, gt: showGt, pred: showPred, conf: showConf, confMin }),
+    [overlaysOn, overlayOpacity, showGt, showPred, showConf, confMin],
   );
 
   const tagsQ = useQuery({
@@ -94,12 +95,13 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
     });
   }, [samples]);
 
-  // Grid view: arrows step the epoch (detail view handles its own keys).
+  // Grid view: ↑/↓ step the epoch (no "current image" here; the detail view
+  // handles its own keys — ←/→ image, ↑/↓ epoch).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (detailIdx != null || isTyping(e.target)) return;
-      if (e.key === "ArrowUp" || e.key === "ArrowRight") { e.preventDefault(); stepEpoch(+1); }
-      else if (e.key === "ArrowDown" || e.key === "ArrowLeft") { e.preventDefault(); stepEpoch(-1); }
+      if (e.key === "ArrowUp") { e.preventDefault(); stepEpoch(+1); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); stepEpoch(-1); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -144,6 +146,13 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
           <label className="flex items-center gap-1.5"><input type="checkbox" checked={showPred} onChange={(e) => setShowPred(e.target.checked)} /> <span style={{ color: "#39c860" }}>pred</span></label>
           <label className="flex items-center gap-1.5"><input type="checkbox" checked={showGt} onChange={(e) => setShowGt(e.target.checked)} /> <span style={{ color: "#ff5edb" }}>gt</span></label>
           <label className="flex items-center gap-1.5"><input type="checkbox" checked={showConf} onChange={(e) => setShowConf(e.target.checked)} /> conf</label>
+          <label className="flex items-center gap-1.5" title="hide pred boxes below this score (visual only — doesn't change metrics)">
+            conf ≥
+            <input type="range" min={0} max={0.95} step={0.05} value={confMin} onChange={(e) => setConfMin(Number(e.target.value))} />
+            <span className="w-9 text-right text-fg">
+              {confMin.toFixed(2)}{confMin > 0 && <button type="button" className="ml-1 text-fgdim hover:text-fg" onClick={() => setConfMin(0)} title="reset">✕</button>}
+            </span>
+          </label>
           {overlayKinds.map((k) => (
             <label key={k} className="flex items-center gap-1.5">
               <input type="checkbox" checked={!!overlaysOn[k]} onChange={(e) => setOverlaysOn((o) => ({ ...o, [k]: e.target.checked }))} /> {k}

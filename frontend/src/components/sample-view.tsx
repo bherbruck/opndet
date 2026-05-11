@@ -10,6 +10,7 @@ export interface Layers {
   gt: boolean; // gt / fn boxes
   pred: boolean; // pred / tp / fp / trail boxes
   conf: boolean; // confidence score label
+  confMin: number; // hide scored (pred-side) boxes below this — visual only
 }
 
 interface Props {
@@ -63,6 +64,7 @@ function paint(canvas: HTMLCanvasElement, natW: number, natH: number, boxes: Box
 
   for (const b of boxes) {
     if (isGtKind(b.kind) ? !layers.gt : !layers.pred) continue;
+    if (!isGtKind(b.kind) && b.score != null && b.score < layers.confMin) continue; // conf filter (pred-side)
     const color = COLOR_BY_KIND[b.kind] ?? "#ffffff";
     if (b.kind === "trail") {
       ctx.strokeStyle = color;

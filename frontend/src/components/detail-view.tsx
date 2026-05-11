@@ -23,10 +23,10 @@ export function DetailView({ sample, caption, layers, onBack, onStepEpoch, onSte
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onBack();
-      else if (e.key === "ArrowUp") { e.preventDefault(); onStepSample?.(+1); }
-      else if (e.key === "ArrowDown") { e.preventDefault(); onStepSample?.(-1); }
-      else if (e.key === "ArrowRight") { e.preventDefault(); onStepEpoch?.(+1); }
-      else if (e.key === "ArrowLeft") { e.preventDefault(); onStepEpoch?.(-1); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); onStepSample?.(+1); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); onStepSample?.(-1); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); onStepEpoch?.(+1); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); onStepEpoch?.(-1); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -52,18 +52,18 @@ export function DetailView({ sample, caption, layers, onBack, onStepEpoch, onSte
         <button type="button" className="btn px-2 py-0" onClick={onBack}>← grid</button>
         {onStepSample && (
           <span className="inline-flex items-center gap-1 text-fgdim">
-            <button type="button" className="btn px-2 py-0" onClick={() => onStepSample(-1)} title="prev image (↓)">◀ img</button>
-            <button type="button" className="btn px-2 py-0" onClick={() => onStepSample(+1)} title="next image (↑)">img ▶</button>
+            <button type="button" className="btn px-2 py-0" onClick={() => onStepSample(-1)} title="prev image (←)">◀ img</button>
+            <button type="button" className="btn px-2 py-0" onClick={() => onStepSample(+1)} title="next image (→)">img ▶</button>
           </span>
         )}
         {onStepEpoch && (
           <span className="inline-flex items-center gap-1 text-fgdim">
-            <button type="button" className="btn px-2 py-0" onClick={() => onStepEpoch(-1)} title="prev epoch (←)">◀ ep</button>
-            <button type="button" className="btn px-2 py-0" onClick={() => onStepEpoch(+1)} title="next epoch (→)">ep ▶</button>
+            <button type="button" className="btn px-2 py-0" onClick={() => onStepEpoch(-1)} title="prev epoch (↓)">◀ ep</button>
+            <button type="button" className="btn px-2 py-0" onClick={() => onStepEpoch(+1)} title="next epoch (↑)">ep ▶</button>
           </span>
         )}
         <span className="font-semibold">{caption}</span>
-        <span className="ml-auto text-fgdim">↑/↓ image · ←/→ epoch · esc back</span>
+        <span className="ml-auto text-fgdim">←/→ image · ↑/↓ epoch · esc back</span>
       </div>
       <div ref={areaRef} className="flex flex-1 items-center justify-center overflow-auto p-2">
         <SampleView
