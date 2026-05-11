@@ -165,7 +165,7 @@ All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except h
 - `model.py` / `blocks.py` — hand-coded reference model (kept for parity tests).
 - `primitives.py` / `registry.py` / `yaml_build.py` — YAML DSL system.
 - `encode.py` — Gaussian heatmap GT encoder (CornerNet σ heuristic).
-- `loss.py` — focal/VFL heatmap + L1/CIoU/DIoU/NWD wh + L1 cxy + repulsion (baseline-subtracted) + count + convexity.
+- `loss.py` — focal/VFL heatmap + L1/CIoU/DIoU/NWD/ProbIoU wh + L1 cxy + repulsion (baseline-subtracted) + count + convexity. `convexity_loss` is per-object-scaled: `convexity_radius` is the MAX window cap; the actual window is Gaussian-weighted per positive cell with σ ≈ the GT box's radius in cells (so big objects get the whole window, small ones an effectively tight one, and a neighbor's blob inside an oversized window doesn't drag the centroid). Size `convexity_radius` to your biggest object — too-big is harmless, too-small means it only sees the blob tip and does nothing.
 - `decode.py` — client-side bbox decoder (no NMS).
 - `dataset.py` — COCO loader, OpndetDataset, mosaic, collate.
 - `augment.py` — photometric + geometric + cutout, with min_visible_frac filter.

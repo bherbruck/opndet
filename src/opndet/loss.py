@@ -210,23 +210,41 @@ def varifocal_loss(
     return (weight * bce).sum() / n_pos
 
 
-def convexity_loss(hm_pred: torch.Tensor, pos: torch.Tensor, k: int = 2, eps: float = 1e-6) -> torch.Tensor:
-    """Center-mass convexity regularizer.
+def convexity_loss(hm_pred: torch.Tensor, pos: torch.Tensor, k: int = 2, eps: float = 1e-6,
+                   sigma_cells: torch.Tensor | None = None) -> torch.Tensor:
+    """Per-object convexity / centroid-alignment regularizer.
 
-    For each positive cell, extract the (2k+1)×(2k+1) patch from the predicted heatmap
-    and compute the mass-weighted centroid offset from the cell center. Penalize.
-    Forces the model to produce symmetric, centroid-aligned peaks — matches the
-    convex-object prior (round / radially symmetric appearance).
+    For each positive cell, extract the (2k+1)×(2k+1) heatmap patch, optionally
+    weight it by a radial Gaussian whose width matches that object's size, compute
+    the mass-weighted centroid offset from the cell center, and penalize it.
+    Forces symmetric, centroid-aligned peaks — the convex-object prior.
 
-    hm_pred: [B,1,H,W] post-sigmoid objectness.
-    pos:     [B,1,H,W] positive cell mask (1 at GT center cell, 0 elsewhere).
-    k:       neighborhood radius (k=2 -> 5×5 patch).
+    Why the per-object Gaussian: a fixed k that's too small for big objects only
+    sees the blob's tip (centroid trivially centered → no signal). Sizing the
+    window to the object fixes that — and the Gaussian (vs. a hard box) also
+    means a *neighbor's* blob sitting inside an oversized window doesn't drag the
+    centroid, which matters for crowded/touching objects.
+
+    hm_pred:     [B,1,H,W] post-sigmoid objectness.
+    pos:         [B,1,H,W] positive-cell mask (1 at GT center cell, 0 elsewhere).
+    k:           MAX neighborhood radius in cells (the window cap — size it to
+                 your *biggest* object; smaller ones self-narrow via sigma).
+    sigma_cells: [B,1,H,W] per-cell object Gaussian σ in cells (≈ 0.5·min(w,h)/
+                 stride), nonzero at positives. None → flat (2k+1) window (legacy).
+
+    Memory: materializes a [B, (2k+1)², H·W] tensor (twice, transiently, when
+    sigma is given) — so big k on a big heatmap at big batch can spike VRAM.
     """
     K = 2 * k + 1
     patches = F.unfold(hm_pred, kernel_size=K, padding=k, stride=1)  # [B, K*K, H*W]
-    coords = torch.arange(K, device=hm_pred.device, dtype=hm_pred.dtype) - float(k)  # [-k..k]
+    dev, dt = hm_pred.device, hm_pred.dtype
+    coords = torch.arange(K, device=dev, dtype=dt) - float(k)  # [-k..k]
     dx = coords.repeat(K).view(1, K * K, 1)              # x offset within patch
     dy = coords.repeat_interleave(K).view(1, K * K, 1)   # y offset within patch
+    if sigma_cells is not None:
+        s = sigma_cells.flatten(2).clamp(min=1.0, max=float(k))            # [B,1,HW]
+        r2 = dx * dx + dy * dy                                            # [1,KK,1]
+        patches = patches * torch.exp(-0.5 * r2 / (s * s))               # [B,KK,HW]
     mass = patches.sum(dim=1, keepdim=True) + eps        # [B, 1, HW]
     cx_off = (patches * dx).sum(dim=1, keepdim=True) / mass
     cy_off = (patches * dy).sum(dim=1, keepdim=True) / mass
@@ -308,6 +326,14 @@ class OpndetBboxLoss(nn.Module):
         self.img_w = img_w
         self.stride = stride
 
+    def _convex_sigma(self, w_norm: torch.Tensor, h_norm: torch.Tensor) -> torch.Tensor:
+        """Per-cell object Gaussian σ for the convexity window, in heatmap cells
+        (≈ object radius). w_norm/h_norm are image-normalized box extents [B,1,H,W];
+        garbage/zero at non-positive cells but those don't contribute to the loss."""
+        w_cells = w_norm * (self.img_w / self.stride)
+        h_cells = h_norm * (self.img_h / self.stride)
+        return 0.5 * torch.minimum(w_cells, h_cells)
+
     def forward(self, raw: torch.Tensor, tgt: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         hm_logit = raw[:, 0:1]
 
@@ -376,7 +402,8 @@ class OpndetBboxLoss(nn.Module):
                 out["loss"] = out["loss"] + self.count_w * l_count
                 out["l_count"] = l_count.detach()
             if self.convex_w > 0:
-                l_convex = convexity_loss(hm_sig, pos, k=self.convex_r)
+                sig = self._convex_sigma(gt[:, 2:3], gt[:, 3:4])  # gt = tgt["obb"]: w_norm, h_norm
+                l_convex = convexity_loss(hm_sig, pos, k=self.convex_r, sigma_cells=sig)
                 out["loss"] = out["loss"] + self.convex_w * l_convex
                 out["l_convex"] = l_convex.detach()
             return out
@@ -409,7 +436,9 @@ class OpndetBboxLoss(nn.Module):
                 out["loss"] = out["loss"] + self.count_w * l_count
                 out["l_count"] = l_count.detach()
             if self.convex_w > 0:
-                l_convex = convexity_loss(hm_sig, pos, k=self.convex_r)
+                _lt = tgt["ltrb"]  # (l, t, r, b) image-normalized → w = l+r, h = t+b
+                sig = self._convex_sigma(_lt[:, 0:1] + _lt[:, 2:3], _lt[:, 1:2] + _lt[:, 3:4])
+                l_convex = convexity_loss(hm_sig, pos, k=self.convex_r, sigma_cells=sig)
                 out["loss"] = out["loss"] + self.convex_w * l_convex
                 out["l_convex"] = l_convex.detach()
             return out
@@ -467,7 +496,8 @@ class OpndetBboxLoss(nn.Module):
             out["l_count"] = l_count.detach()
 
         if self.convex_w > 0:
-            l_convex = convexity_loss(hm_sig, pos, k=self.convex_r)
+            sig = self._convex_sigma(tgt["wh"][:, 0:1], tgt["wh"][:, 1:2])
+            l_convex = convexity_loss(hm_sig, pos, k=self.convex_r, sigma_cells=sig)
             out["loss"] = out["loss"] + self.convex_w * l_convex
             out["l_convex"] = l_convex.detach()
 

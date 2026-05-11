@@ -84,7 +84,11 @@ epochs: 100
 #   wh_loss: ciou                 # default
 #   cls_loss: vfl                 # default — bimodal confidence
 #   count_weight: 0.05            # >0 enables count-aware loss term
-#   convexity_weight: 0.2         # >0 enforces radially-symmetric peaks
+#   convexity_weight: 0.2         # >0 enforces centered, radially-symmetric peaks (convex-object prior)
+#   convexity_radius: 2           # MAX window radius in heatmap cells — size it to your BIGGEST
+#                                 #   object (≈ 0.5·min(w,h)/stride); the loss auto-narrows the
+#                                 #   effective window per object via its GT box, so too-big is
+#                                 #   harmless, too-small does nothing. Cost: ~(2r+1)² VRAM.
 #   repulsion_weight: 0.5         # >0 for crowded touching objects
 #
 # auto_mine:                      # auto hard-negative mining DURING training (off unless set).
