@@ -103,15 +103,20 @@ def _parse_activation(act_name: str | None) -> nn.Module | None:
     return ACTIVATIONS[act_name]()
 
 
-def build_model_from_yaml(path: str | Path) -> YamlModel:
+def build_model_from_yaml(path: str | Path, *, img_h: int | None = None, img_w: int | None = None) -> YamlModel:
     path = Path(path)
     with open(path) as f:
         cfg = yaml.safe_load(f)
 
     spec = cfg["model"]
     in_ch = spec.get("in_ch", 3)
-    img_h = spec.get("img_h", 384)
-    img_w = spec.get("img_w", 512)
+    # img_h/img_w come from the model preset YAML; a caller (train.yaml's
+    # `model: {img_h:, img_w:}`) may override them. The architecture is fully
+    # convolutional + nearest-Resize, so any input divisible by the backbone's
+    # deepest internal stride works — use multiples of 32 to be safe (e.g.
+    # 480x640: 480/32=15, 640/32=20). A bad size fails at the first forward.
+    img_h = int(img_h) if img_h is not None else spec.get("img_h", 384)
+    img_w = int(img_w) if img_w is not None else spec.get("img_w", 512)
     tier = spec.get("tier", "edge")
     if tier not in ("edge", "server"):
         raise ValueError(f"model.tier must be 'edge' or 'server' (got {tier!r}) in {path}")

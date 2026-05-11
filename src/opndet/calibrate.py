@@ -135,7 +135,8 @@ def calibrate_ckpt(
     sel = {"train": train_s, "val": val_s, "test": test_s}[split]
 
     model_path = _resolve_preset(c["model_config"])
-    model = build_model_from_yaml(model_path).to(device).eval()
+    _mc = c.get("model", {}) or {}
+    model = build_model_from_yaml(model_path, img_h=_mc.get("img_h"), img_w=_mc.get("img_w")).to(device).eval()
     sd = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(sd["model"] if "model" in sd else sd)
 

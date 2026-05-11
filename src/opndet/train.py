@@ -679,11 +679,12 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     aug_fn = make_augment(aug_cfg, hn_pool=hn_pool)
 
     model_path = _resolve_preset(c["model_config"])
-    model = build_model_from_yaml(model_path).to(device)
+    _mc = c.get("model", {}) or {}
+    model = build_model_from_yaml(model_path, img_h=_mc.get("img_h"), img_w=_mc.get("img_w")).to(device)
     if resume_state is not None:
         model.load_state_dict(resume_state["model"])
     in_ch, img_h, img_w = model.input_shape
-    stride = int(c.get("model", {}).get("stride", 4))
+    stride = int(_mc.get("stride", 4))
     cfg_shim = _CfgShim(img_h, img_w, stride=stride, hm_blob_frac=float(c.get("hm_blob_frac", 0.0)),
                         hm_target=str(c.get("hm_target", "gaussian")),
                         hm_ellipse_edge_margin=float(c.get("hm_ellipse_edge_margin", 0.1)))

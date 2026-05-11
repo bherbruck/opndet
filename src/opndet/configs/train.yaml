@@ -7,6 +7,14 @@ name: exp1
 
 model_config: bbox-s          # bbox-f | bbox-p | bbox-n | bbox-s | bbox-m
                               # bbox-l | bbox-x | bbox-h | bbox-g | bbox-t   (and -dist variants)
+# model:
+#   stride: 4                 # output stride (default 4)
+#   img_h: 384                # override the preset's input height (default per-preset; 384 for most)
+#   img_w: 512                # override the preset's input width  (default per-preset; 512 for most)
+#                             #   Net is fully conv + nearest-Resize → any size divisible by the
+#                             #   backbone's deepest stride works; use multiples of 32 (e.g. 480x640).
+#                             #   Applied identically by train, eval, calibrate. A bad size fails
+#                             #   at the first forward.
 
 data:
   sources:
