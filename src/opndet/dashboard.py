@@ -19,6 +19,7 @@ Static files: each run's vis assets served under /files/<run_name>/...
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import traceback
@@ -148,6 +149,41 @@ def _open_db(run_dir: Path):
         return _PooledConn(conn, _db_cache[key]["lock"])
 
 
+# ---------------------------------------------------------------------------
+# Content-addressed vis assets. visualize.py re-writes the clean base RGB into
+# a fresh ep<NNN>/ dir every viz epoch — byte-identical content, and often the
+# same val image across runs — so /files/<run>/<path> URLs never dedupe. Hash
+# the bytes and serve at /blob/<hash> instead: the browser then downloads each
+# distinct image at most once, ever, across all runs and epochs.
+_blob_lock = threading.Lock()
+_blob_hash_by_path: dict[str, tuple[str, float, int]] = {}   # resolved path -> (hash, mtime, size)
+_blob_path_by_hash: dict[str, Path] = {}                     # hash -> resolved path
+
+
+def _blob_ref(run_dir: Path, rel_path: str) -> str:
+    """Return a /blob/<hash> URL for a vis file under a run dir. On any error
+    (missing file, escape attempt) fall back to the plain /files/ URL so a
+    broken asset degrades to a 404 rather than a 500."""
+    fallback = f"/files/{run_dir.name}/{rel_path}"
+    try:
+        full = (run_dir / rel_path).resolve()
+        if not str(full).startswith(str(run_dir.resolve())):
+            return fallback
+        st = full.stat()
+        key = str(full)
+        with _blob_lock:
+            cached = _blob_hash_by_path.get(key)
+            if cached and cached[1] == st.st_mtime and cached[2] == st.st_size:
+                h = cached[0]
+            else:
+                h = hashlib.blake2b(full.read_bytes(), digest_size=12).hexdigest()
+                _blob_hash_by_path[key] = (h, st.st_mtime, st.st_size)
+            _blob_path_by_hash[h] = full
+        return f"/blob/{h}"
+    except OSError:
+        return fallback
+
+
 def build_app(root_dir: Path) -> FastAPI:
     root_dir = Path(root_dir).resolve()
     # Tolerate missing root — dashboard launches before training has had a
@@ -202,6 +238,17 @@ def build_app(root_dir: Path) -> FastAPI:
         # Per-epoch vis assets live at distinct paths and never change once
         # written — let the browser cache them so a poll doesn't re-pull MB of PNGs.
         return FileResponse(full, headers={"Cache-Control": "public, max-age=86400, immutable"})
+
+    @app.get("/blob/{h}")
+    def serve_blob(h: str):
+        with _blob_lock:
+            p = _blob_path_by_hash.get(h)
+        if p is None or not p.exists():
+            # Unknown hash (e.g. server restarted, stale URL in a cached page).
+            # The client re-fetches /api/samples, which repopulates the map and
+            # hands back fresh /blob URLs — so this self-heals.
+            raise HTTPException(404)
+        return FileResponse(p, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
     @app.get("/api/runs")
     def api_runs() -> list[dict[str, Any]]:
@@ -266,7 +313,6 @@ def build_app(root_dir: Path) -> FastAPI:
         run_dir = _resolve_run(run)
         if run_dir is None:
             return []
-        run_name = run_dir.name
         with _open_db(run_dir) as con:
             imgs = con.execute(
                 "SELECT sample_idx, base_path FROM images WHERE tag = ? AND ep = ? ORDER BY sample_idx",
@@ -283,7 +329,7 @@ def build_app(root_dir: Path) -> FastAPI:
             ).fetchall()
         ov_by_sample: dict[int, list[dict[str, str]]] = {}
         for s, kind, path in overlays:
-            ov_by_sample.setdefault(s, []).append({"kind": kind, "url": f"/files/{run_name}/{path}"})
+            ov_by_sample.setdefault(s, []).append({"kind": kind, "url": _blob_ref(run_dir, path)})
         bx_by_sample: dict[int, list[dict[str, Any]]] = {}
         for s, kind, x1, y1, x2, y2, score, meta in boxes:
             entry = {"kind": kind, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "score": score}
@@ -308,7 +354,7 @@ def build_app(root_dir: Path) -> FastAPI:
         return [
             {
                 "sample_idx": s,
-                "rgb_url": f"/files/{run_name}/{path}",
+                "rgb_url": _blob_ref(run_dir, path),
                 "overlays": ov_by_sample.get(s, []),
                 "boxes": bx_by_sample.get(s, []),
             }
