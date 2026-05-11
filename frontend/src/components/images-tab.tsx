@@ -23,10 +23,12 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
   const [ep, setEp] = useState<number | null>(null);
   const [lbIdx, setLbIdx] = useState<number | null>(null);
 
+  // No keepPreviousData on tags/epochs: when the run (or tag) changes we WANT
+  // the stale lists gone immediately so `ep` snaps to the new run's latest
+  // instead of lingering on an epoch the new run doesn't have.
   const tagsQ = useQuery({
     queryKey: ["imgTags", imgRun],
     enabled: !!imgRun,
-    placeholderData: keepPreviousData,
     refetchInterval,
     queryFn: () => api.tagsBulk([imgRun]),
   });
@@ -39,16 +41,19 @@ export function ImagesTab({ runs, imgRun, refetchInterval }: Props) {
 
   const hasTag = !!imgRun && imageTags.includes(imgTag);
 
+  // Switching run/tag → drop the current epoch so the snap-to-latest below
+  // can't be short-circuited by a stale-but-coincidentally-valid value.
+  useEffect(() => { setEp(null); }, [imgRun, imgTag]);
+
   const epochsQ = useQuery({
     queryKey: ["imgEpochs", imgRun, imgTag],
     enabled: hasTag,
-    placeholderData: keepPreviousData,
     refetchInterval,
     queryFn: () => api.epochs(imgRun, imgTag).then((e) => [...e].sort((a, b) => a - b)),
   });
   const epochs = epochsQ.data ?? [];
 
-  // Default to the LATEST epoch; only move if the current pick disappears.
+  // Default to the LATEST epoch; only keep the current pick if it still exists.
   useEffect(() => {
     if (epochs.length === 0) { setEp(null); return; }
     setEp((cur) => (cur != null && epochs.includes(cur) ? cur : epochs[epochs.length - 1]));
