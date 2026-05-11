@@ -646,6 +646,22 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
 
     aug_dict = dict(c.get("augment") or {})
     tp_cfg = aug_dict.pop("temporal_prior", None)
+
+    # Auto hard-negative mining (config block `auto_mine:`). When on, point the
+    # paste side at a run-local pool dir (unless the user already configured
+    # `augment.hard_negative_pool`) so the mined patches feed straight back in.
+    auto_mine_cfg = c.get("auto_mine")
+    if isinstance(auto_mine_cfg, dict) and auto_mine_cfg.get("enabled", True):
+        _am_pool = str(out_dir / "hard_negatives")
+        aug_dict.setdefault("hard_negative_pool", _am_pool)
+        aug_dict.setdefault("hard_negative_prob", float(auto_mine_cfg.get("paste_prob", 0.2)))
+        aug_dict.setdefault("hard_negative_count", int(auto_mine_cfg.get("paste_count", 1)))
+        print(f"auto-mine: ON  start_epoch={auto_mine_cfg.get('start_epoch', 50)} "
+              f"every={auto_mine_cfg.get('every', 10)} source={auto_mine_cfg.get('source', 'val')} "
+              f"pool={aug_dict['hard_negative_pool']}  (paste p={aug_dict['hard_negative_prob']} n={aug_dict['hard_negative_count']})")
+    else:
+        auto_mine_cfg = None
+
     aug_cfg = AugConfig(**aug_dict)
     hn_pool = []
     if aug_cfg.hard_negative_pool and aug_cfg.hard_negative_prob > 0:
@@ -653,7 +669,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         hn_pool = load_pool(aug_cfg.hard_negative_pool)
         print(f"  hard-negative pool: {aug_cfg.hard_negative_pool}  loaded {len(hn_pool)} patches "
               f"(p={aug_cfg.hard_negative_prob}, count={aug_cfg.hard_negative_count})")
-        if not hn_pool:
+        if not hn_pool and not auto_mine_cfg:
             print(f"  WARN: hard_negative_pool {aug_cfg.hard_negative_pool} is empty or missing")
     aug_fn = make_augment(aug_cfg, hn_pool=hn_pool)
 
@@ -1339,6 +1355,46 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
         for k, v in m.items():
             writer.add_scalar(f"val/{k}", v, ep)
         writer.add_scalar("time/epoch_s", dt, ep)
+
+        # Auto hard-negative mining: every N epochs (or when the ghost rate
+        # crosses a gate) after a warmup, mine confident phantom centers from a
+        # data slice into the paste pool, then rebuild the train loader so the
+        # next epoch's workers pick up the new patches.
+        if auto_mine_cfg is not None:
+            _am_start = int(auto_mine_cfg.get("start_epoch", 50))
+            _am_every = max(1, int(auto_mine_cfg.get("every", 10)))
+            _am_gate = float(auto_mine_cfg.get("ghost_rate_gate", 2.0))  # >1 ⇒ gate disabled
+            _due = ep >= _am_start and ((ep - _am_start) % _am_every == 0
+                                        or float(m.get("center_ghost_rate", 0.0)) > _am_gate)
+            if _due:
+                from opndet.mine_negatives import mine_into_pool
+                _src = str(auto_mine_cfg.get("source", "val")).lower()
+                _src_samples = train_s if _src == "train" else val_s
+                _thr_cfg = auto_mine_cfg.get("threshold")
+                _mine_thr = float(_thr_cfg) if _thr_cfg is not None else float(cur_eval_threshold)
+                _t_mine = time.time()
+                n_new = mine_into_pool(
+                    eval_model, _src_samples,
+                    img_h=img_h, img_w=img_w, in_ch=in_ch, stride=stride, encode_fn=encode_fn,
+                    score_thresh=_mine_thr, pool_dir=aug_cfg.hard_negative_pool, device=device,
+                    patch_size=int(auto_mine_cfg.get("patch_size", 32)),
+                    top_k_per_sample=int(auto_mine_cfg.get("top_k_per_sample", 4)),
+                    max_total=int(auto_mine_cfg.get("max_pool", 500)),
+                    max_scan=int(auto_mine_cfg.get("max_scan", 400)),
+                    epoch_tag=ep,
+                )
+                from opndet.mine_negatives import load_pool as _load_pool
+                _pool_now = len(_load_pool(aug_cfg.hard_negative_pool))
+                print(f"  auto-mine: +{n_new} hard-neg patches @thr={_mine_thr:.2f} from {_src} "
+                      f"({len(_src_samples)} imgs); pool now {_pool_now}  ({time.time()-_t_mine:.1f}s)")
+                writer.add_scalar("auto_mine/patches_added", n_new, ep)
+                writer.add_scalar("auto_mine/pool_size", _pool_now, ep)
+                if _pool_now > 0:
+                    train_ds.aug = make_augment(aug_cfg, hn_pool=_load_pool(aug_cfg.hard_negative_pool))
+                    _old_loader = train_loader
+                    train_loader = InfiniteDataLoader(train_ds, batch_size=int(c["batch_size"]),
+                                                      shuffle=True, **train_kw)
+                    del _old_loader
 
         m_cal = None
         cur_T = 1.0

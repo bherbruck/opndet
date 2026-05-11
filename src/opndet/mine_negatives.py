@@ -323,6 +323,98 @@ def _cluster_patches(patches: list[np.ndarray], n_clusters: int,
     return labels
 
 
+def mine_into_pool(
+    model: torch.nn.Module,
+    samples: list,
+    *,
+    img_h: int,
+    img_w: int,
+    in_ch: int,
+    stride: int,
+    encode_fn,
+    score_thresh: float,
+    pool_dir: str | Path,
+    device,
+    patch_size: int = 32,
+    top_k_per_sample: int = 4,
+    max_total: int = 500,
+    max_scan: int = 400,
+    epoch_tag: int = 0,
+) -> int:
+    """Lightweight in-training hard-negative miner (no Grad-CAM).
+
+    Runs `model` over a slice of `samples`, takes objectness peaks above
+    `score_thresh` whose center isn't near any GT center (stride-aware radius,
+    matching the metrics' quantization floor), crops a `patch_size` patch around
+    each, and appends them to `<pool_dir>/patches/`. Then trims that dir to the
+    `max_total` most-recent files (oldest deleted) so the pool reflects the
+    current model's failures, not ancient ones. Returns the number written.
+
+    Cheap enough to call every few epochs — one forward pass per scanned image,
+    no backward. Restores the model's train/eval mode on exit.
+    """
+    patches_dir = Path(pool_dir) / "patches"
+    patches_dir.mkdir(parents=True, exist_ok=True)
+    ds = OpndetDataset(samples, img_h, img_w, augment_fn=None, encode_fn=encode_fn,
+                       cache_images=False, in_ch=in_ch, stride=stride)
+    n = min(len(ds), max_scan) if max_scan else len(ds)
+    was_training = model.training
+    model.eval()
+    written = 0
+    try:
+        with torch.no_grad():
+            for s_idx in range(n):
+                img_t, gt_boxes, _ = ds[s_idx]
+                out = model(img_t.unsqueeze(0).to(device))
+                obj_t = out["output"] if isinstance(out, dict) else out
+                obj = obj_t[0, 0].detach().float().cpu().numpy()       # peak-suppressed [0,1]
+                Hc, Wc = obj.shape
+                det_stride = max(1, img_h // Hc)
+                ys, xs = np.where(obj >= score_thresh)
+                if len(ys) == 0:
+                    continue
+                scores = obj[ys, xs]
+                pcx = (xs.astype(np.float32) + 0.5) * det_stride
+                pcy = (ys.astype(np.float32) + 0.5) * det_stride
+                gb = gt_boxes if (gt_boxes is not None and len(gt_boxes)) else np.zeros((0, 4), np.float32)
+                gb = np.asarray(gb, dtype=np.float32).reshape(-1, 4)
+                if gb.shape[0] == 0:
+                    ghost = np.ones(len(ys), dtype=bool)
+                else:
+                    gcx = (gb[:, 0] + gb[:, 2]) * 0.5
+                    gcy = (gb[:, 1] + gb[:, 3]) * 0.5
+                    gw = np.clip(gb[:, 2] - gb[:, 0], 1.0, None)
+                    gh = np.clip(gb[:, 3] - gb[:, 1], 1.0, None)
+                    radii = np.maximum(
+                        np.full(gw.shape, max(8.0, 2.0 * det_stride), dtype=np.float32),
+                        (0.5 * np.minimum(gw, gh)).astype(np.float32),
+                    )
+                    dd = np.sqrt((pcx[:, None] - gcx[None, :]) ** 2 + (pcy[:, None] - gcy[None, :]) ** 2)
+                    nearest = dd.argmin(axis=1)
+                    ghost = dd[np.arange(len(ys)), nearest] > radii[nearest]
+                gi = np.where(ghost)[0]
+                if len(gi) == 0:
+                    continue
+                gi = gi[np.argsort(-scores[gi])][:max(1, top_k_per_sample)]
+                img_bgr = _denormalize(img_t)
+                for j in gi:
+                    patch = _crop_patch(img_bgr, int(round(pcy[j])), int(round(pcx[j])), patch_size)
+                    name = f"ep{epoch_tag:03d}_s{s_idx:05d}_g{int(j):03d}_{written:04d}.png"
+                    cv2.imwrite(str(patches_dir / name), patch)
+                    written += 1
+    finally:
+        model.train(was_training)
+    # Age out: keep the most-recent `max_total` patches.
+    if max_total:
+        files = sorted(patches_dir.glob("*.png"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-max_total]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    return written
+
+
 def load_pool(pool_dir: str | Path) -> list[np.ndarray]:
     """Load all patches from a hard-negative pool directory. Used by augment.py."""
     pool_dir = Path(pool_dir)

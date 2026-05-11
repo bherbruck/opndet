@@ -87,6 +87,23 @@ epochs: 100
 #   convexity_weight: 0.2         # >0 enforces radially-symmetric peaks
 #   repulsion_weight: 0.5         # >0 for crowded touching objects
 #
+# auto_mine:                      # auto hard-negative mining DURING training (off unless set).
+#   enabled: true                 #   Every `every` epochs (after `start_epoch`), or whenever the
+#   start_epoch: 60               #   center-ghost rate crosses `ghost_rate_gate`, run the model on
+#   every: 10                     #   a data slice, take objectness peaks >= `threshold` whose
+#   threshold: 0.5                #   center isn't near any GT, crop a patch around each, and feed
+#   ghost_rate_gate: 2.0          #   them back via the hard-negative paste pool (auto-wired to
+#   source: val                   #   <out_dir>/hard_negatives). >1 disables the rate gate.
+#   max_pool: 500                 #   pool is FIFO-capped (oldest patches age out)
+#   max_scan: 400                 #   images scanned per mine pass
+#   top_k_per_sample: 4           #   max patches per image
+#   patch_size: 32                #   crop size (px)
+#   paste_prob: 0.2               #   per-sample probability the dataloader pastes a mined patch
+#   paste_count: 1                #   patches pasted per sample when it fires
+#   WARNING: start_epoch matters — mining before the cls head knows what objects
+#   look like teaches it to suppress real-but-not-yet-learned objects → recall
+#   collapse. Don't start until the heatmap loss has converged.
+#
 # augment:                        # full per-tier defaults already set; override here if needed
 #   mosaic_prob: 0.0              # bbox-f/p default; bbox-s+ default 0.1; bbox-h+ default 0.3
 #   cutout_prob: 0.0
