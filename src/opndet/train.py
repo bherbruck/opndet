@@ -1448,10 +1448,24 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
                 writer.add_scalar("auto_mine/pool_size", _pool_now, ep)
                 if _pool_now > 0:
                     train_ds.aug = make_augment(aug_cfg, hn_pool=_load_pool(aug_cfg.hard_negative_pool))
-                    _old_loader = train_loader
+                    # Tear the old InfiniteDataLoader's persistent workers down
+                    # *now*, in the main process, before forking the new ones —
+                    # otherwise the new workers inherit the still-alive old
+                    # iterator and, on exit, spew "AssertionError: can only test
+                    # a child process" from its __del__ (harmless but ugly; Colab
+                    # / torch+py3.12). Explicit shutdown + gc makes it go away.
+                    _old_it = getattr(train_loader, "iterator", None)
+                    train_loader = None
+                    if _old_it is not None and hasattr(_old_it, "_shutdown_workers"):
+                        try:
+                            _old_it._shutdown_workers()
+                        except Exception:
+                            pass
+                    del _old_it
+                    import gc as _gc
+                    _gc.collect()
                     train_loader = InfiniteDataLoader(train_ds, batch_size=int(c["batch_size"]),
                                                       shuffle=True, **train_kw)
-                    del _old_loader
 
         m_cal = None
         cur_T = 1.0
