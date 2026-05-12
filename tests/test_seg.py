@@ -133,19 +133,25 @@ def test_encode_seg_dome_flat_top():
 def test_encode_seg_instance_gap():
     import cv2
     from opndet.encode import encode_targets_seg
-    # two disks 1px apart (cx 30 / 70, r=20 → rims at x=50 / x=49 → essentially tangent at x≈49.5)
+    # two disks ~tangent at x≈50 (cx 30 / 70, r=20)
     da = np.zeros((128, 192), np.uint8); cv2.circle(da, (30, 64), 20, 1, -1)
     db = np.zeros((128, 192), np.uint8); cv2.circle(db, (70, 64), 20, 1, -1)
     class S0(_Shim):
-        seg_dome_ramp_px = 0; seg_instance_gap_px = 0
-    class S4(_Shim):
-        seg_dome_ramp_px = 0; seg_instance_gap_px = 4
-    d0 = encode_targets_seg(S0(), masks=[da, db])["dome"][0].numpy()
-    d4 = encode_targets_seg(S4(), masks=[da, db])["dome"][0].numpy()
-    # with the 4px erosion the 0-corridor between the disks is wider than without
+        seg_dome_ramp_px = 2; seg_instance_gap_px = 0
+    class S6(_Shim):
+        seg_dome_ramp_px = 2; seg_instance_gap_px = 6   # flat-top: fixed normalization → clean per-pixel compares
     zero_run = lambda row: int((row == 0).sum())
-    assert zero_run(d4[64, 40:60]) > zero_run(d0[64, 40:60])
-    assert d4[64, 30] > 0.0 and d4[64, 70] > 0.0   # interiors still positive (eroded, not gone)
+    d0 = encode_targets_seg(S0(), masks=[da, db])["dome"][0].numpy()
+    d6 = encode_targets_seg(S6(), masks=[da, db])["dome"][0].numpy()
+    # the inter-instance corridor is wider with the gap; interiors still saturated
+    assert zero_run(d6[64, 42:58]) > zero_run(d0[64, 42:58])
+    assert d6[64, 30] > 0.99 and d6[64, 70] > 0.99
+    # contact-ONLY: a lone disk is byte-identical with gap 0 and gap 6 (no uniform erosion)
+    solo0 = encode_targets_seg(S0(), masks=[da])["dome"][0].numpy()
+    solo6 = encode_targets_seg(S6(), masks=[da])["dome"][0].numpy()
+    assert np.array_equal(solo0, solo6)
+    # ...and even when da is in a touching pair, its FAR rim (away from db, x≈10-15) is untouched
+    assert np.array_equal(d6[:, :16], d0[:, :16])
 
 
 def test_seg_mask_gt_through_dataset(tmp_path):

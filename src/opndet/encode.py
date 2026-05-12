@@ -475,17 +475,18 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
            same footprint). Still hits exactly 0 at the boundary, so touching-but-not-
            overlapping objects keep a 0 valley between them and separate cleanly.
 
-    `cfg.seg_instance_gap_px` (default 0, masks source only): erode each instance mask by
-      ~gap/2 px before the distance transform → the GT has a guaranteed ≥gap-wide 0-corridor
-      between any two touching instances, so the model learns to keep them apart and a plain
-      threshold + connected-components decode (no watershed) separates them. Costs a ~gap/2-px
-      shrink of each object's apparent area (small vs the edge ramp; bias is toward under-).
+    `cfg.seg_instance_gap_px` (default 0, masks source only): carve a ~gap-wide 0-corridor
+      ONLY along contact lines between *different* instances (a fg pixel with a 4-neighbour of
+      another instance, dilated by ~gap/2) → the GT has a guaranteed gap between any two touching
+      instances, so the model learns to keep them apart and a plain threshold + connected-
+      components decode (no watershed) separates them. An ISOLATED object keeps its full edge —
+      only the contact sides shrink (~gap/2 px there).
 
     Sources, in priority order:
-      - `masks`: list of HxW binary instance masks (at image res). Each → (optional erode) →
-        its L2 distance-transform, then `dt/dt.max()` (proportional) or `clip(dt/ramp_px,0,1)`
-        (flat-top). Handles arbitrary convex shapes; max-aggregated across instances ⇒
-        exactly 0 between two touching ones (no bleed across the contact line).
+      - `masks`: list of HxW binary instance masks (at image res). Each → (optional contact
+        carve) → its L2 distance-transform, then `dt/dt.max()` (proportional) or
+        `clip(dt/ramp_px,0,1)` (flat-top). Handles arbitrary convex shapes; max-aggregated
+        across instances ⇒ exactly 0 between two touching ones (no bleed across the contact line).
       - `obbs`: [N,5] of (cx,cy,w,h,θ) in image px ⇒ the elliptical dome
         (`_draw_rotated_dome`, same two profiles) per box, at seg res. The fallback when
         only OBB sidecars exist (an egg's egg-ellipse is a decent stand-in for its mask).
@@ -495,22 +496,37 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
     ramp = float(getattr(cfg, "seg_dome_ramp_px", 0.0) or 0.0)
     ramp_d = max(ramp / st, 1e-3) if ramp > 0.0 else 0.0     # ramp width in seg-res cells
     gap = float(getattr(cfg, "seg_instance_gap_px", 0.0) or 0.0)
-    gap_r = int(round(gap / st / 2.0)) if gap > 0.0 else 0   # erosion radius in seg-res cells
+    gap_r = int(round(gap / st / 2.0)) if gap > 0.0 else 0   # contact-carve radius in seg-res cells
     Hd, Wd = int(cfg.img_h) // st, int(cfg.img_w) // st
     dome = np.zeros((Hd, Wd), dtype=np.float32)
     if masks is not None and len(masks) > 0:
         import cv2 as _cv2
-        gap_kernel = np.ones((2 * gap_r + 1, 2 * gap_r + 1), np.uint8) if gap_r > 0 else None
+        bms: list[np.ndarray] = []
         for mk in masks:
-            m = (np.asarray(mk) > 0).astype(np.uint8)
+            m = (np.asarray(mk) > 0)
             if m.shape != (Hd, Wd):
-                m = _cv2.resize(m, (Wd, Hd), interpolation=_cv2.INTER_NEAREST)
-            m = np.ascontiguousarray(m)
-            if gap_kernel is not None:
-                m = _cv2.erode(m, gap_kernel)
-            if int(m.sum()) == 0:
+                m = _cv2.resize(m.astype(np.uint8), (Wd, Hd), interpolation=_cv2.INTER_NEAREST) > 0
+            bms.append(np.ascontiguousarray(m))
+        if gap_r > 0 and len(bms) > 1:
+            # carve the inter-instance contact corridor (NOT a uniform erosion — isolated edges
+            # keep full size). Boundary = a fg pixel adjacent to a *different* nonzero label;
+            # dilate it by gap_r → ~gap-wide 0-strip centred on every contact line.
+            lab = np.zeros((Hd, Wd), np.int32)
+            for i, m in enumerate(bms):
+                lab[m] = i + 1
+            bnd = np.zeros((Hd, Wd), bool)
+            hd = (lab[:, :-1] != lab[:, 1:]) & (lab[:, :-1] > 0) & (lab[:, 1:] > 0)
+            bnd[:, :-1] |= hd; bnd[:, 1:] |= hd
+            vd = (lab[:-1, :] != lab[1:, :]) & (lab[:-1, :] > 0) & (lab[1:, :] > 0)
+            bnd[:-1, :] |= vd; bnd[1:, :] |= vd
+            if bnd.any():
+                corridor = _cv2.dilate(bnd.astype(np.uint8), np.ones((2 * gap_r + 1, 2 * gap_r + 1), np.uint8)) > 0
+                bms = [m & ~corridor for m in bms]
+        for m in bms:
+            mu = np.ascontiguousarray(m.astype(np.uint8))
+            if int(mu.sum()) == 0:
                 continue
-            dt = _cv2.distanceTransform(m, _cv2.DIST_L2, 5)
+            dt = _cv2.distanceTransform(mu, _cv2.DIST_L2, 5)
             if ramp_d > 0.0:
                 np.maximum(dome, np.clip(dt / ramp_d, 0.0, 1.0).astype(np.float32), out=dome)
             else:
