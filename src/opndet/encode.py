@@ -522,11 +522,19 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
             if bnd.any():
                 corridor = _cv2.dilate(bnd.astype(np.uint8), np.ones((2 * gap_r + 1, 2 * gap_r + 1), np.uint8)) > 0
                 bms = [m & ~corridor for m in bms]
+        # Pad the canvas before the distance transform with the EDGE replicated, then crop back:
+        # a mask that runs to the array border (a frame-clipped object, or one against the
+        # letterbox pad) would otherwise see that border as "background" and get a fake ramp on
+        # that side — i.e. the clipped edge would read ~ramp_px in. REPLICATE = "the object keeps
+        # going past the edge", so the clipped edge stays ≈1. (Background at the border → still
+        # background → no change.)
+        bw = max(2, int(np.ceil(ramp_d)) + 1 if ramp_d > 0.0 else 2)
         for m in bms:
             mu = np.ascontiguousarray(m.astype(np.uint8))
             if int(mu.sum()) == 0:
                 continue
-            dt = _cv2.distanceTransform(mu, _cv2.DIST_L2, 5)
+            mp = _cv2.copyMakeBorder(mu, bw, bw, bw, bw, _cv2.BORDER_REPLICATE)
+            dt = _cv2.distanceTransform(mp, _cv2.DIST_L2, 5)[bw:-bw, bw:-bw]
             if ramp_d > 0.0:
                 np.maximum(dome, np.clip(dt / ramp_d, 0.0, 1.0).astype(np.float32), out=dome)
             else:

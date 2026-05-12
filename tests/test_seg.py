@@ -154,6 +154,19 @@ def test_encode_seg_instance_gap():
     assert np.array_equal(d6[:, :16], d0[:, :16])
 
 
+def test_encode_seg_clipped_edge_not_ramped():
+    import cv2
+    from opndet.encode import encode_targets_seg
+    class S(_Shim):
+        seg_dome_ramp_px = 3
+    # a disk centered at (96,25) r=40 → extends to y=-15 → clipped at the frame top (rows <0 gone)
+    m = np.zeros((128, 192), np.uint8); cv2.circle(m, (96, 25), 40, 1, -1)
+    dome = encode_targets_seg(S(), masks=[m])["dome"][0].numpy()
+    assert dome[0, 96] > 0.9, "the clipped frame-edge row stays saturated (object continues past the edge), not ramped"
+    assert 0.0 < dome[64, 96] < 1.0, "the real curved edge (y≈65) still has the ~3px ramp"
+    assert dome[70, 96] == 0.0, "outside the disk → 0"
+
+
 def test_seg_mask_gt_through_dataset(tmp_path):
     import cv2
     from opndet.dataset import OpndetDataset, Sample
