@@ -167,6 +167,35 @@ def test_encode_seg_clipped_edge_not_ramped():
     assert dome[70, 96] == 0.0, "outside the disk → 0"
 
 
+def test_seg_coco_polygon_gt_through_dataset(tmp_path):
+    import json
+    import cv2
+    from opndet.dataset import OpndetDataset, load_coco_single_class
+    from opndet.encode import encode_targets_seg
+    img = (np.random.default_rng(0).random((80, 100, 3)) * 255).astype(np.uint8)
+    img_dir = tmp_path / "imgs"; img_dir.mkdir()
+    cv2.imwrite(str(img_dir / "a.png"), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    # two square instances via COCO polygon `segmentation`
+    poly1 = [10, 20, 35, 20, 35, 55, 10, 55]   # x,y,x,y,... (a 25x35 box)
+    poly2 = [60, 20, 88, 20, 88, 55, 60, 55]
+    coco = {"images": [{"id": 1, "file_name": "a.png", "width": 100, "height": 80}],
+            "annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [10, 20, 25, 35], "segmentation": [poly1]},
+                            {"id": 2, "image_id": 1, "category_id": 0, "bbox": [60, 20, 28, 35], "segmentation": [poly2]}],
+            "categories": [{"id": 0, "name": "obj"}]}
+    cp = tmp_path / "ann.json"; cp.write_text(json.dumps(coco))
+    samps = load_coco_single_class(cp, img_dir)
+    assert len(samps) == 1 and samps[0].coco_segs is not None and len(samps[0].coco_segs) == 2
+    class _Cfg:
+        img_h = 64; img_w = 64; seg_stride = 1; seg_dome_ramp_px = 0; seg_instance_gap_px = 0
+    def _enc(boxes, obbs=None, masks=None):
+        return encode_targets_seg(_Cfg(), masks=masks)
+    _enc._takes_masks = True
+    ds = OpndetDataset(samps, 64, 64, augment_fn=None, encode_fn=_enc, mosaic_prob=0.0)
+    assert ds._has_masks
+    dome = ds[0][2]["dome"][0].numpy()
+    assert dome.shape == (64, 64) and dome.max() > 0.99 and int((dome > 0).sum()) > 80
+
+
 def test_seg_mask_gt_through_dataset(tmp_path):
     import cv2
     from opndet.dataset import OpndetDataset, Sample

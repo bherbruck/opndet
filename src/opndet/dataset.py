@@ -25,6 +25,8 @@ class Sample:
     img_h: int
     obbs: np.ndarray | None = None  # [N, 5] (cx, cy, w, h, theta) in px+rad; None = AABB-only
     mask_path: Path | None = None   # <mask_dir>/<stem>.png instance-id label map (0=bg, k=instance k); None = none
+    coco_segs: list | None = None   # per-instance COCO `segmentation` (polygon lists [[x,y,...],...] or RLE dict),
+                                    #   image-px, aligned with `boxes`; rasterized to an instance-label map in __getitem__
 
 
 def _load_obbs_for_image(obb_dir: Path, image_path: Path, img_w: int, img_h: int) -> np.ndarray | None:
@@ -61,6 +63,10 @@ def load_coco_single_class(coco_path: str | Path, image_root: str | Path,
     If mask_dir is given, looks up `<mask_dir>/<stem>.png` instance-id label maps
     (0 = bg, pixel value k = instance k; what `opndet sam-seg` writes) and attaches
     the path (lazily loaded in __getitem__). Missing → Sample.mask_path=None.
+
+    COCO `segmentation` (polygons or RLE) on the annotations is also read into
+    `Sample.coco_segs` (aligned with `boxes`) — the seg head can train directly off these,
+    no `sam-seg`/`sam-obb` preprocessing needed.
     """
     coco_path = Path(coco_path)
     image_root = Path(image_root)
@@ -71,6 +77,7 @@ def load_coco_single_class(coco_path: str | Path, image_root: str | Path,
 
     images_by_id = {im["id"]: im for im in coco["images"]}
     boxes_by_image: dict[int, list[list[float]]] = {im_id: [] for im_id in images_by_id}
+    segs_by_image: dict[int, list] = {im_id: [] for im_id in images_by_id}
     for ann in coco["annotations"]:
         if ann.get("iscrowd", 0):
             continue
@@ -78,6 +85,13 @@ def load_coco_single_class(coco_path: str | Path, image_root: str | Path,
         if w <= 0 or h <= 0:
             continue
         boxes_by_image[ann["image_id"]].append([x, y, x + w, y + h])
+        seg = ann.get("segmentation")
+        # polygons come as [[x,y,...], ...] (one or more rings); RLE as {"counts":..,"size":..}; drop empties
+        if isinstance(seg, list) and not (len(seg) and isinstance(seg[0], (int, float))):
+            seg = seg if any(len(p) >= 6 for p in seg) else None
+        elif not isinstance(seg, dict):
+            seg = None
+        segs_by_image[ann["image_id"]].append(seg)
 
     samples: list[Sample] = []
     for im_id, im in images_by_id.items():
@@ -90,9 +104,11 @@ def load_coco_single_class(coco_path: str | Path, image_root: str | Path,
         if mask_dir_p is not None:
             mp = mask_dir_p / (path.stem + ".png")
             mask_path = mp if mp.exists() else None
+        segs = segs_by_image[im_id]
+        coco_segs = segs if any(s is not None for s in segs) else None
         samples.append(Sample(image_path=path, boxes=boxes,
                               img_w=int(im["width"]), img_h=int(im["height"]),
-                              obbs=obbs, mask_path=mask_path))
+                              obbs=obbs, mask_path=mask_path, coco_segs=coco_segs))
     return samples
 
 
@@ -233,11 +249,12 @@ class OpndetDataset(Dataset):
         self._encode_takes_masks = bool(getattr(encode_fn, "_takes_masks", False))
         self._cur_obbs = None
         self._cur_masks = None
-        # Per-instance label-map masks (`opndet sam-seg`). Only relevant when the encoder
-        # consumes them (the seg head). If present, mosaic is disabled (the mosaic canvas
-        # builder doesn't composite masks) so the GT can't desync from the image.
+        # Per-instance seg GT (a `<stem>.png` instance-label sidecar from `opndet sam-seg`,
+        # OR rasterized from the COCO `segmentation` annotations). Only relevant when the
+        # encoder consumes masks (the seg head). If present, mosaic is disabled (the mosaic
+        # canvas builder doesn't composite masks) so the GT can't desync from the image.
         self._has_masks = bool(self._encode_takes_masks) and any(
-            getattr(s, "mask_path", None) is not None for s in self.samples)
+            getattr(s, "mask_path", None) is not None or getattr(s, "coco_segs", None) for s in self.samples)
         self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
         self.cache_images = cache_images
@@ -278,6 +295,37 @@ class OpndetDataset(Dataset):
         if m.ndim == 3:
             m = m[:, :, 0]
         return m.astype(np.int32, copy=False)
+
+    def _rasterize_coco_segs(self, s: "Sample") -> np.ndarray | None:
+        """Rasterize a Sample's COCO `segmentation` list (polygons and/or RLE, image-px,
+        aligned with s.boxes) into an instance-id label map [H,W] int32 (0=bg, k=instance k)."""
+        segs = getattr(s, "coco_segs", None)
+        if not segs:
+            return None
+        lbl = np.zeros((s.img_h, s.img_w), dtype=np.int32)
+        for i, seg in enumerate(segs):
+            if seg is None:
+                continue
+            if isinstance(seg, dict):  # RLE — needs pycocotools
+                try:
+                    from pycocotools import mask as _M  # type: ignore
+                except ImportError as e:
+                    raise RuntimeError("COCO RLE segmentation needs `pycocotools` (pip install pycocotools), "
+                                       "or re-export your dataset with polygon segmentation.") from e
+                m = _M.decode(seg)
+                lbl[m > 0] = i + 1
+            else:  # list of polygon rings: [[x,y,x,y,...], ...]
+                for ring in seg:
+                    pts = np.asarray(ring, dtype=np.float32).reshape(-1, 2)
+                    if pts.shape[0] >= 3:
+                        cv2.fillPoly(lbl, [np.round(pts).astype(np.int32)], int(i + 1))
+        return lbl
+
+    def _instance_label_map(self, s: "Sample") -> np.ndarray | None:
+        """Per-instance label map for the seg head: the `<stem>.png` sidecar if present,
+        else rasterized from the COCO `segmentation` annotations, else None."""
+        m = self._load_mask(getattr(s, "mask_path", None))
+        return m if m is not None else self._rasterize_coco_segs(s)
 
     def warm_cache(self, max_mb: float | None = None, workers: int | None = None) -> float:
         """Pre-decode every sample's RGB into `self._cache` (no-op if cache_images=False).
@@ -462,7 +510,7 @@ class OpndetDataset(Dataset):
             img = img.copy()
         boxes = s.boxes.copy()
         sample_obbs = s.obbs.copy() if getattr(s, "obbs", None) is not None else None
-        sample_mask = self._load_mask(getattr(s, "mask_path", None)) if self._has_masks else None
+        sample_mask = self._instance_label_map(s) if self._has_masks else None
         return self._finish(img, boxes, do_letterbox=True, obbs=sample_obbs, mask=sample_mask)
 
 

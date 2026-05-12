@@ -322,43 +322,38 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}  "
           f"seg head: dense dome, output [1,1,{img_h//seg_stride},{img_w//seg_stride}]")
 
-    # --- data: prefer per-instance masks (`opndet sam-seg`, true distance-transform dome);
-    #     fall back to OBB sidecars (`opndet sam-obb`, elliptical dome) if no mask_dir. ---
+    # --- data: GT shape source, in priority order — per-instance masks (a `<stem>.png` sidecar
+    #     from `opndet sam-seg`, OR rasterized from COCO `segmentation` polygons/RLE → true
+    #     distance-transform dome) > OBB sidecars (`opndet sam-obb` → elliptical-dome fallback). ---
     print("loading data ...")
     data_cfg = c.get("data", {}) or {}
     sources = data_cfg["sources"]
-    has_mask = any((s.get("mask_dir") if isinstance(s, dict) else None) for s in sources)
-    has_obb = any((s.get("obb_dir") if isinstance(s, dict) else None) for s in sources)
-    if not (has_mask or has_obb):
-        raise RuntimeError("bbox-*-seg needs GT shapes: run `opndet sam-seg` and set "
-                           "data.sources[*].mask_dir (true mask dome), or `opndet sam-obb` + "
-                           "data.sources[*].obb_dir (elliptical-dome fallback).")
     all_s = load_datasets(sources, image_filter=data_cfg.get("image_filter"))
     n_pre = len(all_s)
-    if has_mask:
-        kept = [s for s in all_s if getattr(s, "mask_path", None) is not None]
-        # boxes only used for aug clip / min_visible — keep the COCO AABBs (or OBB AABBs if also present)
-        for s in kept:
-            if getattr(s, "obbs", None) is not None and s.obbs.shape[0]:
+    has_seg = lambda s: getattr(s, "mask_path", None) is not None or bool(getattr(s, "coco_segs", None))
+    has_obb = lambda s: getattr(s, "obbs", None) is not None and s.obbs.shape[0] > 0
+    if any(has_seg(s) for s in all_s):
+        gt_src = "per-instance masks (sam-seg sidecars / COCO segmentation)"
+        all_s = [s for s in all_s if has_seg(s)]
+        for s in all_s:  # boxes are only for aug clip / min_visible — prefer OBB AABBs if present
+            if has_obb(s):
                 s.boxes = np.array([obb_to_aabb(*o) for o in s.obbs], dtype=np.float32)
-        all_s = kept
-        if not all_s:
-            raise RuntimeError("mask_dir set but no samples have a `<stem>.png` mask — run `opndet sam-seg` first.")
         if n_pre != len(all_s):
-            print(f"  dropped {n_pre - len(all_s)} samples without mask sidecars")
-    else:
-        kept = []
+            print(f"  dropped {n_pre - len(all_s)} samples with no mask / COCO-segmentation GT")
+    elif any(has_obb(s) for s in all_s):
+        gt_src = "OBB ellipses (sam-obb)"
+        all_s = [s for s in all_s if has_obb(s)]
         for s in all_s:
-            if getattr(s, "obbs", None) is None or s.obbs.shape[0] == 0:
-                continue
-            s.boxes = np.array([obb_to_aabb(*o) for o in s.obbs], dtype=np.float32)  # for aug clip/min-visible
-            kept.append(s)
-        all_s = kept
-        if not all_s:
-            raise RuntimeError("no samples have OBB sidecars — run `opndet sam-obb` first.")
+            s.boxes = np.array([obb_to_aabb(*o) for o in s.obbs], dtype=np.float32)
         if n_pre != len(all_s):
             print(f"  dropped {n_pre - len(all_s)} samples without OBB sidecars")
-    print(f"  GT source: {'per-instance masks (sam-seg)' if has_mask else 'OBB ellipses (sam-obb)'}")
+    else:
+        raise RuntimeError("bbox-*-seg needs GT shapes: a COCO json with `segmentation` polygons, "
+                           "or `opndet sam-seg` masks (data.sources[*].mask_dir), or `opndet sam-obb` "
+                           "OBBs (data.sources[*].obb_dir, elliptical-dome fallback).")
+    if not all_s:
+        raise RuntimeError("no samples have usable GT shapes — check your COCO segmentation / mask_dir / obb_dir.")
+    print(f"  GT source: {gt_src}")
     ratios = tuple(data_cfg.get("split_ratios", (0.8, 0.1, 0.1)))
     train_s, val_s, test_s = split_samples(all_s, ratios=ratios, seed=seed)
     print(f"total samples: {len(all_s)}   split: train={len(train_s)} val={len(val_s)} test={len(test_s)}")
