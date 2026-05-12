@@ -18,7 +18,7 @@ def _export(m, x, path):
 
 
 # ---- 1. preset builds, forwards [1,1,H,W], exports opset-13 edge-clean, ORT==PT ----
-@pytest.mark.parametrize("preset", ["bbox-f-seg", "bbox-n-seg", "bbox-s-seg"])
+@pytest.mark.parametrize("preset", ["bbox-f-seg", "bbox-p-seg", "bbox-n-seg", "bbox-s-seg", "bbox-m-seg"])
 def test_seg_preset_builds_and_exports_opset13(preset):
     m = build_model_from_yaml(resolve(preset)).eval()
     c, h, w = m.input_shape

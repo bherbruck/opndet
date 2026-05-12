@@ -242,6 +242,7 @@ def _cmd_sam_obb(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         save_rejected=args.save_rejected,
+        image_filter=args.filter,
     )
     print(f"processed={stats.n_images_processed} skipped={stats.n_images_skipped} "
           f"obj={stats.n_objects_processed} obb={stats.n_obb_extracted} "
@@ -469,6 +470,12 @@ def main(argv: list[str] | None = None) -> int:
                      help="Per-rule cap on rejected-OBB diagnostic previews saved to "
                           "<out>/_rejected/ (default: 16; 0 to disable). Each preview is a "
                           "3-panel image: AABB prompt | SAM mask | candidate OBB.")
+    pso.add_argument("--filter", default=None,
+                     help="Optional text file of image names (one per line, basename or stem, "
+                          "`#`-comments ok) — same format as data.image_filter in train.yaml. "
+                          "When given, SAM only runs on those images, so you don't waste GPU on "
+                          "images you won't train on. (Idempotency still applies: existing *.txt "
+                          "outputs are skipped regardless.)")
     pso.set_defaults(func=_cmd_sam_obb)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")

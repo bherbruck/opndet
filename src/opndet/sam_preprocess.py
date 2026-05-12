@@ -427,7 +427,8 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
         sam_model: str = "sam2_b", device: str = "cuda",
         max_images: int | None = None,
         batch_size: int = 8, num_workers: int = 8,
-        save_rejected: int = 16) -> RunStats:
+        save_rejected: int = 16,
+        image_filter: str | Path | None = None) -> RunStats:
     coco_json = Path(coco_json)
     images_dir = Path(images_dir)
     out_dir = Path(out_dir)
@@ -450,6 +451,18 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
     t0 = time.time()
 
     items = list(images_by_id.items())
+    if image_filter is not None:
+        from opndet.dataset import _read_image_filter
+        match, n_entries = _read_image_filter(image_filter)
+        if not match:
+            print(f"  image_filter {image_filter}: empty — processing all {len(items)} images")
+        else:
+            kept = [(iid, im) for (iid, im) in items
+                    if Path(im["file_name"]).name in match or Path(im["file_name"]).stem in match]
+            print(f"  image_filter {image_filter}: {n_entries} entries → SAM will run on {len(kept)}/{len(items)} images")
+            if not kept:
+                raise ValueError(f"image_filter {image_filter} matched 0 of this COCO's images — check the names")
+            items = kept
     if max_images is not None:
         items = items[:max_images]
 

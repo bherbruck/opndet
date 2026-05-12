@@ -179,8 +179,10 @@ PER_SIZE: dict[str, dict[str, Any]] = {
     # dome rendered from `opndet sam-obb` sidecars; needs data.sources[*].obb_dir.
     # Trained by the dedicated loop in train_seg.py (auto-dispatched).
     "bbox-f-seg": {"lr": 3.0e-3, "batch_size": 128, "augment": _AUG_LIGHT},
+    "bbox-p-seg": {"lr": 3.0e-3, "batch_size": 128, "augment": _AUG_LIGHT},
     "bbox-n-seg": {"lr": 3.0e-3, "batch_size": 64,  "augment": _AUG_MEDIUM},
     "bbox-s-seg": {"lr": 2.5e-3, "batch_size": 32,  "augment": _AUG_FULL},
+    "bbox-m-seg": {"lr": 2.0e-3, "batch_size": 16,  "warmup_steps": 400, "augment": _AUG_FULL},
 }
 
 
