@@ -467,12 +467,13 @@ def evaluate(model, loader, cfg_shim: _CfgShim, device: torch.device,
             "angle_err_le_30_frac": float(ang_err_le_30_frac)}
 
 
-def _bundle_run(out_dir: Path, include_tb: bool = False) -> Path | None:
-    """Zip the run dir at end of training. Skips tfevents by default (huge). On Colab, also
-    triggers a browser download. Returns the zip path."""
+def _bundle_run(out_dir: Path, include_tb: bool = False, include_vis: bool = False) -> Path | None:
+    """Zip the run dir at end of training. Skips tfevents (huge) and the vis/ PNGs (dashboard
+    artifacts served live — pointless in a download) by default. On Colab, also triggers a
+    browser download. Returns the zip path."""
     import zipfile
     bundle = out_dir.parent / f"{out_dir.name}.zip"
-    skipped_tb = 0
+    skipped_tb = skipped_vis = 0
     n = 0
     try:
         with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
@@ -480,15 +481,24 @@ def _bundle_run(out_dir: Path, include_tb: bool = False) -> Path | None:
                 if not f.is_file():
                     continue
                 rel = f.relative_to(out_dir)
-                if not include_tb and rel.parts and rel.parts[0] == "tb":
+                top = rel.parts[0] if rel.parts else ""
+                if not include_tb and top == "tb":
                     skipped_tb += 1
+                    continue
+                if not include_vis and top == "vis":
+                    skipped_vis += 1
                     continue
                 z.write(f, rel)
                 n += 1
         sz_mb = bundle.stat().st_size / 1024 / 1024
         msg = f"bundled run -> {bundle} ({sz_mb:.1f} MB, {n} files"
+        skips = []
         if not include_tb:
-            msg += f", skipped {skipped_tb} tb events — pass bundle_include_tb: true to include"
+            skips.append(f"{skipped_tb} tb events")
+        if not include_vis:
+            skips.append(f"{skipped_vis} vis PNGs")
+        if skips:
+            msg += f", skipped {' + '.join(skips)} — bundle_include_tb / bundle_include_vis: true to include"
         msg += ")"
         print(msg)
     except Exception as e:
@@ -519,7 +529,9 @@ def _download_run(out_dir: Path, c: dict) -> None:
       "best"   (default) — just `<name>_best.pt` + `metrics.duckdb` (the things you actually
                  want off the box; the run dir's vis/ PNGs are dashboard artifacts served live,
                  not worth GB of zip).
-      "bundle"          — zip the whole run dir (minus tb/) and download it (the old behaviour).
+      "bundle"          — zip the run dir (minus tb/ and vis/ — i.e. ckpts + metrics.duckdb +
+                 config + eval reports) and download it. `bundle_include_vis: true` adds the
+                 vis PNGs back; `bundle_include_tb: true` adds tfevents.
       "none"            — download nothing (the run stays on the box's disk).
     Back-compat: if `download` is absent but `auto_bundle` is set, true→"bundle", false→"none"."""
     if "download" in c:
@@ -531,7 +543,8 @@ def _download_run(out_dir: Path, c: dict) -> None:
     if mode == "none":
         return
     if mode == "bundle":
-        _bundle_run(out_dir, include_tb=bool(c.get("bundle_include_tb", False)))
+        _bundle_run(out_dir, include_tb=bool(c.get("bundle_include_tb", False)),
+                    include_vis=bool(c.get("bundle_include_vis", False)))
         return
     # mode == "best"
     targets: list[Path] = []
