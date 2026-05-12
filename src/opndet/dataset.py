@@ -249,6 +249,27 @@ class OpndetDataset(Dataset):
             self._cache[idx] = img
         return img
 
+    def warm_cache(self, max_mb: float | None = None) -> float:
+        """Pre-decode every sample's RGB into `self._cache` (no-op if cache_images=False).
+        Returns the total MB cached. Call this in the MAIN process BEFORE building a
+        multi-worker DataLoader: the forked workers then inherit the fully-populated cache
+        via copy-on-write — ONE shared, bounded, never-growing copy — instead of each worker
+        filling its OWN `_cache` toward the whole dataset over epochs (≈num_workers× the
+        dataset in RAM, growing every epoch: the "RAM rising by gigs/epoch" leak). `max_mb`
+        caps it: once the cached arrays would exceed it, stop (the rest decode on the fly).
+        """
+        if not self.cache_images:
+            return 0.0
+        budget = float("inf") if max_mb is None else float(max_mb) * 1e6
+        used = sum(a.nbytes for a in self._cache.values())
+        for idx, s in enumerate(self.samples):
+            if used >= budget:
+                break
+            if idx in self._cache:
+                continue
+            used += self._load_rgb(idx, s.image_path).nbytes
+        return used / 1e6
+
     def _mosaic(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
         """4-image mosaic. Output dims = (img_h, img_w). Each quadrant filled by one
         sample, scaled to fit. Boxes transformed and filtered by min_visible_frac.

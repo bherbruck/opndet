@@ -651,13 +651,19 @@ class SegDomeLoss(nn.Module):
 
     Target: a per-pixel dome ∈ [0,1] — 1.0 at each convex object's deepest interior
     point, ~linear ramp to 0 at its boundary, 0 elsewhere (encode_targets_seg).
-      l_qfl  : Quality-Focal-Loss regression toward the soft dome value-for-value
-               (the model learns the *shape*, with focal downweighting of pixels it
-               already gets right). Same QFL used by the cls heads.
-      l_dice : soft Dice on the foreground — sigmoid(logit) vs (dome > fg_thresh).
-               Pushes the *area* / boundary to be right; per-pixel QFL alone is
-               weak there (the boundary is a thin set, easy to ignore in a sum).
-      loss = w_qfl·l_qfl + w_dice·l_dice
+      l_qfl  : Quality-Focal regression toward the soft dome value-for-value (the model
+               learns the *shape*, with `|target−p|^β` focal downweighting of pixels it
+               already gets right) — reduced as a per-pixel **mean** (≈ O(0..2)). This is
+               deliberately NOT the detector's `quality_focal_loss`, which divides the
+               sum-over-pixels by the count of exact-1.0 cells: fine for a SPARSE heatmap,
+               but on a dense dome that's ≈ (H·W/n_obj)·meanloss ≈ hundreds, which dwarfs
+               the Dice term ~10000:1 so `w_dice` would be a no-op. With a per-pixel mean,
+               l_qfl and l_dice are the same order → `w_qfl=w_dice=1` is genuinely balanced.
+               (Adam normalises the overall scale, so the printed `loss` shrinking from
+               ~hundreds to ~1 does NOT change the effective step / need an LR re-tune.)
+      l_dice : soft Dice on the foreground — sigmoid(logit) vs (dome > fg_thresh) — pulls
+               the boundary/extent right and punishes false-positive pixels.
+      loss = w_qfl·l_qfl + w_dice·l_dice   (both ≈ O(0..1), so the weights are real)
     """
 
     def __init__(self, qfl_beta: float = 2.0, w_qfl: float = 1.0, w_dice: float = 1.0,
@@ -672,13 +678,14 @@ class SegDomeLoss(nn.Module):
         dome = target["dome"]
         if dome.dim() == raw_logit.dim() - 1:
             dome = dome.unsqueeze(1)
-        l_qfl = quality_focal_loss(raw_logit, dome.clamp(0.0, 1.0), beta=self.qfl_beta)
+        dome = dome.clamp(0.0, 1.0)
         p = torch.sigmoid(raw_logit)
+        bce = F.binary_cross_entropy_with_logits(raw_logit, dome, reduction="none")
+        l_qfl = ((dome - p).abs().pow(self.qfl_beta) * bce).mean()        # per-pixel mean, ≈ O(0..2)
         t = (dome > self.fg_thresh).to(p.dtype)
         dims = tuple(range(1, p.dim()))
         inter = (p * t).sum(dim=dims)
         denom = p.sum(dim=dims) + t.sum(dim=dims)
-        dice = (2.0 * inter + 1.0) / (denom + 1.0)
-        l_dice = (1.0 - dice).mean()
+        l_dice = (1.0 - (2.0 * inter + 1.0) / (denom + 1.0)).mean()       # ≈ O(0..1)
         loss = self.w_qfl * l_qfl + self.w_dice * l_dice
         return {"loss": loss, "l_qfl": l_qfl.detach(), "l_dice": l_dice.detach()}

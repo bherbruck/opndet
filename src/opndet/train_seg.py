@@ -349,19 +349,27 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         dl_kw["prefetch_factor"] = pf; dl_kw["persistent_workers"] = True
     bs = int(c["batch_size"])
     cache_imgs = bool(c.get("cache_images", False))
-    if cache_imgs and nw > 0:
-        # Each persistent worker gets its OWN OpndetDataset → its OWN image cache, and with a
-        # reshuffling sampler each worker's cache accumulates toward the FULL dataset over epochs
-        # → effective RAM ≈ num_workers × dataset → the "RAM constantly rising" / OOM. Caching only
-        # makes sense single-process. (TODO: a shared-memory image cache would fix this properly.)
-        print(f"  cache_images=true ignored: num_workers={nw}>0 → it'd be {nw} separate caches growing to "
-              f"~{nw}× the dataset in RAM. Set num_workers: 0 to use caching, or leave it off.")
-        cache_imgs = False
     common = dict(img_h=img_h, img_w=img_w, encode_fn=_seg_encode, cache_images=cache_imgs,
                   in_ch=in_ch, stride=int(_mc.get("stride", 4)))
     train_ds = OpndetDataset(train_s, augment_fn=make_augment(aug_cfg), mosaic_prob=mosaic_p, min_visible_frac=min_vis, **common)
     val_ds   = OpndetDataset(val_s,   augment_fn=None, mosaic_prob=0.0, min_visible_frac=min_vis, **common)
     test_ds  = OpndetDataset(test_s,  augment_fn=None, mosaic_prob=0.0, min_visible_frac=min_vis, **common)
+    if cache_imgs:
+        # Pre-decode every image into the cache HERE, in the main process, before the DataLoader
+        # forks its workers — so the workers inherit ONE shared, fully-populated, never-growing copy
+        # (copy-on-write) instead of each worker filling its own cache toward the whole dataset over
+        # epochs (≈num_workers× the dataset in RAM, growing every epoch — the leak). Total capped by
+        # cache_max_mb (default 32 GB), split across train/val/test.
+        rem = float(c.get("cache_max_mb", 32768))
+        n_imgs = 0
+        for d in (train_ds, val_ds, test_ds):
+            mb = d.warm_cache(max_mb=max(0.0, rem))
+            rem -= mb; n_imgs += len(d._cache)
+        cached_mb = float(c.get("cache_max_mb", 32768)) - max(0.0, rem)
+        n_tot = len(train_s) + len(val_s) + len(test_s)
+        print(f"  cache_images: pre-decoded {n_imgs}/{n_tot} images (~{cached_mb/1024:.1f} GB, shared via "
+              f"copy-on-write across {nw} workers)" + ("" if n_imgs >= n_tot else
+              f" — hit the cache_max_mb={c.get('cache_max_mb', 32768)} budget; the rest decode on the fly"))
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, drop_last=True, **dl_kw)
     val_loader   = DataLoader(val_ds,   batch_size=bs, shuffle=False, **dl_kw)
     test_loader  = DataLoader(test_ds,  batch_size=bs, shuffle=False, **dl_kw)
