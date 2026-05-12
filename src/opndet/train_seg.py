@@ -40,8 +40,22 @@ class _SegCfgShim:
         self.img_h, self.img_w, self.seg_stride = int(img_h), int(img_w), int(seg_stride)
 
 
-def _match_count_area(pred_blobs, gt_blobs):
-    """Greedy nearest-centroid match → (count_abs_err, list of |a_pred-a_gt|/a_gt)."""
+def _touches_edge(blob, H: int, W: int, margin: float) -> bool:
+    """True if the blob's AABB comes within `margin·dim` of any frame edge — i.e. it's
+    a clipped/partial object. margin <= 0 → only literal-border touch (>=1px in)."""
+    mx = max(1.0, margin * W) if margin > 0 else 1.0
+    my = max(1.0, margin * H) if margin > 0 else 1.0
+    return blob.x1 <= mx or blob.y1 <= my or blob.x2 >= (W - mx) or blob.y2 >= (H - my)
+
+
+def _match_count_area(pred_blobs, gt_blobs, H: int, W: int, edge_margin: float = 0.0):
+    """Greedy nearest-centroid match → (count_abs_err, list of |a_pred-a_gt|/a_gt).
+
+    Edge leniency: a GT egg whose bbox touches within `edge_margin·dim` of the frame is
+    a clipped partial — its visible area isn't a meaningful measurement — so it (and its
+    matched pred) is skipped for the area-MAPE list. It still counts toward count_abs_err
+    (you still want to know if the model missed/hallucinated an edge egg).
+    """
     n_err = abs(len(pred_blobs) - len(gt_blobs))
     if not gt_blobs or not pred_blobs:
         return n_err, []
@@ -57,12 +71,14 @@ def _match_count_area(pred_blobs, gt_blobs):
                 bd, best = d, i
         if best >= 0 and bd <= (max(8.0, math.sqrt(max(g.area_px, 1.0)))) ** 2:
             used.add(best)
+            if _touches_edge(g, H, W, edge_margin) or _touches_edge(pred_blobs[best], H, W, edge_margin):
+                continue   # clipped object → area is unmeasurable; don't ding the model on it
             apes.append(abs(pred_blobs[best].area_px - g.area_px) / max(g.area_px, 1.0))
     return n_err, apes
 
 
 @torch.no_grad()
-def evaluate_seg(model, loader, device, fg_thresh: float = 0.5) -> dict:
+def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: float = 0.0) -> dict:
     model.eval()
     inter = denom = inter_i = union_i = 0.0
     n_imgs = 0
@@ -79,11 +95,12 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5) -> dict:
         inter += float((pf * tf).sum()); denom += float(pf.sum() + tf.sum())
         inter_i += float((pf * tf).sum()); union_i += float(((pf + tf) > 0).float().sum())
         pn = p.cpu().numpy(); tn = dome_t.cpu().numpy()
+        Hd, Wd = pn.shape[2], pn.shape[3]
         for b in range(pn.shape[0]):
             n_imgs += 1
             pb = decode_seg(pn[b, 0], threshold=fg_thresh, min_area=4)
             gb = decode_seg(tn[b, 0], threshold=fg_thresh, min_area=4)
-            ne, apes = _match_count_area(pb, gb)
+            ne, apes = _match_count_area(pb, gb, Hd, Wd, edge_margin)
             count_errs.append(ne); area_apes.extend(apes)
     dice = (2.0 * inter) / max(denom, 1e-9)
     iou = inter_i / max(union_i, 1e-9)
@@ -96,38 +113,116 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5) -> dict:
     }
 
 
-def _seg_vis(model, val_ds, run_dir: Path, ep: int, n: int, device, fg_thresh: float = 0.5, db=None) -> None:
-    """Per-epoch vis: stable RGB once per sample + predicted & GT dome heatmaps per epoch.
-    Also registers them in the DuckDB store (tag `val/seg`, overlay kinds `dome_pred`
-    / `dome_gt`) so the `opndet dashboard` image view shows seg runs."""
+# Distinct, colourblind-ish per-instance colours (RGB).
+_SEG_PALETTE = [(86, 180, 233), (230, 159, 0), (0, 158, 115), (213, 94, 0), (204, 121, 167),
+                (240, 228, 66), (0, 114, 178), (160, 200, 120), (200, 120, 180), (120, 160, 220),
+                (233, 86, 120), (130, 200, 200), (200, 170, 90), (170, 120, 220), (90, 200, 130)]
+_SEG_BODY_ALPHA = 130     # translucent fill — you see the object through it
+_SEG_BORDER_ALPHA = 255   # crisp same-hue rim. Flip these two if you want a fainter border.
+
+
+def _render_seg_decoded(dome: np.ndarray, thr: float = 0.5, min_area: int = 4,
+                        edge_margin: float = 0.0) -> np.ndarray:
+    """Decode a [H,W] dome → an RGBA (BGRA, for cv2.imwrite) overlay: each connected
+    component filled with a distinct colour at `body_alpha`, its contour drawn in the
+    SAME hue at `border_alpha`, a `<N>px` area label + centroid dot. Transparent
+    elsewhere. The "instance segmentation" view (vs the raw `dome` heatmap); the
+    dashboard's overlay-opacity slider scales the whole thing — same machinery as the
+    other overlays. Blobs touching within `edge_margin·dim` of the frame (clipped
+    partials) get a thin border + an `·E` tag (their area isn't a real measurement)."""
+    import cv2
+    H, W = dome.shape
+    fg = (dome >= float(thr)).astype(np.uint8)
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(fg, connectivity=4)
+    canvas = np.zeros((H, W, 4), dtype=np.uint8)   # BGRA
+    mx = max(1.0, edge_margin * W) if edge_margin > 0 else 1.0
+    my = max(1.0, edge_margin * H) if edge_margin > 0 else 1.0
+    for lab in range(1, n):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        x, y = int(stats[lab, cv2.CC_STAT_LEFT]), int(stats[lab, cv2.CC_STAT_TOP])
+        w, h = int(stats[lab, cv2.CC_STAT_WIDTH]), int(stats[lab, cv2.CC_STAT_HEIGHT])
+        edge = x <= mx or y <= my or (x + w) >= (W - mx) or (y + h) >= (H - my)
+        r, g, b = _SEG_PALETTE[(lab - 1) % len(_SEG_PALETTE)]
+        m = labels == lab
+        canvas[m] = (b, g, r, _SEG_BODY_ALPHA)
+        cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        rim = np.zeros((H, W, 4), dtype=np.uint8)
+        cv2.drawContours(rim, cnts, -1, (b, g, r, _SEG_BORDER_ALPHA), 1 if edge else 2)
+        rmask = rim[:, :, 3] > 0
+        canvas[rmask] = rim[rmask]
+        cx, cy = int(round(cents[lab, 0])), int(round(cents[lab, 1]))
+        cv2.circle(canvas, (cx, cy), 2, (b, g, r, 255), -1)
+        cv2.putText(canvas, f"{area}px{'·E' if edge else ''}", (cx + 4, cy - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (b, g, r, 255), 1, cv2.LINE_AA)
+    return canvas
+
+
+def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/seg",
+             fg_thresh: float = 0.5, edge_margin: float = 0.0, db=None) -> None:
+    """Vis for the seg head, on the samples of `ds`, registered under `tag` (e.g. `val/seg`,
+    `test/seg`). Per sample:
+      base    : sample_<i>_rgb.png         — the clean letterboxed RGB (written ONCE)
+      overlay : dome_pred / dome_gt        — the dome as a TURBO heatmap (pred: this epoch; gt: once)
+      overlay : seg_pred  / seg_gt         — the DECODED instance view: filled blobs + same-hue
+                                             borders + per-blob `<N>px` area (pred: this epoch; gt: once)
+      boxes   : kind pred / gt             — per-blob AABB + score=peak + meta {area_px, cx, cy}
+    Files go under vis/<tag-with-_>/ ; the dashboard auto-discovers the overlay kinds and its
+    overlay-opacity slider scales them (same as obj_heat / prior_heat). GT is deterministic
+    (no aug on val/test) → written once to a stable path, re-referenced each call. Only the
+    caller decides *when* to run this (the loop runs it on a new-best epoch — see train_seg)."""
     import cv2
 
+    from opndet.decode import decode_seg
     from opndet.visualize import _denorm, save_heatmap_overlay_png
-    shared = run_dir / "vis" / "seg"
+    shared = run_dir / "vis" / tag.replace("/", "_")
     epdir = shared / f"ep_{ep:03d}"
     epdir.mkdir(parents=True, exist_ok=True)
     model.eval()
     with torch.no_grad():
-        for i in range(min(n, len(val_ds))):
-            img_t, _boxes, targets = val_ds[i]
+        for i in range(min(n, len(ds))):
+            img_t, _boxes, targets = ds[i]
+            ih, iw = int(img_t.shape[-2]), int(img_t.shape[-1])
             rgb_path = shared / f"sample_{i}_rgb.png"
             if not rgb_path.exists():
-                rgb = _denorm(img_t)
-                cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-            logit = model.forward_with_alias(img_t.unsqueeze(0).to(device), "raw")
-            pred = torch.sigmoid(logit)[0, 0].cpu().numpy()
-            pred_path = epdir / f"sample_{i}_pred.png"
-            gt_path = epdir / f"sample_{i}_gt.png"
-            save_heatmap_overlay_png(pred, str(pred_path), colormap=cv2.COLORMAP_TURBO, gamma=0.5)
-            save_heatmap_overlay_png(targets["dome"][0].numpy(), str(gt_path),
-                                     colormap=cv2.COLORMAP_TURBO, gamma=0.5)
-            if db is not None:
-                try:
-                    db.add_image(ep, "val/seg", i, rgb_path)
-                    db.add_overlay(ep, "val/seg", i, "dome_pred", pred_path)
-                    db.add_overlay(ep, "val/seg", i, "dome_gt", gt_path)
-                except Exception:
-                    pass
+                cv2.imwrite(str(rgb_path), cv2.cvtColor(_denorm(img_t), cv2.COLOR_RGB2BGR))
+            # --- GT dome: deterministic → render heatmap + decoded ONCE (stable path) ---
+            gt = targets["dome"][0].numpy()
+            if gt.shape != (ih, iw):
+                gt = cv2.resize(gt, (iw, ih), interpolation=cv2.INTER_LINEAR)
+            gt_heat = shared / f"sample_{i}_gt_heat.png"
+            gt_seg = shared / f"sample_{i}_gt_seg.png"
+            if not gt_heat.exists():
+                save_heatmap_overlay_png(gt, str(gt_heat), colormap=cv2.COLORMAP_TURBO, gamma=0.5)
+            if not gt_seg.exists():
+                cv2.imwrite(str(gt_seg), _render_seg_decoded(gt, fg_thresh, edge_margin=edge_margin))
+            # --- predicted dome: this epoch ---
+            pred = torch.sigmoid(model.forward_with_alias(img_t.unsqueeze(0).to(device), "raw"))[0, 0].cpu().numpy()
+            if pred.shape != (ih, iw):
+                pred = cv2.resize(pred, (iw, ih), interpolation=cv2.INTER_LINEAR)
+            pred_heat = epdir / f"sample_{i}_pred_heat.png"
+            pred_seg = epdir / f"sample_{i}_pred_seg.png"
+            save_heatmap_overlay_png(pred, str(pred_heat), colormap=cv2.COLORMAP_TURBO, gamma=0.5)
+            cv2.imwrite(str(pred_seg), _render_seg_decoded(pred, fg_thresh, edge_margin=edge_margin))
+            if db is None:
+                continue
+            try:
+                db.add_image(ep, tag, i, rgb_path)
+                db.add_overlay(ep, tag, i, "dome_pred", pred_heat)
+                db.add_overlay(ep, tag, i, "seg_pred", pred_seg)
+                db.add_overlay(ep, tag, i, "dome_gt", gt_heat)
+                db.add_overlay(ep, tag, i, "seg_gt", gt_seg)
+                for kind, arr in (("pred", pred), ("gt", gt)):
+                    blobs = decode_seg(arr, threshold=fg_thresh, min_area=4)
+                    if blobs:
+                        aabbs = np.array([[b.x1, b.y1, b.x2, b.y2] for b in blobs], np.float32)
+                        peaks = np.array([b.peak for b in blobs], np.float32)
+                        meta = {j: {"area_px": int(b.area_px), "cx": round(b.cx, 1), "cy": round(b.cy, 1)}
+                                for j, b in enumerate(blobs)}
+                        db.add_boxes(ep, tag, i, kind, aabbs, scores=peaks, meta=meta)
+            except Exception:
+                pass
 
 
 def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None = None,
@@ -243,6 +338,9 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     total_steps = epochs * steps_per_epoch
     warmup = int(c.get("warmup_steps", min(500, total_steps // 20)))
     log_every = max(1, steps_per_epoch // 8)   # ~8 train/loss points per epoch in the dashboard
+    seg_fg = float(c.get("seg_fg_thresh", 0.5))            # dome foreground cut for decode/metrics/vis
+    seg_edge_margin = float(c.get("seg_edge_margin", 0.0)) # >0 → clipped (frame-edge) blobs are lenient
+    viz_on_best = bool(c.get("viz_only_on_improvement", True))
     ema_decay = float(c.get("ema_decay", 0.999))
     ema = EMA(model, decay=ema_decay, tau=int(c.get("ema_tau", 2000))) if ema_decay > 0 else None
     use_amp = bool(c.get("amp", True)) and device.type == "cuda"
@@ -263,7 +361,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         best_epoch = int(resume_state.get("best_epoch", 0))
         print(f"resuming from epoch {start_epoch + 1}, best_{metric_for_best}={best_metric:.4f} @ ep {best_epoch}")
 
-    vis_every = int(c.get("vis_every", 1)); vis_n = int(c.get("vis_samples", 16))
+    vis_n = int(c.get("vis_samples", 16))   # # of val/test samples to vis on a new-best epoch
     patience = int(c.get("patience", 0))
     ckpt_path = out_dir / f"{c.get('name', c['model_config'])}_best.pt"
 
@@ -308,7 +406,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                 except Exception:
                     pass
         eval_model = ema.shadow if ema is not None else model
-        m = evaluate_seg(eval_model, val_loader, device)
+        m = evaluate_seg(eval_model, val_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin)
         dt = time.time() - t0
         print(f"epoch {ep:3d}/{epochs}  lr={lr:.2e}  loss={run_loss/max(nb,1):.4f}  "
               f"dice={m['dice']:.3f}  iou={m['fg_iou']:.3f}  count_mae={m['count_mae']:.2f}  "
@@ -320,13 +418,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                 db.flush_scalars()
             except Exception:
                 pass
-        if vis_every > 0 and (ep % vis_every == 0):
-            try:
-                _seg_vis(eval_model, val_ds, out_dir, ep, vis_n, device, db=db)
-                if db is not None:
-                    db.flush_scalars(); db.checkpoint()   # push the image/overlay INSERTs out of the WAL
-            except Exception as e:
-                print(f"  (vis skipped: {type(e).__name__}: {e})")
+
         cur = m[metric_for_best]
         is_best = (cur < best_metric) if lower_better else (cur > best_metric)
         if is_best:
@@ -334,20 +426,38 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
             _save(ckpt_path, ep, m)
             print(f"  -> saved best ({metric_for_best}={best_metric:.4f})  {ckpt_path}")
         _save(out_dir / "last.pt", ep, m)
+
+        # Vis (val + test) only when it's worth it: a new best, or the first/last epoch.
+        # No point dumping heatmaps + decoded-instance PNGs for an epoch that didn't beat
+        # what we already have (matches the detector's viz_only_on_improvement default).
+        boundary = (ep == start_epoch + 1) or (ep == epochs)
+        if vis_n > 0 and (not viz_on_best or is_best or boundary):
+            try:
+                _seg_vis(eval_model, val_ds, out_dir, ep, vis_n, device, tag="val/seg",
+                         fg_thresh=seg_fg, edge_margin=seg_edge_margin, db=db)
+            except Exception as e:
+                print(f"  (val vis skipped: {type(e).__name__}: {e})")
+            if len(test_s) > 0:
+                try:
+                    mt = evaluate_seg(eval_model, test_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin)
+                    print(f"  test:  dice={mt['dice']:.3f}  iou={mt['fg_iou']:.3f}  count_mae={mt['count_mae']:.2f}  area_mape={mt['area_mape']:.3f}")
+                    if db is not None:
+                        for k in ("dice", "fg_iou", "count_mae", "area_mape"):
+                            db.add_scalar(ep, f"test/{k}", float(mt[k]))
+                        db.flush_scalars()
+                    _seg_vis(eval_model, test_ds, out_dir, ep, vis_n, device, tag="test/seg",
+                             fg_thresh=seg_fg, edge_margin=seg_edge_margin, db=db)
+                except Exception as e:
+                    print(f"  (test vis skipped: {type(e).__name__}: {e})")
+            if db is not None:
+                db.flush_scalars(); db.checkpoint()   # push the image/overlay INSERTs out of the WAL
+
         if patience > 0 and (ep - best_epoch) >= patience:
             print(f"early stop: no {metric_for_best} improvement for {patience} epochs (best={best_metric:.4f} @ ep {best_epoch})")
             break
 
-    # final test
-    eval_model = ema.shadow if ema is not None else model
-    mt = evaluate_seg(eval_model, test_loader, device)
-    print(f"test:  dice={mt['dice']:.3f}  iou={mt['fg_iou']:.3f}  count_mae={mt['count_mae']:.2f}  area_mape={mt['area_mape']:.3f}")
     if db is not None:
-        try:
-            for k in ("dice", "fg_iou", "count_mae", "area_mape"):
-                db.add_scalar(epochs, f"test/{k}", float(mt[k]))
-        finally:
-            db.close()
+        db.close()
     if bool(c.get("auto_bundle", True)):
         try:
             _bundle_run(out_dir, include_tb=False)

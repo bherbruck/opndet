@@ -232,10 +232,18 @@ def test_train_seg_end_to_end(tmp_path):
     d = torch.load(ckpts[0], map_location="cpu", weights_only=False)
     assert d["metric_for_best"] == "dice" and d["ema"] is not None
     assert {"dice", "fg_iou", "count_mae", "area_mape", "n_val"} <= set(d["metrics"])
-    # the dome RGB is written once per sample (stable path), heatmaps per epoch
-    rgb = list((tmp_path / "runs").rglob("vis/seg/sample_*_rgb.png"))
-    eps = list((tmp_path / "runs").rglob("vis/seg/ep_*/sample_*_pred.png"))
-    assert len(rgb) == 2 and len(eps) == 4  # 2 samples × {ep1,ep2}
+    # vis only runs on a new-best (or first/last) epoch — here ep1 (first+best) and ep2 (last).
+    # stable-once PNGs (deterministic on val): RGB + GT heatmap + GT decoded, one each per sample.
+    rgb = list((tmp_path / "runs").rglob("vis/val_seg/sample_*_rgb.png"))
+    gt_h = list((tmp_path / "runs").rglob("vis/val_seg/sample_*_gt_heat.png"))
+    gt_s = list((tmp_path / "runs").rglob("vis/val_seg/sample_*_gt_seg.png"))
+    assert len(rgb) == 2 and len(gt_h) == 2 and len(gt_s) == 2
+    # per-epoch PNGs: predicted dome heatmap + predicted decoded instances, per sample × vis-epoch.
+    ph = list((tmp_path / "runs").rglob("vis/val_seg/ep_*/sample_*_pred_heat.png"))
+    ps = list((tmp_path / "runs").rglob("vis/val_seg/ep_*/sample_*_pred_seg.png"))
+    assert len(ph) == 4 and len(ps) == 4  # 2 samples × {ep1=first/best, ep2=last}
+    # test vis (also gated on best/boundary) lands under vis/test_seg/
+    assert list((tmp_path / "runs").rglob("vis/test_seg/sample_*_rgb.png"))
     # DuckDB store written (so the dashboard shows seg runs) with scalars + the val/seg vis
     rundir = ckpts[0].parent
     assert (rundir / "metrics.duckdb").exists()
@@ -245,7 +253,10 @@ def test_train_seg_end_to_end(tmp_path):
         tags = {r[0] for r in con.execute("select distinct tag from scalars").fetchall()}
         assert {"train/loss", "lr", "val/dice"} <= tags
         assert "val/seg" in {r[0] for r in con.execute("select distinct tag from images").fetchall()}
-        assert {"dome_pred", "dome_gt"} <= {r[0] for r in con.execute("select distinct kind from overlays").fetchall()}
+        kinds = {r[0] for r in con.execute("select distinct kind from overlays").fetchall()}
+        assert {"dome_pred", "dome_gt", "seg_pred", "seg_gt"} <= kinds   # heatmap + decoded, pred + gt
+        bk = {r[0] for r in con.execute("select distinct kind from boxes").fetchall()}
+        assert "gt" in bk   # per-blob AABB + area_px meta (gt always has blobs; pred too once trained)
     finally:
         con.close()
     # `opndet eval` routes a seg ckpt to the seg eval path

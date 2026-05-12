@@ -430,7 +430,8 @@ def _run_seg_eval(model, c: dict, samples, split: str, img_h: int, img_w: int,
     bs = int(batch_size or c.get("batch_size", 8))
     loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=int(c.get("num_workers", 2)),
                         collate_fn=collate, pin_memory=False)
-    m = evaluate_seg(model, loader, device)
+    m = evaluate_seg(model, loader, device, fg_thresh=float(c.get("seg_fg_thresh", 0.5)),
+                     edge_margin=float(c.get("seg_edge_margin", 0.0)))
     print(f"\n=== seg eval ({split}, n={m['n_val']}) ===")
     print(f"  dice       {m['dice']:.4f}")
     print(f"  fg_iou     {m['fg_iou']:.4f}")
