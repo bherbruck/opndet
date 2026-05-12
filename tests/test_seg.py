@@ -181,7 +181,7 @@ def test_seg_dome_loss_basic():
     assert bad.grad is not None and torch.isfinite(bad.grad).all()
 
 
-# ---- 4. train_seg: end-to-end (2 epochs on a tiny synthetic egg dataset) ----
+# ---- 4. train_seg: end-to-end (2 epochs on a tiny synthetic object dataset) ----
 def _seg_fixture(tmp_path, n=14, sz=96):
     import cv2
     img_dir = tmp_path / "imgs"; obb_dir = tmp_path / "obb"
@@ -206,7 +206,7 @@ def _seg_fixture(tmp_path, n=14, sz=96):
     import json
     coco = tmp_path / "ann.json"
     coco.write_text(json.dumps({"images": images, "annotations": anns,
-                                "categories": [{"id": 1, "name": "egg"}]}))
+                                "categories": [{"id": 1, "name": "object"}]}))
     return coco, img_dir, obb_dir
 
 

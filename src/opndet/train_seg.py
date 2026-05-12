@@ -51,10 +51,10 @@ def _touches_edge(blob, H: int, W: int, margin: float) -> bool:
 def _match_count_area(pred_blobs, gt_blobs, H: int, W: int, edge_margin: float = 0.0):
     """Greedy nearest-centroid match → (count_abs_err, list of |a_pred-a_gt|/a_gt).
 
-    Edge leniency: a GT egg whose bbox touches within `edge_margin·dim` of the frame is
+    Edge leniency: a GT object whose bbox touches within `edge_margin·dim` of the frame is
     a clipped partial — its visible area isn't a meaningful measurement — so it (and its
     matched pred) is skipped for the area-MAPE list. It still counts toward count_abs_err
-    (you still want to know if the model missed/hallucinated an edge egg).
+    (you still want to know if the model missed/hallucinated an edge object).
     """
     n_err = abs(len(pred_blobs) - len(gt_blobs))
     if not gt_blobs or not pred_blobs:
@@ -342,9 +342,9 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     warmup = int(c.get("warmup_steps", min(500, total_steps // 20)))
     log_every = max(1, steps_per_epoch // 8)   # ~8 train/loss points per epoch in the dashboard
     seg_fg = float(c.get("seg_fg_thresh", 0.05))           # dome cut for decode/metrics/vis — keep LOW:
-                                                            # the dome ramps 1→0 linearly out to the egg's
-                                                            # edge, so >0.5 is the INNER HALF of the egg;
-                                                            # ~0.05 ≈ the full egg footprint (= the OBB).
+                                                            # the dome ramps 1→0 linearly out to the object's
+                                                            # edge, so >0.5 is the INNER HALF of the object;
+                                                            # ~0.05 ≈ the full object footprint (= the OBB).
     seg_edge_margin = float(c.get("seg_edge_margin", 0.0)) # >0 → clipped (frame-edge) blobs are lenient
     viz_on_best = bool(c.get("viz_only_on_improvement", True))
     ema_decay = float(c.get("ema_decay", 0.999))
