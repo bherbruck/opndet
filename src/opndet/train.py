@@ -547,6 +547,21 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     from opndet.training_defaults import defaults_for, deep_merge
     c = deep_merge(defaults_for(user_cfg["model_config"]), user_cfg)
 
+    # bbox-*-seg presets (dense full-res dome head) have a different metric space
+    # (Dice / area / count, not detection mAP), no in-graph peak op to calibrate,
+    # no curriculum/repulsion/eval-threshold. Delegate to the dedicated seg loop.
+    try:
+        _pp = yaml.safe_load(open(_resolve_preset(c["model_config"])))
+        _is_seg = isinstance(_pp, dict) and (_pp.get("model", {}) or {}).get("head") == "seg"
+    except Exception:
+        _is_seg = False
+    if _is_seg:
+        if teacher is not None or self_distill:
+            raise ValueError("distillation is not supported for bbox-*-seg presets")
+        from opndet.train_seg import train_seg
+        train_seg(cfg_path, run_name=run_name, runs_dir=runs_dir, resume=resume)
+        return
+
     if runs_dir is not None:
         c["runs_dir"] = runs_dir
     if run_name is not None:

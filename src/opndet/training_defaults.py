@@ -173,6 +173,14 @@ PER_SIZE: dict[str, dict[str, Any]] = {
                    "assigner": "stal", "curriculum": "progloss"},
     "bbox-x-pro": {"lr": 1.5e-3, "batch_size": 32, "warmup_steps": 400, "augment": _AUG_FULL,
                    "assigner": "stal", "curriculum": "progloss"},
+
+    # `-seg` dense-dome segmentation heads (full-res output → roughly 4x the head
+    # FLOPs of the -obb counterpart, hence smaller batch). v1 trains the elliptical
+    # dome rendered from `opndet sam-obb` sidecars; needs data.sources[*].obb_dir.
+    # Trained by the dedicated loop in train_seg.py (auto-dispatched).
+    "bbox-f-seg": {"lr": 3.0e-3, "batch_size": 128, "augment": _AUG_LIGHT},
+    "bbox-n-seg": {"lr": 3.0e-3, "batch_size": 64,  "augment": _AUG_MEDIUM},
+    "bbox-s-seg": {"lr": 2.5e-3, "batch_size": 32,  "augment": _AUG_FULL},
 }
 
 

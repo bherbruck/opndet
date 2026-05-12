@@ -123,6 +123,29 @@ def test_encode_seg_stride_2():
 
 
 # ---- 3. SegDomeLoss: QFL toward the dome + soft Dice on foreground ----
+def test_decode_seg_blobs():
+    import cv2
+    from opndet.decode import decode_seg, decode_seg_batch
+    dome = np.zeros((128, 192), np.float32)
+    # two well-separated convex blobs (a disk and a small ellipse)
+    cv2.circle(dome, (50, 64), 22, 1.0, -1)          # disk r=22 → area ≈ π·22² ≈ 1520
+    cv2.ellipse(dome, (140, 64), (16, 10), 0, 0, 360, 0.9, -1)
+    blobs = decode_seg(dome, threshold=0.5, min_area=4)
+    assert len(blobs) == 2
+    by_x = sorted(blobs, key=lambda b: b.cx)
+    assert abs(by_x[0].cx - 50) < 2 and abs(by_x[0].cy - 64) < 2
+    assert abs(by_x[1].cx - 140) < 2
+    assert by_x[0].area_px > 1300                      # ≈ disk area in px
+    assert by_x[0].peak >= 0.99 and by_x[1].peak >= 0.89
+    # touching-but-distinct check: the dome between them is 0 → still 2 components
+    assert blobs[0].peak >= blobs[1].peak              # sorted by descending peak
+    # batch wrapper + min_area denoise
+    dome2 = dome.copy(); dome2[0, 0] = 1.0             # 1-px speck
+    out = np.stack([dome, dome2])[:, None]             # [2,1,H,W]
+    bb = decode_seg_batch(out, threshold=0.5, min_area=4)
+    assert len(bb) == 2 and len(bb[0]) == 2 and len(bb[1]) == 2  # the 1-px speck dropped
+
+
 def test_seg_dome_loss_basic():
     from opndet.loss import SegDomeLoss
     B, H, W = 2, 32, 48
@@ -139,3 +162,62 @@ def test_seg_dome_loss_basic():
     out = loss(bad, {"dome": dome})
     out["loss"].backward()
     assert bad.grad is not None and torch.isfinite(bad.grad).all()
+
+
+# ---- 4. train_seg: end-to-end (2 epochs on a tiny synthetic egg dataset) ----
+def _seg_fixture(tmp_path, n=14, sz=96):
+    import cv2
+    img_dir = tmp_path / "imgs"; obb_dir = tmp_path / "obb"
+    img_dir.mkdir(); obb_dir.mkdir()
+    images, anns, aid = [], [], 1
+    rng = np.random.default_rng(0)
+    for i in range(n):
+        im = (rng.random((sz, sz, 3)) * 60 + 30).astype(np.uint8)
+        lines = []
+        for _ in range(2):
+            cx, cy = int(rng.integers(20, sz - 20)), int(rng.integers(20, sz - 20))
+            a, b = int(rng.integers(8, 14)), int(rng.integers(6, 11))
+            cv2.ellipse(im, (cx, cy), (a, b), 0, 0, 360, (220, 210, 200), -1)
+            x1, y1, x2, y2 = cx - a, cy - b, cx + a, cy + b
+            anns.append({"id": aid, "image_id": i, "category_id": 1,
+                         "bbox": [x1, y1, 2 * a, 2 * b], "area": 4 * a * b, "iscrowd": 0}); aid += 1
+            lines.append("0 " + " ".join(f"{v:.6f}" for v in
+                         [x1 / sz, y1 / sz, x2 / sz, y1 / sz, x2 / sz, y2 / sz, x1 / sz, y2 / sz]))
+        cv2.imwrite(str(img_dir / f"img{i}.jpg"), im)
+        images.append({"id": i, "file_name": f"img{i}.jpg", "width": sz, "height": sz})
+        (obb_dir / f"img{i}.txt").write_text("\n".join(lines) + "\n")
+    import json
+    coco = tmp_path / "ann.json"
+    coco.write_text(json.dumps({"images": images, "annotations": anns,
+                                "categories": [{"id": 1, "name": "egg"}]}))
+    return coco, img_dir, obb_dir
+
+
+def test_train_seg_end_to_end(tmp_path):
+    import yaml as _yaml
+
+    from opndet.train import train  # exercises the seg auto-dispatch
+    coco, img_dir, obb_dir = _seg_fixture(tmp_path)
+    cfg = {
+        "model_config": "bbox-n-seg", "model": {"img_h": 96, "img_w": 96},
+        "device": "cpu", "amp": False, "seed": 0,
+        "epochs": 2, "batch_size": 4, "lr": 1e-3, "warmup_steps": 2,
+        "num_workers": 0, "ema_decay": 0.9, "ema_tau": 5,
+        "vis_every": 1, "vis_samples": 2, "metric_for_best": "dice", "auto_bundle": False,
+        "data": {"sources": [{"coco": str(coco), "images": str(img_dir), "obb_dir": str(obb_dir)}],
+                 "split_ratios": [0.6, 0.25, 0.15]},
+        "loss": {"qfl_beta": 2.0}, "augment": {"hflip_prob": 0.5},
+        "runs_dir": str(tmp_path / "runs"), "name": "seg_smoke",
+    }
+    cfg_path = tmp_path / "train.yaml"
+    cfg_path.write_text(_yaml.safe_dump(cfg))
+    train(str(cfg_path))
+    ckpts = list((tmp_path / "runs").rglob("*_best.pt"))
+    assert ckpts, "train_seg should have saved a best checkpoint"
+    d = torch.load(ckpts[0], map_location="cpu", weights_only=False)
+    assert d["metric_for_best"] == "dice" and d["ema"] is not None
+    assert {"dice", "fg_iou", "count_mae", "area_mape", "n_val"} <= set(d["metrics"])
+    # the dome RGB is written once per sample (stable path), heatmaps per epoch
+    rgb = list((tmp_path / "runs").rglob("vis/seg/sample_*_rgb.png"))
+    eps = list((tmp_path / "runs").rglob("vis/seg/ep_*/sample_*_pred.png"))
+    assert len(rgb) == 2 and len(eps) == 4  # 2 samples × {ep1,ep2}

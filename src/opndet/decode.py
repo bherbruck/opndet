@@ -218,3 +218,55 @@ def gt_obbs_from_targets(pos: np.ndarray, obb: np.ndarray, img_h: int, img_w: in
         theta = tn * math.pi
         out.append(np.stack([cx, cy, w, h, theta], axis=-1).astype(np.float32))
     return out
+
+
+@dataclass
+class SegBlob:
+    cx: float          # centroid x, image px
+    cy: float          # centroid y, image px
+    area_px: float     # foreground pixel count of this blob (the convex object's area)
+    peak: float        # max dome value inside the blob (≈1.0 for a clean detection)
+    x1: float          # tight AABB of the blob (informational)
+    y1: float
+    x2: float
+    y2: float
+
+
+def decode_seg(dome: np.ndarray, threshold: float = 0.5, min_area: int = 4) -> list[SegBlob]:
+    """Decode one dense dome map [H, W] (the bbox-*-seg output channel) into instances.
+
+    Unlike the detector heads (which bake peak-suppression into the graph so NO
+    postprocessing runs), a dense seg dome IS a segmentation map — extracting the
+    per-object area/center is inherently postprocessing: threshold → connected
+    components → per-blob centroid + pixel count. The dome hits exactly 0 between
+    touching objects, so plain 4-connectivity components already separate them; no
+    NMS, no watershed needed for convex blobs.
+
+    threshold: foreground cut on the dome (0.5 = "inside the object by >half-depth").
+               Lower it to recover the full object area; raise it to get just cores.
+    min_area : drop blobs smaller than this many px (denoise).
+    Returns blobs sorted by descending peak.
+    """
+    import cv2
+    H, W = dome.shape
+    fg = (dome >= float(threshold)).astype(np.uint8)
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(fg, connectivity=4)
+    out: list[SegBlob] = []
+    for i in range(1, n):  # 0 is background
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < int(min_area):
+            continue
+        x, y, w, h = (int(stats[i, k]) for k in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP,
+                                                 cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
+        peak = float(dome[y:y + h, x:x + w][labels[y:y + h, x:x + w] == i].max())
+        cx, cy = float(cents[i, 0]), float(cents[i, 1])
+        out.append(SegBlob(cx, cy, float(area), peak, float(x), float(y), float(x + w), float(y + h)))
+    out.sort(key=lambda b: -b.peak)
+    return out
+
+
+def decode_seg_batch(out: np.ndarray, threshold: float = 0.5, min_area: int = 4) -> list[list[SegBlob]]:
+    """out: [B, 1, H, W] dome maps → per-image instance lists (see decode_seg)."""
+    if out.ndim == 4:
+        out = out[:, 0]
+    return [decode_seg(out[b], threshold=threshold, min_area=min_area) for b in range(out.shape[0])]

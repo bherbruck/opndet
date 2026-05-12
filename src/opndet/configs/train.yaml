@@ -122,6 +122,20 @@ epochs: 100
 #                                 #   don't moat each other). 0.2–0.3 typical. Pairs with — and is more
 #                                 #   reliable than — peak_sharpen_weight (which is the loss-side nudge).
 #
+# --- bbox-*-seg presets only (dense full-res dome SEGMENTATION head) ----------
+# These presets auto-dispatch to the seg training loop (train_seg.py): Dice/IoU/
+# area/count metrics, no calibration / curriculum / eval-threshold / peak op. They
+# need data.sources[*].obb_dir (v1 renders the elliptical dome from sam-obb OBBs).
+# seg_stride: 1                    # output stride: 1 = full input res (default), 2 = half. Smaller =
+#                                  #   finer area readout but a heavier conv head (the cost the size
+#                                  #   ladder absorbs).
+# loss:
+#   qfl_beta: 2.0                  # focal exponent on the dome regression (same QFL as the cls heads)
+#   seg_w_qfl: 1.0                 # weight on the QFL-toward-dome term (defaults to loss.w_hm)
+#   seg_w_dice: 1.0                # weight on the soft-Dice-on-foreground term (drives area accuracy)
+# metric_for_best: dice            # default for seg; also fg_iou | count_mae | area_mape (latter two
+#                                  #   are lower-better and handled as such)
+#
 # loss:
 #   wh_loss: ciou                 # default
 #   cls_loss: vfl                 # default — bimodal confidence. Also: focal | soft_hm.
