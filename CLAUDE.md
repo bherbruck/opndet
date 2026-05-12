@@ -39,7 +39,7 @@ opndet dashboard --root /path/to/runs                                        # D
 
 The `--model` flag accepts a **bundled preset name** (`bbox-f`, `bbox-p`, `bbox-n`, `bbox-s`, `bbox-m`, `bbox-l`, `bbox-x`, plus variants `-dist`, `-hm2`, `-flow`, `-tp`) OR a path to a YAML.
 
-**In-browser tester**: drop any exported ONNX into [bherbruck.github.io/opndet](https://bherbruck.github.io/opndet) (lives in `docs/index.html`, deployed via GH Pages). Runs entirely client-side via onnxruntime-web. The "explain mode" toggle requires an ONNX exported with `--diagnostic`.
+**In-browser tester**: drop any exported ONNX into [bherbruck.github.io/opndet](https://bherbruck.github.io/opndet) (lives in `docs/index.html`, deployed via GH Pages). Runs entirely client-side via onnxruntime-web. It auto-detects the output shape: a 5-ch `[1,5,H/4,W/4]` (or 6-ch OBB) → box decode + draw; a **1-ch `[1,1,H,W]`** → treated as a `bbox-*-seg` dense dome → Turbo heatmap overlay + a JS flood-fill connected-components → per-blob centroid + pixel-area, with the threshold slider as the dome foreground cut. The "explain mode" toggle requires an ONNX exported with `--diagnostic` (works for seg presets too — the diagnostic outputs are the decoder layers).
 
 ## Architecture (big picture)
 

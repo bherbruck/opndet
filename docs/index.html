@@ -140,6 +140,7 @@
       <div class="small">
         <p style="margin:6px 0">Runs entirely in browser via onnxruntime-web (WASM). No upload to server.</p>
         <p style="margin:6px 0">Default expects a 5-channel <code>[1,5,H/4,W/4]</code> output: <code>(obj, cx, cy, w, h)</code> with cell-relative offsets and image-normalized w/h.</p>
+        <p style="margin:6px 0">A <strong>1-channel</strong> <code>[1,1,H,W]</code> output is auto-detected as a <code>bbox-*-seg</code> dense dome → rendered as a heatmap + flood-fill connected-components for per-blob centroid (red dot) &amp; pixel-area. The threshold slider becomes the dome foreground cut (0.5 = "inside the object past half-depth").</p>
         <p style="margin:6px 0">If your ONNX expects already-normalized fp32 [0,1] - mean/std input, uncheck the <em>baked norm</em> box.</p>
       </div>
     </fieldset>
@@ -489,6 +490,22 @@ async function runOn(src) {
 
   lastOutputs = out;
 
+  if (C === 1) {  // bbox-*-seg: dense [1,1,H,W] dome — not a detection tensor
+    const thr = parseFloat(els.threshold.value);
+    const blobs = segBlobs(o.data, H, W, thr);
+    lastDecodeArgs = { seg: true, dome: o.data, H, W, lb };
+    activeOverlay = renderDomeOverlay(o.data, H, W);
+    let dmax = 0; for (let i = 0, n = H * W; i < n; i++) if (o.data[i] > dmax) dmax = o.data[i];
+    els.sOutput.textContent = `[${B},${C},${H},${W}] dome`;
+    els.sInfer.textContent = `${dt.toFixed(1)} ms`;
+    els.sFps.textContent = _fps().toFixed(1);
+    els.sObjMax.textContent = dmax.toFixed(3);
+    els.sDets.textContent = blobs.length;
+    blitOverlay();
+    drawSegBlobs(blobs, H, W);
+    return;
+  }
+
   const stride = parseInt(els.stride.value, 10) || 4;
   const threshold = parseFloat(els.threshold.value);
   const dets = decode(o.data, C, H, W, inputH, inputW, stride, threshold);
@@ -518,6 +535,15 @@ async function runOn(src) {
 
 function renderFromCache() {
   if (!lastDecodeArgs) return;
+  if (lastDecodeArgs.seg) {
+    const { dome, H, W } = lastDecodeArgs;
+    const blobs = segBlobs(dome, H, W, parseFloat(els.threshold.value));
+    els.sDets.textContent = blobs.length;
+    if (lastImage) drawLetterbox(lastImage);
+    if (activeOverlay) blitOverlay();
+    drawSegBlobs(blobs, H, W);
+    return;
+  }
   const { o, C, H, W, lb } = lastDecodeArgs;
   const stride = parseInt(els.stride.value, 10) || 4;
   const threshold = parseFloat(els.threshold.value);
@@ -572,6 +598,71 @@ function drawDetections(dets) {
     ctx.fillStyle = "#0d1117";
     ctx.fillText(label, d.x1 + 2, d.y1 - 1);
   }
+}
+
+// === seg head (bbox-*-seg dense dome [1,1,H,W]) =============================
+
+// Render the dome (h×w, values in [0,1]) as a Turbo overlay at canvas size.
+// NOT normalized (1.0 means "deepest interior" — stretching would lie); alpha
+// rises with the value so the ~0 background stays see-through.
+function renderDomeOverlay(arr, h, w) {
+  const id = ctx.createImageData(inputW, inputH);
+  const px = id.data;
+  const sx = w / inputW, sy = h / inputH;
+  let d = 0;
+  for (let y = 0; y < inputH; y++) {
+    const rowOff = Math.min(h - 1, Math.floor(y * sy)) * w;
+    for (let x = 0; x < inputW; x++) {
+      const v = Math.max(0, Math.min(1, arr[rowOff + Math.min(w - 1, Math.floor(x * sx))]));
+      const [r, g, b] = turbo(Math.sqrt(v));   // gamma 0.5 boosts low-value visibility
+      px[d++] = r; px[d++] = g; px[d++] = b; px[d++] = Math.round(Math.min(1, v * 1.3) * 255);
+    }
+  }
+  return id;
+}
+
+// 4-connectivity flood fill over (dome >= thr) → blobs in dome-grid coords.
+function segBlobs(arr, h, w, thr) {
+  const seen = new Uint8Array(h * w), stack = new Int32Array(h * w), blobs = [];
+  for (let i0 = 0; i0 < h * w; i0++) {
+    if (seen[i0] || arr[i0] < thr) continue;
+    let sp = 0; stack[sp++] = i0; seen[i0] = 1;
+    let n = 0, sxv = 0, syv = 0, peak = 0, x1 = w, y1 = h, x2 = -1, y2 = -1;
+    while (sp > 0) {
+      const i = stack[--sp], y = (i / w) | 0, x = i - y * w;
+      n++; sxv += x; syv += y; if (arr[i] > peak) peak = arr[i];
+      if (x < x1) x1 = x; if (x > x2) x2 = x; if (y < y1) y1 = y; if (y > y2) y2 = y;
+      if (x > 0     && !seen[i - 1] && arr[i - 1] >= thr) { seen[i - 1] = 1; stack[sp++] = i - 1; }
+      if (x < w - 1 && !seen[i + 1] && arr[i + 1] >= thr) { seen[i + 1] = 1; stack[sp++] = i + 1; }
+      if (y > 0     && !seen[i - w] && arr[i - w] >= thr) { seen[i - w] = 1; stack[sp++] = i - w; }
+      if (y < h - 1 && !seen[i + w] && arr[i + w] >= thr) { seen[i + w] = 1; stack[sp++] = i + w; }
+    }
+    if (n >= 4) blobs.push({ cx: sxv / n, cy: syv / n, area: n, peak, x1, y1, x2, y2 });
+  }
+  blobs.sort((a, b) => b.peak - a.peak);
+  return blobs;
+}
+
+function drawSegBlobs(blobs, gh, gw) {
+  const fx = inputW / gw, fy = inputH / gh, fa = fx * fy;
+  ctx.font = "11px ui-monospace, Menlo, monospace"; ctx.textBaseline = "bottom"; ctx.lineWidth = 1;
+  for (const b of blobs) {
+    const cx = b.cx * fx, cy = b.cy * fy;
+    ctx.strokeStyle = "rgba(63,185,80,0.95)";
+    ctx.strokeRect(b.x1 * fx, b.y1 * fy, (b.x2 - b.x1 + 1) * fx, (b.y2 - b.y1 + 1) * fy);
+    ctx.fillStyle = "rgba(248,81,73,0.95)";
+    ctx.beginPath(); ctx.arc(cx, cy, 2.5, 0, 6.283185); ctx.fill();
+    const label = `${Math.round(b.area * fa)}px`;
+    const tw = ctx.measureText(label).width + 4;
+    ctx.fillStyle = "rgba(63,185,80,0.95)"; ctx.fillRect(cx + 4, cy - 13, tw, 13);
+    ctx.fillStyle = "#0d1117"; ctx.fillText(label, cx + 6, cy - 1);
+  }
+}
+
+function _fps() {
+  fpsBuf.push(performance.now());
+  while (fpsBuf.length > 30) fpsBuf.shift();
+  return fpsBuf.length >= 2 ? (fpsBuf.length - 1) / ((fpsBuf[fpsBuf.length - 1] - fpsBuf[0]) / 1000) : 0;
 }
 
 // === Explain mode ===========================================================
