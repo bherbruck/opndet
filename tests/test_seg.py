@@ -213,14 +213,18 @@ def test_train_seg_end_to_end(tmp_path):
 
     from opndet.train import train  # exercises the seg auto-dispatch
     coco, img_dir, obb_dir = _seg_fixture(tmp_path)
+    # image_filter: only the first 10 of the 14 fixture images → split 0.6/0.25/0.15 ⇒ val=2.
+    # (without the filter being applied it'd be int(14*0.25)=3 — see the n_val assertion.)
+    flt = tmp_path / "filter.txt"
+    flt.write_text("\n".join(f"img{i}" for i in range(10)) + "\n")
     cfg = {
         "model_config": "bbox-n-seg", "model": {"img_h": 96, "img_w": 96},
         "device": "cpu", "amp": False, "seed": 0,
         "epochs": 2, "batch_size": 4, "lr": 1e-3, "warmup_steps": 2,
         "num_workers": 0, "ema_decay": 0.9, "ema_tau": 5,
-        "vis_every": 1, "vis_samples": 2, "metric_for_best": "dice", "auto_bundle": False,
+        "vis_samples": 2, "metric_for_best": "dice", "auto_bundle": False,
         "data": {"sources": [{"coco": str(coco), "images": str(img_dir), "obb_dir": str(obb_dir)}],
-                 "split_ratios": [0.6, 0.25, 0.15]},
+                 "split_ratios": [0.6, 0.25, 0.15], "image_filter": str(flt)},
         "loss": {"qfl_beta": 2.0}, "augment": {"hflip_prob": 0.5},
         "runs_dir": str(tmp_path / "runs"), "name": "seg_smoke",
     }
@@ -232,6 +236,7 @@ def test_train_seg_end_to_end(tmp_path):
     d = torch.load(ckpts[0], map_location="cpu", weights_only=False)
     assert d["metric_for_best"] == "dice" and d["ema"] is not None
     assert {"dice", "fg_iou", "count_mae", "area_mape", "n_val"} <= set(d["metrics"])
+    assert d["metrics"]["n_val"] == 2, "train_seg must honour data.image_filter (10 imgs × 0.25 = 2 val)"
     # vis only runs on a new-best (or first/last) epoch — here ep1 (first+best) and ep2 (last).
     # stable-once PNGs (deterministic on val): RGB + GT heatmap + GT decoded, one each per sample.
     rgb = list((tmp_path / "runs").rglob("vis/val_seg/sample_*_rgb.png"))

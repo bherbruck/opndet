@@ -280,11 +280,12 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
 
     # --- data (requires OBB sidecars; v1 renders the elliptical dome from them) ---
     print("loading data ...")
-    sources = c["data"]["sources"]
+    data_cfg = c.get("data", {}) or {}
+    sources = data_cfg["sources"]
     if not any((s.get("obb_dir") if isinstance(s, dict) else None) for s in sources):
         raise RuntimeError("bbox-*-seg needs OBB sidecars: run `opndet sam-obb` and set "
                            "data.sources[*].obb_dir (v1 derives the dome from the OBBs).")
-    all_s = load_datasets(sources)
+    all_s = load_datasets(sources, image_filter=data_cfg.get("image_filter"))
     n_pre = len(all_s)
     out_kept = []
     for s in all_s:
@@ -297,7 +298,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         raise RuntimeError("no samples have OBB sidecars — run `opndet sam-obb` first.")
     if n_pre != len(all_s):
         print(f"  dropped {n_pre - len(all_s)} samples without OBB sidecars")
-    ratios = tuple((c.get("data", {}) or {}).get("split_ratios", (0.8, 0.1, 0.1)))
+    ratios = tuple(data_cfg.get("split_ratios", (0.8, 0.1, 0.1)))
     train_s, val_s, test_s = split_samples(all_s, ratios=ratios, seed=seed)
     print(f"total samples: {len(all_s)}   split: train={len(train_s)} val={len(val_s)} test={len(test_s)}")
 
