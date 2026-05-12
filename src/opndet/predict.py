@@ -293,6 +293,32 @@ def predict_image(
         out = m(t.to(device))
     out_t = out["output"] if isinstance(out, dict) else out
     out_np = out_t.cpu().numpy()
+
+    # bbox-*-seg: the output is a dense [1,1,H,W] dome, not a detection tensor.
+    if "dome" in getattr(m, "aliases", {}) or out_np.shape[1] == 1:
+        from opndet.decode import decode_seg
+        s, px, py = info["scale"], info["pad_x"], info["pad_y"]
+        ih, iw = int(round(info["orig_h"] * s)), int(round(info["orig_w"] * s))
+        dome = out_np[0, 0][py:py + ih, px:px + iw]                       # strip letterbox pad
+        dome = cv2.resize(dome, (info["orig_w"], info["orig_h"]), interpolation=cv2.INTER_LINEAR)
+        thr = threshold if threshold > 0 else 0.5
+        blobs = decode_seg(dome, threshold=thr, min_area=4)
+        results = [{"cx": round(b.cx, 1), "cy": round(b.cy, 1), "area_px": int(b.area_px),
+                    "peak": round(b.peak, 3), "x1": round(b.x1, 1), "y1": round(b.y1, 1),
+                    "x2": round(b.x2, 1), "y2": round(b.y2, 1)} for b in blobs]
+        if save_path is not None:
+            vis = img_bgr.copy()
+            heat = cv2.applyColorMap((np.clip(dome, 0.0, 1.0) ** 0.5 * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+            vis = cv2.addWeighted(vis, 0.55, heat, 0.45, 0)
+            cnts, _ = cv2.findContours((dome >= thr).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(vis, cnts, -1, (0, 255, 0), 1)
+            for b in blobs:
+                cv2.circle(vis, (int(b.cx), int(b.cy)), 2, (0, 0, 255), -1)
+                cv2.putText(vis, f"{int(b.area_px)}px", (int(b.cx) + 3, int(b.cy) - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            cv2.imwrite(str(save_path), vis)
+        return results
+
     dets = decode(out_np[0], h, w, stride, threshold=threshold)
 
     results = []

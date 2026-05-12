@@ -123,6 +123,21 @@ def test_encode_seg_stride_2():
 
 
 # ---- 3. SegDomeLoss: QFL toward the dome + soft Dice on foreground ----
+def test_predict_image_seg_path(tmp_path):
+    import cv2
+
+    from opndet.predict import predict_image
+    img = (np.random.default_rng(0).random((150, 240, 3)) * 255).astype(np.uint8)
+    ip = tmp_path / "x.jpg"; cv2.imwrite(str(ip), img)
+    out = tmp_path / "vis.jpg"
+    # untrained model + low threshold so the (≈0.1-everywhere) dome yields ≥1 blob
+    res = predict_image(image_path=str(ip), model_config=resolve("bbox-n-seg"), ckpt=None,
+                        threshold=0.05, device="cpu", save_path=str(out))
+    assert out.exists()
+    v = cv2.imread(str(out)); assert v.shape == img.shape  # vis is at original resolution
+    assert res and {"cx", "cy", "area_px", "peak", "x1", "y1", "x2", "y2"} == set(res[0])
+
+
 def test_decode_seg_blobs():
     import cv2
     from opndet.decode import decode_seg, decode_seg_batch
