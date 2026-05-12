@@ -431,7 +431,7 @@ def _run_seg_eval(model, c: dict, samples, split: str, img_h: int, img_w: int,
     loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=int(c.get("num_workers", 2)),
                         collate_fn=collate, pin_memory=False)
     m = evaluate_seg(model, loader, device, fg_thresh=float(c.get("seg_fg_thresh", 0.05)),
-                     edge_margin=float(c.get("seg_edge_margin", 0.0)),
+                     edge_margin=float(c.get("seg_edge_margin", 0.0)), mode=str(c.get("seg_decode_mode", "watershed")),
                      peak_kernel=int(c.get("seg_peak_kernel", 9)), peak_thr=float(c.get("seg_peak_thr", 0.4)))
     print(f"\n=== seg eval ({split}, n={m['n_val']}) ===")
     print(f"  dice          {m['dice']:.4f}      (global pixel overlap, pred dome vs GT dome)")

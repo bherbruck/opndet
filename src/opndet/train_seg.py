@@ -84,7 +84,7 @@ def _match_count_area(pred_blobs, gt_blobs, H: int, W: int, edge_margin: float =
 
 @torch.no_grad()
 def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: float = 0.0,
-                 peak_kernel: int = 9, peak_thr: float = 0.4) -> dict:
+                 mode: str = "watershed", peak_kernel: int = 9, peak_thr: float = 0.4) -> dict:
     """Returns:
       dice / fg_iou         : GLOBAL pixel overlap of (pred dome > fg_thresh) vs (GT dome > fg_thresh)
       count_mae / area_mape : per-image #blob error / per-matched-object |Δarea|/area (clipped objects
@@ -115,7 +115,7 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: flo
         inter_i += float((pf * tf).sum()); union_i += float(((pf + tf) > 0).float().sum())
         pn = p.cpu().numpy(); tn = dome_t.cpu().numpy()
         Hd, Wd = pn.shape[2], pn.shape[3]
-        dk = dict(threshold=fg_thresh, min_area=4, mode="watershed", peak_kernel=peak_kernel,
+        dk = dict(threshold=fg_thresh, min_area=4, mode=mode, peak_kernel=peak_kernel,
                   peak_thr=peak_thr, return_labels=True)
         for b in range(pn.shape[0]):
             n_imgs += 1
@@ -163,19 +163,21 @@ _SEG_BORDER_ALPHA = 255   # crisp same-hue rim. Flip these two if you want a fai
 
 
 def _render_seg_decoded(dome: np.ndarray, thr: float = 0.5, min_area: int = 4,
-                        edge_margin: float = 0.0, peak_kernel: int = 9, peak_thr: float = 0.4) -> np.ndarray:
+                        edge_margin: float = 0.0, mode: str = "watershed",
+                        peak_kernel: int = 9, peak_thr: float = 0.4) -> np.ndarray:
     """Decode a [H,W] dome → an RGBA (BGRA, for cv2.imwrite) overlay: each INSTANCE
-    (from the watershed "march out from each peak" split — NOT one big threshold blob,
-    so two touching objects whose dome only dips still come apart) filled with a distinct
-    colour at `body_alpha`, its contour in the SAME hue at `border_alpha`, a `<N>px` area
-    label + centroid dot. Transparent elsewhere. The "instance segmentation" view (vs the
-    raw `dome` heatmap); the dashboard's overlay-opacity slider scales the whole thing.
-    Frame-edge-touching (clipped) instances get a thin border + an `·E` tag."""
+    (split by `mode` — 'cc' = threshold + connected-components, right for a flat-top dome
+    that hits 0 between objects; 'watershed' = march out from dome peaks, for a proportional
+    ramp that only dips between touchers) filled with a distinct colour at `body_alpha`, its
+    contour in the SAME hue at `border_alpha`, a `<N>px` area label + centroid dot. Transparent
+    elsewhere. The "instance segmentation" view (vs the raw `dome` heatmap); the dashboard's
+    overlay-opacity slider scales the whole thing. Frame-edge-touching (clipped) instances get
+    a thin border + an `·E` tag."""
     import cv2
 
     from opndet.decode import decode_seg
     H, W = dome.shape
-    blobs, lbl = decode_seg(dome, threshold=thr, min_area=min_area, mode="watershed",
+    blobs, lbl = decode_seg(dome, threshold=thr, min_area=min_area, mode=mode,
                             peak_kernel=peak_kernel, peak_thr=peak_thr, return_labels=True)
     canvas = np.zeros((H, W, 4), dtype=np.uint8)   # BGRA
     mx = max(1.0, edge_margin * W) if edge_margin > 0 else 1.0
@@ -205,8 +207,8 @@ def _render_seg_decoded(dome: np.ndarray, thr: float = 0.5, min_area: int = 4,
 
 
 def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/seg",
-             fg_thresh: float = 0.5, edge_margin: float = 0.0, peak_kernel: int = 9,
-             peak_thr: float = 0.4, db=None) -> None:
+             fg_thresh: float = 0.5, edge_margin: float = 0.0, mode: str = "watershed",
+             peak_kernel: int = 9, peak_thr: float = 0.4, db=None) -> None:
     """Vis for the seg head, on the samples of `ds`, registered under `tag` (e.g. `val/seg`,
     `test/seg`). Per sample:
       base    : sample_<i>_rgb.png         — the clean letterboxed RGB (written ONCE)
@@ -243,7 +245,7 @@ def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/
                 save_heatmap_overlay_png(gt, str(gt_heat), colormap=cv2.COLORMAP_TURBO, gamma=0.5)
             if not gt_seg.exists():
                 cv2.imwrite(str(gt_seg), _render_seg_decoded(gt, fg_thresh, edge_margin=edge_margin,
-                                                             peak_kernel=peak_kernel, peak_thr=peak_thr))
+                                                             mode=mode, peak_kernel=peak_kernel, peak_thr=peak_thr))
             # --- predicted dome: this epoch ---
             pred = torch.sigmoid(model.forward_with_alias(img_t.unsqueeze(0).to(device), "raw"))[0, 0].cpu().numpy()
             if pred.shape != (ih, iw):
@@ -252,7 +254,7 @@ def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/
             pred_seg = epdir / f"sample_{i}_pred_seg.png"
             save_heatmap_overlay_png(pred, str(pred_heat), colormap=cv2.COLORMAP_TURBO, gamma=0.5)
             cv2.imwrite(str(pred_seg), _render_seg_decoded(pred, fg_thresh, edge_margin=edge_margin,
-                                                           peak_kernel=peak_kernel, peak_thr=peak_thr))
+                                                           mode=mode, peak_kernel=peak_kernel, peak_thr=peak_thr))
             if db is None:
                 continue
             try:
@@ -422,9 +424,16 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                                                             # edge, so >0.5 is the INNER HALF of the object;
                                                             # ~0.05 ≈ the full object footprint (= the OBB).
     seg_edge_margin = float(c.get("seg_edge_margin", 0.0)) # >0 → clipped (frame-edge) blobs are lenient
-    seg_peak_kernel = int(c.get("seg_peak_kernel", 9))     # watershed-decode: NMS window (px) for dome peaks
+    # decode mode: "cc" (threshold + connected-components — right for a flat-top dome, which hits a
+    # true 0 between objects; immune to a bumpy near-1.0 plateau) or "watershed" (march out from dome
+    # peaks — for a proportional ramp that only dips between touchers). Auto-picks "cc" when the GT is
+    # flat-top (seg_dome_ramp_px>0): a real conv plateau is never perfectly flat, so watershed-from-
+    # local-maxima would shatter one object into a Voronoi of wedges around each tiny bump.
+    _ramp_px = float(c.get("seg_dome_ramp_px", 0.0) or 0.0)
+    seg_decode_mode = str(c.get("seg_decode_mode") or ("cc" if _ramp_px > 0.0 else "watershed"))
+    seg_peak_kernel = int(c.get("seg_peak_kernel", 9))     # watershed-decode only: NMS window (px) for dome peaks
     seg_peak_thr = float(c.get("seg_peak_thr", 0.4))       #   and the min height a dome max needs to be a seed
-    seg_dk = dict(peak_kernel=seg_peak_kernel, peak_thr=seg_peak_thr)
+    seg_dk = dict(mode=seg_decode_mode, peak_kernel=seg_peak_kernel, peak_thr=seg_peak_thr)
     viz_on_best = bool(c.get("viz_only_on_improvement", True))
     ema_decay = float(c.get("ema_decay", 0.999))
     ema = EMA(model, decay=ema_decay, tau=int(c.get("ema_tau", 2000))) if ema_decay > 0 else None

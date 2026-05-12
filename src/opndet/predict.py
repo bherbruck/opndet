@@ -119,6 +119,7 @@ def predict_video(
     device: str = "cpu",
     save_path: str | Path = "predict_out.mp4",
     stride: int = 4,
+    decode_mode: str = "watershed",
     max_frames: int | None = None,
     print_every: int = 30,
     temporal_n_frames: int = 8,
@@ -234,7 +235,7 @@ def predict_video(
                 dome = out_np[0, 0]  # [h, w] at canvas coords
                 heat = cv2.applyColorMap((np.clip(dome, 0.0, 1.0) ** 0.5 * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
                 vis = cv2.addWeighted(canvas, 0.55, heat, 0.45, 0)
-                blobs, lbl = decode_seg(dome, threshold=seg_thr, min_area=4, return_labels=True)  # watershed-from-peaks
+                blobs, lbl = decode_seg(dome, threshold=seg_thr, min_area=4, mode=decode_mode, return_labels=True)
                 for j, b in enumerate(blobs):
                     cnts, _ = cv2.findContours((lbl == j + 1).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     cv2.drawContours(vis, cnts, -1, (0, 255, 0), 1)
@@ -298,6 +299,7 @@ def predict_image(
     device: str = "cpu",
     save_path: str | Path | None = None,
     stride: int = 4,
+    decode_mode: str = "watershed",
 ) -> list[dict]:
     m = load_model(model_config, ckpt, device=device)
     in_ch, h, w = m.input_shape
@@ -318,7 +320,7 @@ def predict_image(
         dome = out_np[0, 0][py:py + ih, px:px + iw]                       # strip letterbox pad
         dome = cv2.resize(dome, (info["orig_w"], info["orig_h"]), interpolation=cv2.INTER_LINEAR)
         thr = threshold if (threshold and threshold > 0) else 0.05
-        blobs, lbl = decode_seg(dome, threshold=thr, min_area=4, return_labels=True)  # watershed-from-peaks
+        blobs, lbl = decode_seg(dome, threshold=thr, min_area=4, mode=decode_mode, return_labels=True)
         results = [{"cx": round(b.cx, 1), "cy": round(b.cy, 1), "area_px": int(b.area_px),
                     "peak": round(b.peak, 3), "x1": round(b.x1, 1), "y1": round(b.y1, 1),
                     "x2": round(b.x2, 1), "y2": round(b.y2, 1)} for b in blobs]

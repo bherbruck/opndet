@@ -109,6 +109,7 @@ def _cmd_predict(args: argparse.Namespace) -> int:
             device=args.device,
             save_path=args.save or "predict_out.mp4",
             stride=args.stride,
+            decode_mode=args.decode_mode,
             max_frames=args.max_frames,
         )
         print(json.dumps(stats, indent=2))
@@ -126,6 +127,7 @@ def _cmd_predict(args: argparse.Namespace) -> int:
         device=args.device,
         save_path=args.save,
         stride=args.stride,
+        decode_mode=args.decode_mode,
     )
     print(json.dumps(results, indent=2))
     if args.save:
@@ -377,6 +379,10 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--ckpt", default=None)
     pp.add_argument("--threshold", type=float, default=0.3)
     pp.add_argument("--stride", type=int, default=4)
+    pp.add_argument("--decode-mode", default="watershed", choices=["watershed", "cc"],
+                    help="(seg models only) dome→instances: 'cc' = threshold + connected-components "
+                         "(use for a flat-top dome — one blob per object, immune to plateau bumps); "
+                         "'watershed' = march out from dome peaks (proportional-ramp dome only)")
     pp.add_argument("--device", default="cpu")
     pp.add_argument("--save", default=None,
                     help="Save annotated output. For --image: PNG/JPG. For --video: MP4 (default predict_out.mp4)")
