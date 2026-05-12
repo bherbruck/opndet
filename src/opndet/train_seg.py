@@ -195,14 +195,14 @@ def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/
       overlay : dome_pred / dome_gt        — the dome as a TURBO heatmap (pred: this epoch; gt: once)
       overlay : seg_pred  / seg_gt         — the DECODED instance view: filled blobs + same-hue
                                              borders + per-blob `<N>px` area (pred: this epoch; gt: once)
-      boxes   : kind pred / gt             — per-blob AABB + score=peak + meta {area_px, cx, cy}
+    No box rows — this is a dense-dome head, not a box model; per-blob extent lives in the
+    seg_pred / seg_gt overlay's `<N>px` labels, an AABB fitted around a dome blob is meaningless.
     Files go under vis/<tag-with-_>/ ; the dashboard auto-discovers the overlay kinds and its
     overlay-opacity slider scales them (same as obj_heat / prior_heat). GT is deterministic
     (no aug on val/test) → written once to a stable path, re-referenced each call. Only the
     caller decides *when* to run this (the loop runs it on a new-best epoch — see train_seg)."""
     import cv2
 
-    from opndet.decode import decode_seg
     from opndet.visualize import _denorm, save_heatmap_overlay_png
     shared = run_dir / "vis" / tag.replace("/", "_")
     epdir = shared / f"ep_{ep:03d}"
@@ -243,15 +243,6 @@ def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/
                 db.add_overlay(ep, tag, i, "seg_pred", pred_seg)
                 db.add_overlay(ep, tag, i, "dome_gt", gt_heat)
                 db.add_overlay(ep, tag, i, "seg_gt", gt_seg)
-                for kind, arr in (("pred", pred), ("gt", gt)):
-                    blobs = decode_seg(arr, threshold=fg_thresh, min_area=4, mode="watershed",
-                                       peak_kernel=peak_kernel, peak_thr=peak_thr)
-                    if blobs:
-                        aabbs = np.array([[b.x1, b.y1, b.x2, b.y2] for b in blobs], np.float32)
-                        peaks = np.array([b.peak for b in blobs], np.float32)
-                        meta = {j: {"area_px": int(b.area_px), "cx": round(b.cx, 1), "cy": round(b.cy, 1)}
-                                for j, b in enumerate(blobs)}
-                        db.add_boxes(ep, tag, i, kind, aabbs, scores=peaks, meta=meta)
             except Exception:
                 pass
 

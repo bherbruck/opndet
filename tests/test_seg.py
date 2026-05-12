@@ -285,8 +285,9 @@ def test_train_seg_end_to_end(tmp_path):
         assert "val/seg" in {r[0] for r in con.execute("select distinct tag from images").fetchall()}
         kinds = {r[0] for r in con.execute("select distinct kind from overlays").fetchall()}
         assert {"dome_pred", "dome_gt", "seg_pred", "seg_gt"} <= kinds   # heatmap + decoded, pred + gt
-        bk = {r[0] for r in con.execute("select distinct kind from boxes").fetchall()}
-        assert "gt" in bk   # per-blob AABB + area_px meta (gt always has blobs; pred too once trained)
+        # no box rows for a seg run — it's a dense-dome head, not a box model (an AABB fitted
+        # around a dome blob is meaningless; per-blob extent is the `<N>px` label in the seg overlay)
+        assert not con.execute("select count(*) from boxes").fetchone()[0]
     finally:
         con.close()
     # `opndet eval` routes a seg ckpt to the seg eval path
