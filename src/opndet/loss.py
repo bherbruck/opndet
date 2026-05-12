@@ -661,18 +661,21 @@ class SegDomeLoss(nn.Module):
                l_qfl and l_dice are the same order → `w_qfl=w_dice=1` is genuinely balanced.
                (Adam normalises the overall scale, so the printed `loss` shrinking from
                ~hundreds to ~1 does NOT change the effective step / need an LR re-tune.)
-      l_dice : soft Dice on the foreground — sigmoid(logit) vs (dome > fg_thresh) — pulls
-               the boundary/extent right and punishes false-positive pixels.
+      l_dice : SOFT Dice — sigmoid(logit) vs the soft dome itself (squared-denominator form
+               `1 − 2Σ(p·t)/(Σp²+Σt²)`, which bottoms out at p==t). Crucially the target is the
+               RAMP, not a binarized `dome>thresh` footprint: a binary-footprint Dice rewards a
+               flat-topped p≈1 over the whole object → it FIGHTS l_qfl (which wants the ramp) and,
+               weighted up, turns the prediction into a solid blob instead of a CenterNet-style
+               peak-with-gradient. Soft-target Dice pulls the same shape l_qfl does (overlap/extent
+               emphasis vs l_qfl's per-pixel emphasis), so the two cooperate at any w_dice.
       loss = w_qfl·l_qfl + w_dice·l_dice   (both ≈ O(0..1), so the weights are real)
     """
 
-    def __init__(self, qfl_beta: float = 2.0, w_qfl: float = 1.0, w_dice: float = 1.0,
-                 fg_thresh: float = 1e-3):
+    def __init__(self, qfl_beta: float = 2.0, w_qfl: float = 1.0, w_dice: float = 1.0):
         super().__init__()
         self.qfl_beta = float(qfl_beta)
         self.w_qfl = float(w_qfl)
         self.w_dice = float(w_dice)
-        self.fg_thresh = float(fg_thresh)
 
     def forward(self, raw_logit: torch.Tensor, target: dict) -> dict:
         dome = target["dome"]
@@ -682,10 +685,10 @@ class SegDomeLoss(nn.Module):
         p = torch.sigmoid(raw_logit)
         bce = F.binary_cross_entropy_with_logits(raw_logit, dome, reduction="none")
         l_qfl = ((dome - p).abs().pow(self.qfl_beta) * bce).mean()        # per-pixel mean, ≈ O(0..2)
-        t = (dome > self.fg_thresh).to(p.dtype)
+        t = dome                                                          # SOFT target — Dice on the ramp, not a binary footprint
         dims = tuple(range(1, p.dim()))
         inter = (p * t).sum(dim=dims)
-        denom = p.sum(dim=dims) + t.sum(dim=dims)
+        denom = (p * p).sum(dim=dims) + (t * t).sum(dim=dims)
         l_dice = (1.0 - (2.0 * inter + 1.0) / (denom + 1.0)).mean()       # ≈ O(0..1)
         loss = self.w_qfl * l_qfl + self.w_dice * l_dice
         return {"loss": loss, "l_qfl": l_qfl.detach(), "l_dice": l_dice.detach()}
