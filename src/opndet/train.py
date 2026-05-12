@@ -526,9 +526,9 @@ def _colab_download(path: Path) -> None:
 
 def _download_run(out_dir: Path, c: dict) -> None:
     """End-of-training Colab download. Controlled by `download:` in the config:
-      "best"   (default) — just `<name>_best.pt` + `metrics.duckdb` (the things you actually
-                 want off the box; the run dir's vis/ PNGs are dashboard artifacts served live,
-                 not worth GB of zip).
+      "best"   (default) — `<name>_best.pt` + `config.yaml` + `metrics.duckdb` (the things you
+                 actually want off the box; the run dir's vis/ PNGs are dashboard artifacts served
+                 live, not worth GB of zip).
       "bundle"          — zip the run dir (minus tb/ and vis/ — i.e. ckpts + metrics.duckdb +
                  config + eval reports) and download it. `bundle_include_vis: true` adds the
                  vis PNGs back; `bundle_include_tb: true` adds tfevents.
@@ -551,6 +551,9 @@ def _download_run(out_dir: Path, c: dict) -> None:
     best = next(iter(sorted(out_dir.glob("*_best.pt"))), None) or next(iter(sorted(out_dir.glob("*.pt"))), None)
     if best is not None:
         targets.append(best)
+    cfg_yaml = out_dir / "config.yaml"
+    if cfg_yaml.exists():
+        targets.append(cfg_yaml)
     db = out_dir / "metrics.duckdb"
     if db.exists():
         targets.append(db)
@@ -561,6 +564,25 @@ def _download_run(out_dir: Path, c: dict) -> None:
         print(f"download: {p.name} ({p.stat().st_size / 1e6:.1f} MB)")
     for p in targets:
         _colab_download(p)
+
+
+def _persist_run_config(out_dir: Path, cfg_path: "str | Path", resolved: dict) -> None:
+    """Save the run's config into the run dir so it travels with the checkpoints / bundle:
+    `train.yaml` = the source config file verbatim (keeps your comments), `config.yaml` =
+    the fully-merged spec that actually ran (preset defaults applied). Both are picked up by
+    `_bundle_run` (it only excludes `tb/` and `vis/`). Best-effort — never fails the run."""
+    import shutil
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        src = Path(cfg_path)
+        if src.is_file():
+            shutil.copy2(src, out_dir / "train.yaml")
+    except Exception:
+        pass
+    try:
+        (out_dir / "config.yaml").write_text(yaml.safe_dump(resolved, sort_keys=False, default_flow_style=False))
+    except Exception:
+        pass
 
 
 def _resolve_out_dir(base: Path, auto_increment: bool = True) -> Path:
@@ -640,6 +662,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             base = Path(c.get("out_dir", "runs/exp1"))
         out_dir = _resolve_out_dir(base, auto_increment=bool(c.get("auto_increment", True)))
     out_dir.mkdir(parents=True, exist_ok=True)
+    _persist_run_config(out_dir, cfg_path, c)
     tb_dir = out_dir / "tb"
     print(f"out_dir: {out_dir}")
     seed = int(c.get("seed", 0))

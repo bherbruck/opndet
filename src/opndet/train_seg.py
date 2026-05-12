@@ -31,7 +31,7 @@ from opndet.decode import decode_seg
 from opndet.encode import encode_targets_seg, obb_to_aabb
 from opndet.loss import SegDomeLoss
 from opndet.presets import resolve as _resolve_preset
-from opndet.train import EMA, _download_run, _resolve_out_dir, cosine_lr
+from opndet.train import EMA, _download_run, _persist_run_config, _resolve_out_dir, cosine_lr
 from opndet.training_defaults import deep_merge, defaults_for
 from opndet.yaml_build import build_model_from_yaml
 
@@ -287,6 +287,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         base = Path(c.get("runs_dir", "runs")) / str(c.get("name", c["model_config"]))
         out_dir = _resolve_out_dir(base, auto_increment=bool(c.get("auto_increment", True)))
     out_dir.mkdir(parents=True, exist_ok=True)
+    _persist_run_config(out_dir, cfg_path, c)
     print(f"out_dir: {out_dir}")
 
     db = None
