@@ -495,8 +495,10 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
     st = max(1, int(getattr(cfg, "seg_stride", 1)))
     ramp = float(getattr(cfg, "seg_dome_ramp_px", 0.0) or 0.0)
     ramp_d = max(ramp / st, 1e-3) if ramp > 0.0 else 0.0     # ramp width in seg-res cells
-    gap = float(getattr(cfg, "seg_instance_gap_px", 0.0) or 0.0)
-    gap_r = int(round(gap / st / 2.0)) if gap > 0.0 else 0   # contact-carve radius in seg-res cells
+    gap_d = int(round(float(getattr(cfg, "seg_instance_gap_px", 0.0) or 0.0) / st))   # corridor width, seg-res cells
+    # the bare contact boundary (a fg cell + its differing neighbour) is already ~2 cells wide,
+    # so to make the corridor ≈ gap_d cells we only dilate it by ~(gap_d-2)/2 extra each side:
+    gap_extra_r = max(0, int(round(gap_d / 2.0)) - 1)
     Hd, Wd = int(cfg.img_h) // st, int(cfg.img_w) // st
     dome = np.zeros((Hd, Wd), dtype=np.float32)
     if masks is not None and len(masks) > 0:
@@ -507,10 +509,10 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
             if m.shape != (Hd, Wd):
                 m = _cv2.resize(m.astype(np.uint8), (Wd, Hd), interpolation=_cv2.INTER_NEAREST) > 0
             bms.append(np.ascontiguousarray(m))
-        if gap_r > 0 and len(bms) > 1:
-            # carve the inter-instance contact corridor (NOT a uniform erosion — isolated edges
-            # keep full size). Boundary = a fg pixel adjacent to a *different* nonzero label;
-            # dilate it by gap_r → ~gap-wide 0-strip centred on every contact line.
+        if gap_d >= 1 and len(bms) > 1:
+            # carve a ~gap_d-cell 0-corridor along inter-instance contact lines ONLY (isolated
+            # edges keep full size). Boundary = a fg cell adjacent to a *different* nonzero label
+            # (already ~2 cells wide); dilate by gap_extra_r to reach the requested total width.
             lab = np.zeros((Hd, Wd), np.int32)
             for i, m in enumerate(bms):
                 lab[m] = i + 1
@@ -520,7 +522,8 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
             vd = (lab[:-1, :] != lab[1:, :]) & (lab[:-1, :] > 0) & (lab[1:, :] > 0)
             bnd[:-1, :] |= vd; bnd[1:, :] |= vd
             if bnd.any():
-                corridor = _cv2.dilate(bnd.astype(np.uint8), np.ones((2 * gap_r + 1, 2 * gap_r + 1), np.uint8)) > 0
+                corridor = (bnd if gap_extra_r == 0
+                            else _cv2.dilate(bnd.astype(np.uint8), np.ones((2 * gap_extra_r + 1,) * 2, np.uint8)) > 0)
                 bms = [m & ~corridor for m in bms]
         # Pad the canvas before the distance transform with the EDGE replicated, then crop back:
         # a mask that runs to the array border (a frame-clipped object, or one against the
