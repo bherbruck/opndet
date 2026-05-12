@@ -167,6 +167,45 @@ def test_encode_seg_clipped_edge_not_ramped():
     assert dome[70, 96] == 0.0, "outside the disk → 0"
 
 
+def test_decode_coco_rle():
+    from opndet.dataset import _decode_coco_rle
+    exp = np.zeros((4, 4), np.uint8); exp[:, 2:] = 1   # left half bg, right half fg
+    # uncompressed (list counts) and compressed (ASCII string) forms, column-major: [bg=8, fg=8]
+    assert np.array_equal(_decode_coco_rle({"size": [4, 4], "counts": [8, 8]}), exp)
+    assert np.array_equal(_decode_coco_rle({"size": [4, 4], "counts": "88"}), exp)
+    # all-foreground 2x2 → counts [0, 4]
+    assert np.array_equal(_decode_coco_rle({"size": [2, 2], "counts": [0, 4]}), np.ones((2, 2), np.uint8))
+    # bytes counts (some loaders hand it back as bytes)
+    assert np.array_equal(_decode_coco_rle({"size": [4, 4], "counts": b"88"}), exp)
+
+
+def test_seg_coco_rle_gt_through_dataset(tmp_path):
+    import json
+    import cv2
+    from opndet.dataset import OpndetDataset, load_coco_single_class
+    from opndet.encode import encode_targets_seg
+    img = (np.random.default_rng(1).random((40, 60, 3)) * 255).astype(np.uint8)
+    img_dir = tmp_path / "imgs"; img_dir.mkdir()
+    cv2.imwrite(str(img_dir / "a.png"), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    # one instance = the left 30 columns (column-major counts: 30*40 fg, then 30*40 bg)
+    coco = {"images": [{"id": 1, "file_name": "a.png", "width": 60, "height": 40}],
+            "annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [0, 0, 30, 40], "iscrowd": 0,
+                             "segmentation": {"size": [40, 60], "counts": [0, 1200, 1200]}}],
+            "categories": [{"id": 0, "name": "obj"}]}
+    cp = tmp_path / "ann.json"; cp.write_text(json.dumps(coco))
+    samps = load_coco_single_class(cp, img_dir)
+    assert samps[0].coco_segs is not None and isinstance(samps[0].coco_segs[0], dict)
+    class _Cfg:
+        img_h = 40; img_w = 64; seg_stride = 1; seg_dome_ramp_px = 0; seg_instance_gap_px = 0
+    def _enc(b, obbs=None, masks=None):
+        return encode_targets_seg(_Cfg(), masks=masks)
+    _enc._takes_masks = True
+    ds = OpndetDataset(samps, 40, 64, augment_fn=None, encode_fn=_enc, mosaic_prob=0.0)
+    assert ds._has_masks
+    dome = ds[0][2]["dome"][0].numpy()
+    assert dome.max() > 0.99 and int((dome > 0).sum()) > 200    # the left-half blob decoded + domed
+
+
 def test_seg_coco_polygon_gt_through_dataset(tmp_path):
     import json
     import cv2

@@ -29,6 +29,50 @@ class Sample:
                                     #   image-px, aligned with `boxes`; rasterized to an instance-label map in __getitem__
 
 
+def _decode_coco_rle(rle: dict) -> np.ndarray:
+    """Decode a COCO RLE `{"size": [h, w], "counts": ...}` to a [h, w] uint8 binary mask.
+    Handles both forms: `counts` a list of ints (uncompressed) or the LEB-ish ASCII string
+    (compressed — the canonical cocoapi `rleFrString` algorithm). Column-major (Fortran) fill.
+    Native impl so opndet doesn't drag in pycocotools (a C-extension that's flaky on Colab)."""
+    h, w = int(rle["size"][0]), int(rle["size"][1])
+    counts = rle["counts"]
+    if isinstance(counts, (bytes, bytearray)):
+        counts = counts.decode("ascii")
+    if isinstance(counts, str):
+        cnts: list[int] = []
+        p, L = 0, len(counts)
+        while p < L:
+            x, k, more = 0, 0, 1
+            while more:
+                c = ord(counts[p]) - 48
+                x |= (c & 0x1F) << (5 * k)
+                more = c & 0x20
+                p += 1
+                k += 1
+                if not more and (c & 0x10):
+                    x |= (-1) << (5 * k)
+            if len(cnts) > 2:
+                x += cnts[-2]
+            cnts.append(x)
+    else:
+        cnts = [int(v) for v in counts]
+    flat = np.zeros(h * w, dtype=np.uint8)
+    pos, v = 0, 0
+    for c in cnts:
+        if c < 0:
+            c = 0
+        end = pos + c
+        if end > h * w:
+            end = h * w
+        if v:
+            flat[pos:end] = 1
+        pos = end
+        v ^= 1
+        if pos >= h * w:
+            break
+    return flat.reshape((h, w), order="F")
+
+
 def _load_obbs_for_image(obb_dir: Path, image_path: Path, img_w: int, img_h: int) -> np.ndarray | None:
     """Look up <obb_dir>/<basename>.txt; parse YOLOv8-OBB lines into [N,5] OBBs.
     Returns None if the file doesn't exist (caller falls back to AABB).
@@ -306,19 +350,24 @@ class OpndetDataset(Dataset):
         for i, seg in enumerate(segs):
             if seg is None:
                 continue
-            if isinstance(seg, dict):  # RLE — needs pycocotools
-                try:
-                    from pycocotools import mask as _M  # type: ignore
-                except ImportError as e:
-                    raise RuntimeError("COCO RLE segmentation needs `pycocotools` (pip install pycocotools), "
-                                       "or re-export your dataset with polygon segmentation.") from e
-                m = _M.decode(seg)
+            if isinstance(seg, dict):  # COCO RLE (compressed string counts, or list counts)
+                m = _decode_coco_rle(seg)
+                if m.shape != (s.img_h, s.img_w):  # RLE size disagrees with the image record — best-effort
+                    m = cv2.resize(m.astype(np.uint8), (s.img_w, s.img_h), interpolation=cv2.INTER_NEAREST)
                 lbl[m > 0] = i + 1
             else:  # list of polygon rings: [[x,y,x,y,...], ...]
                 for ring in seg:
-                    pts = np.asarray(ring, dtype=np.float32).reshape(-1, 2)
-                    if pts.shape[0] >= 3:
-                        cv2.fillPoly(lbl, [np.round(pts).astype(np.int32)], int(i + 1))
+                    try:
+                        pts = np.asarray(ring, dtype=np.float64).reshape(-1, 2)
+                    except (ValueError, TypeError):
+                        continue  # malformed ring (some exporters emit junk) — skip it
+                    # also skip rings with coords wildly out of the image (a known Roboflow-export glitch
+                    # concatenates numbers → e.g. x=639108 on a 1200-wide image → would flood-fill garbage)
+                    if (pts.shape[0] < 3 or not np.isfinite(pts).all()
+                            or (pts[:, 0] < -2).any() or (pts[:, 0] > s.img_w + 2).any()
+                            or (pts[:, 1] < -2).any() or (pts[:, 1] > s.img_h + 2).any()):
+                        continue
+                    cv2.fillPoly(lbl, [np.round(pts).astype(np.int32)], int(i + 1))
         return lbl
 
     def _instance_label_map(self, s: "Sample") -> np.ndarray | None:
