@@ -140,7 +140,7 @@ def predict_video(
     m = load_model(model_config, ckpt, device=device)
     in_ch, h, w = m.input_shape
     is_seg = "dome" in getattr(m, "aliases", {})
-    seg_thr = threshold if (threshold and threshold > 0) else 0.5
+    seg_thr = threshold if (threshold and threshold > 0) else 0.05  # seg dome: ~0.05 ≈ full footprint, 0.5 = inner half
 
     acc = None
     if in_ch == 4 and not is_seg:

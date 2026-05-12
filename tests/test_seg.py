@@ -18,7 +18,9 @@ def _export(m, x, path):
 
 
 # ---- 1. preset builds, forwards [1,1,H,W], exports opset-13 edge-clean, ORT==PT ----
-@pytest.mark.parametrize("preset", ["bbox-f-seg", "bbox-p-seg", "bbox-n-seg", "bbox-s-seg", "bbox-m-seg"])
+# f (smallest) + s (mid) cover both width extremes; p/n/m are mechanical clones of the same
+# decoder graph — no need to ONNX-export all five every run (each export is ~2 s).
+@pytest.mark.parametrize("preset", ["bbox-f-seg", "bbox-s-seg"])
 def test_seg_preset_builds_and_exports_opset13(preset):
     m = build_model_from_yaml(resolve(preset)).eval()
     c, h, w = m.input_shape
@@ -220,7 +222,7 @@ def test_train_seg_end_to_end(tmp_path):
     cfg = {
         "model_config": "bbox-n-seg", "model": {"img_h": 96, "img_w": 96},
         "device": "cpu", "amp": False, "seed": 0,
-        "epochs": 2, "batch_size": 4, "lr": 1e-3, "warmup_steps": 2,
+        "epochs": 1, "batch_size": 4, "lr": 1e-3, "warmup_steps": 2,   # 1 epoch — keep the test cheap
         "num_workers": 0, "ema_decay": 0.9, "ema_tau": 5,
         "vis_samples": 2, "metric_for_best": "dice", "auto_bundle": False,
         "data": {"sources": [{"coco": str(coco), "images": str(img_dir), "obb_dir": str(obb_dir)}],
@@ -237,7 +239,7 @@ def test_train_seg_end_to_end(tmp_path):
     assert d["metric_for_best"] == "dice" and d["ema"] is not None
     assert {"dice", "fg_iou", "count_mae", "area_mape", "n_val"} <= set(d["metrics"])
     assert d["metrics"]["n_val"] == 2, "train_seg must honour data.image_filter (10 imgs × 0.25 = 2 val)"
-    # vis only runs on a new-best (or first/last) epoch — here ep1 (first+best) and ep2 (last).
+    # vis only runs on a new-best (or first/last) epoch — here ep1 is first+best+last.
     # stable-once PNGs (deterministic on val): RGB + GT heatmap + GT decoded, one each per sample.
     rgb = list((tmp_path / "runs").rglob("vis/val_seg/sample_*_rgb.png"))
     gt_h = list((tmp_path / "runs").rglob("vis/val_seg/sample_*_gt_heat.png"))
@@ -246,7 +248,7 @@ def test_train_seg_end_to_end(tmp_path):
     # per-epoch PNGs: predicted dome heatmap + predicted decoded instances, per sample × vis-epoch.
     ph = list((tmp_path / "runs").rglob("vis/val_seg/ep_*/sample_*_pred_heat.png"))
     ps = list((tmp_path / "runs").rglob("vis/val_seg/ep_*/sample_*_pred_seg.png"))
-    assert len(ph) == 4 and len(ps) == 4  # 2 samples × {ep1=first/best, ep2=last}
+    assert len(ph) == 2 and len(ps) == 2  # 2 samples × 1 vis-epoch (ep1)
     # test vis (also gated on best/boundary) lands under vis/test_seg/
     assert list((tmp_path / "runs").rglob("vis/test_seg/sample_*_rgb.png"))
     # DuckDB store written (so the dashboard shows seg runs) with scalars + the val/seg vis

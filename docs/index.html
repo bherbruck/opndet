@@ -140,7 +140,7 @@
       <div class="small">
         <p style="margin:6px 0">Runs entirely in browser via onnxruntime-web (WASM). No upload to server.</p>
         <p style="margin:6px 0">Default expects a 5-channel <code>[1,5,H/4,W/4]</code> output: <code>(obj, cx, cy, w, h)</code> with cell-relative offsets and image-normalized w/h.</p>
-        <p style="margin:6px 0">A <strong>1-channel</strong> <code>[1,1,H,W]</code> output is auto-detected as a <code>bbox-*-seg</code> dense dome → rendered as a heatmap + flood-fill connected-components for per-blob centroid (red dot) &amp; pixel-area. The threshold slider becomes the dome foreground cut (0.5 = "inside the object past half-depth").</p>
+        <p style="margin:6px 0">A <strong>1-channel</strong> <code>[1,1,H,W]</code> output is auto-detected as a <code>bbox-*-seg</code> dense dome → rendered as a heatmap + flood-fill connected-components for per-blob centroid (red dot) &amp; pixel-area. The threshold slider is the dome foreground cut — the dome ramps 1→0 <em>linearly</em> out to the object edge, so <strong>drop it to ~0.05 for the full object footprint</strong> (0.5 ≈ just the inner half).</p>
         <p style="margin:6px 0">If your ONNX expects already-normalized fp32 [0,1] - mean/std input, uncheck the <em>baked norm</em> box.</p>
       </div>
     </fieldset>

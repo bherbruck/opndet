@@ -91,7 +91,7 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: flo
         logit = model.forward_with_alias(imgs, "raw")   # [B,1,H,W]
         p = torch.sigmoid(logit)
         pf = (p > fg_thresh).float()
-        tf = (dome_t > 1e-3).float()
+        tf = (dome_t > fg_thresh).float()   # SAME cut for pred & GT — else a perfect pred caps Dice ≈ 0.4
         inter += float((pf * tf).sum()); denom += float(pf.sum() + tf.sum())
         inter_i += float((pf * tf).sum()); union_i += float(((pf + tf) > 0).float().sum())
         pn = p.cpu().numpy(); tn = dome_t.cpu().numpy()
@@ -108,7 +108,9 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: flo
         "dice": dice,
         "fg_iou": iou,
         "count_mae": float(np.mean(count_errs)) if count_errs else 0.0,
-        "area_mape": float(np.mean(area_apes)) if area_apes else 0.0,
+        # NaN (not 0.0) when nothing matched — "no measurable blobs" isn't "perfect areas",
+        # and 0.0 would be an unbeatable spurious best for `metric_for_best: area_mape`.
+        "area_mape": float(np.mean(area_apes)) if area_apes else float("nan"),
         "n_val": n_imgs,
     }
 
@@ -339,7 +341,10 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     total_steps = epochs * steps_per_epoch
     warmup = int(c.get("warmup_steps", min(500, total_steps // 20)))
     log_every = max(1, steps_per_epoch // 8)   # ~8 train/loss points per epoch in the dashboard
-    seg_fg = float(c.get("seg_fg_thresh", 0.5))            # dome foreground cut for decode/metrics/vis
+    seg_fg = float(c.get("seg_fg_thresh", 0.05))           # dome cut for decode/metrics/vis — keep LOW:
+                                                            # the dome ramps 1→0 linearly out to the egg's
+                                                            # edge, so >0.5 is the INNER HALF of the egg;
+                                                            # ~0.05 ≈ the full egg footprint (= the OBB).
     seg_edge_margin = float(c.get("seg_edge_margin", 0.0)) # >0 → clipped (frame-edge) blobs are lenient
     viz_on_best = bool(c.get("viz_only_on_improvement", True))
     ema_decay = float(c.get("ema_decay", 0.999))
@@ -459,6 +464,12 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
 
     if db is not None:
         db.close()
+    if not ckpt_path.exists() and (out_dir / "last.pt").exists():
+        # never recorded a metric improvement (e.g. metric_for_best=area_mape and every
+        # epoch was NaN/empty) — fall back so predict/eval/export have a checkpoint.
+        import shutil as _sh
+        _sh.copy2(out_dir / "last.pt", ckpt_path)
+        print(f"  (no {metric_for_best} improvement ever — best = last; {ckpt_path})")
     if bool(c.get("auto_bundle", True)):
         try:
             _bundle_run(out_dir, include_tb=False)

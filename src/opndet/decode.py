@@ -232,7 +232,7 @@ class SegBlob:
     y2: float
 
 
-def decode_seg(dome: np.ndarray, threshold: float = 0.5, min_area: int = 4) -> list[SegBlob]:
+def decode_seg(dome: np.ndarray, threshold: float = 0.05, min_area: int = 4) -> list[SegBlob]:
     """Decode one dense dome map [H, W] (the bbox-*-seg output channel) into instances.
 
     Unlike the detector heads (which bake peak-suppression into the graph so NO
@@ -242,8 +242,12 @@ def decode_seg(dome: np.ndarray, threshold: float = 0.5, min_area: int = 4) -> l
     touching objects, so plain 4-connectivity components already separate them; no
     NMS, no watershed needed for convex blobs.
 
-    threshold: foreground cut on the dome (0.5 = "inside the object by >half-depth").
-               Lower it to recover the full object area; raise it to get just cores.
+    threshold: foreground cut. The dome ramps 1.0 (object center) → 0.0 (object
+               EDGE) *linearly*, so `threshold` is "how deep into the object":
+               ~0.05 ≈ the full footprint (the object's true extent → `area_px`
+               ≈ the real area); 0.5 ≈ only the inner half (~1/4 the area).
+               Default is low (0.05) so areas come out right; raise it only if
+               you want just the cores.
     min_area : drop blobs smaller than this many px (denoise).
     Returns blobs sorted by descending peak.
     """
@@ -265,7 +269,7 @@ def decode_seg(dome: np.ndarray, threshold: float = 0.5, min_area: int = 4) -> l
     return out
 
 
-def decode_seg_batch(out: np.ndarray, threshold: float = 0.5, min_area: int = 4) -> list[list[SegBlob]]:
+def decode_seg_batch(out: np.ndarray, threshold: float = 0.05, min_area: int = 4) -> list[list[SegBlob]]:
     """out: [B, 1, H, W] dome maps → per-image instance lists (see decode_seg)."""
     if out.ndim == 4:
         out = out[:, 0]
