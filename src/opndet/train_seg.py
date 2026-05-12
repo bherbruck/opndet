@@ -96,8 +96,10 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5) -> dict:
     }
 
 
-def _seg_vis(model, val_ds, run_dir: Path, ep: int, n: int, device, fg_thresh: float = 0.5) -> None:
-    """Per-epoch vis: stable RGB once per sample + predicted & GT dome heatmaps per epoch."""
+def _seg_vis(model, val_ds, run_dir: Path, ep: int, n: int, device, fg_thresh: float = 0.5, db=None) -> None:
+    """Per-epoch vis: stable RGB once per sample + predicted & GT dome heatmaps per epoch.
+    Also registers them in the DuckDB store (tag `val/seg`, overlay kinds `dome_pred`
+    / `dome_gt`) so the `opndet dashboard` image view shows seg runs."""
     import cv2
 
     from opndet.visualize import _denorm, save_heatmap_overlay_png
@@ -114,10 +116,18 @@ def _seg_vis(model, val_ds, run_dir: Path, ep: int, n: int, device, fg_thresh: f
                 cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
             logit = model.forward_with_alias(img_t.unsqueeze(0).to(device), "raw")
             pred = torch.sigmoid(logit)[0, 0].cpu().numpy()
-            save_heatmap_overlay_png(pred, str(epdir / f"sample_{i}_pred.png"),
+            pred_path = epdir / f"sample_{i}_pred.png"
+            gt_path = epdir / f"sample_{i}_gt.png"
+            save_heatmap_overlay_png(pred, str(pred_path), colormap=cv2.COLORMAP_TURBO, gamma=0.5)
+            save_heatmap_overlay_png(targets["dome"][0].numpy(), str(gt_path),
                                      colormap=cv2.COLORMAP_TURBO, gamma=0.5)
-            save_heatmap_overlay_png(targets["dome"][0].numpy(), str(epdir / f"sample_{i}_gt.png"),
-                                     colormap=cv2.COLORMAP_TURBO, gamma=0.5)
+            if db is not None:
+                try:
+                    db.add_image(ep, "val/seg", i, rgb_path)
+                    db.add_overlay(ep, "val/seg", i, "dome_pred", pred_path)
+                    db.add_overlay(ep, "val/seg", i, "dome_gt", gt_path)
+                except Exception:
+                    pass
 
 
 def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None = None,
@@ -141,6 +151,17 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         out_dir = _resolve_out_dir(base, auto_increment=bool(c.get("auto_increment", True)))
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"out_dir: {out_dir}")
+
+    db = None
+    if bool(c.get("metrics_db", True)):
+        try:
+            from opndet.metrics_db import MetricsDB
+            db = MetricsDB(out_dir)
+            db.set_config(c)
+            print(f"metrics_db: {db.path}")
+        except Exception as e:
+            print(f"metrics_db disabled ({type(e).__name__}: {e})")
+            db = None
 
     device = torch.device(c.get("device", "cuda") if torch.cuda.is_available()
                           or c.get("device") == "cpu" else "cpu")
@@ -280,9 +301,17 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         print(f"epoch {ep:3d}/{epochs}  lr={lr:.2e}  loss={run_loss/max(nb,1):.4f}  "
               f"dice={m['dice']:.3f}  iou={m['fg_iou']:.3f}  count_mae={m['count_mae']:.2f}  "
               f"area_mape={m['area_mape']:.3f}  (n_val={m['n_val']}, {dt:.1f}s)")
+        if db is not None:
+            try:
+                db.add_scalar(ep, "train/loss", run_loss / max(nb, 1))
+                db.add_scalar(ep, "lr", lr)
+                for k in ("dice", "fg_iou", "count_mae", "area_mape"):
+                    db.add_scalar(ep, f"val/{k}", float(m[k]))
+            except Exception:
+                pass
         if vis_every > 0 and (ep % vis_every == 0):
             try:
-                _seg_vis(eval_model, val_ds, out_dir, ep, vis_n, device)
+                _seg_vis(eval_model, val_ds, out_dir, ep, vis_n, device, db=db)
             except Exception as e:
                 print(f"  (vis skipped: {type(e).__name__}: {e})")
         cur = m[metric_for_best]
@@ -300,6 +329,12 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     eval_model = ema.shadow if ema is not None else model
     mt = evaluate_seg(eval_model, test_loader, device)
     print(f"test:  dice={mt['dice']:.3f}  iou={mt['fg_iou']:.3f}  count_mae={mt['count_mae']:.2f}  area_mape={mt['area_mape']:.3f}")
+    if db is not None:
+        try:
+            for k in ("dice", "fg_iou", "count_mae", "area_mape"):
+                db.add_scalar(epochs, f"test/{k}", float(mt[k]))
+        finally:
+            db.close()
     if bool(c.get("auto_bundle", True)):
         try:
             _bundle_run(out_dir, include_tb=False)

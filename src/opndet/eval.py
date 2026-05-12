@@ -407,6 +407,45 @@ def write_tb_scalars(report: dict, writer, step: int = 0) -> None:
         writer.add_scalar("eval/stability/track_completion", stab["track_completion_rate"], step)
 
 
+def _run_seg_eval(model, c: dict, samples, split: str, img_h: int, img_w: int,
+                  device, batch_size: int | None, out_dir: str | Path | None) -> dict:
+    """Eval path for bbox-*-seg ckpts: Dice / fg-IoU / per-object area-MAPE / count-MAE
+    on the dense dome (vs the same elliptical-dome GT training uses). Needs OBB sidecars."""
+    from opndet.encode import encode_targets_seg, obb_to_aabb
+    from opndet.train_seg import _SegCfgShim, evaluate_seg
+    cfg_shim = _SegCfgShim(img_h, img_w, int(c.get("seg_stride", 1)))
+    kept = []
+    for s in samples:
+        if getattr(s, "obbs", None) is None or s.obbs.shape[0] == 0:
+            continue
+        s.boxes = np.array([obb_to_aabb(*o) for o in s.obbs], dtype=np.float32)
+        kept.append(s)
+    if not kept:
+        raise RuntimeError("seg eval needs OBB sidecars — set data.sources[*].obb_dir and run `opndet sam-obb`")
+
+    def _enc(boxes_xyxy, obbs=None):
+        return encode_targets_seg(cfg_shim, obbs=obbs if obbs is not None else np.zeros((0, 5), np.float32))
+    _enc._takes_obbs = True  # type: ignore[attr-defined]
+    ds = OpndetDataset(kept, img_h, img_w, augment_fn=None, encode_fn=_enc, cache_images=False)
+    bs = int(batch_size or c.get("batch_size", 8))
+    loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=int(c.get("num_workers", 2)),
+                        collate_fn=collate, pin_memory=False)
+    m = evaluate_seg(model, loader, device)
+    print(f"\n=== seg eval ({split}, n={m['n_val']}) ===")
+    print(f"  dice       {m['dice']:.4f}")
+    print(f"  fg_iou     {m['fg_iou']:.4f}")
+    print(f"  count_mae  {m['count_mae']:.3f}   (mean |#pred_blobs - #gt_blobs| per image)")
+    print(f"  area_mape  {m['area_mape']:.3f}   (mean |area_pred - area_gt| / area_gt over matched blobs)")
+    if out_dir is not None:
+        op = Path(out_dir); op.mkdir(parents=True, exist_ok=True)
+        (op / f"seg_eval_{split}.md").write_text(
+            f"# seg eval ({split}, n={m['n_val']})\n\n| metric | value |\n|---|---:|\n"
+            f"| dice | {m['dice']:.4f} |\n| fg_iou | {m['fg_iou']:.4f} |\n"
+            f"| count_mae | {m['count_mae']:.3f} |\n| area_mape | {m['area_mape']:.3f} |\n")
+        print(f"report: {op / f'seg_eval_{split}.md'}")
+    return {"seg": m}
+
+
 def run_eval(
     ckpt_path: str | Path,
     config_path: str | Path | None = None,
@@ -454,6 +493,8 @@ def run_eval(
         apply_temperature(model, T)
         print(f"applied calibration temperature T={T:.4f}")
     in_ch, img_h, img_w = model.input_shape
+    if "dome" in getattr(model, "aliases", {}):
+        return _run_seg_eval(model, c, sel, split, img_h, img_w, device, batch_size, out_dir)
     cfg_shim = _CfgShim(img_h, img_w, stride=int(c["model"].get("stride", 4)))
 
     encode_fn = partial(encode_targets, cfg=cfg_shim)

@@ -212,6 +212,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         n_perturbations=args.n_perturbations,
         auto_threshold=args.auto_threshold,
     )
+    if "seg" in out:  # bbox-*-seg ckpt — already printed by _run_seg_eval
+        return 0
     s = out["report"]["summary"]
     cs = out["report"]["counts"]
     print(f"P={s['precision']:.3f} R={s['recall']:.3f} F1={s['f1']:.3f}  mAP@.5={s['map50']:.3f} mAP@.5:.95={s['map_50_95']:.3f}")

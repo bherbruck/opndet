@@ -236,3 +236,20 @@ def test_train_seg_end_to_end(tmp_path):
     rgb = list((tmp_path / "runs").rglob("vis/seg/sample_*_rgb.png"))
     eps = list((tmp_path / "runs").rglob("vis/seg/ep_*/sample_*_pred.png"))
     assert len(rgb) == 2 and len(eps) == 4  # 2 samples × {ep1,ep2}
+    # DuckDB store written (so the dashboard shows seg runs) with scalars + the val/seg vis
+    rundir = ckpts[0].parent
+    assert (rundir / "metrics.duckdb").exists()
+    import duckdb
+    con = duckdb.connect(str(rundir / "metrics.duckdb"), read_only=True)
+    try:
+        tags = {r[0] for r in con.execute("select distinct tag from scalars").fetchall()}
+        assert {"train/loss", "lr", "val/dice"} <= tags
+        assert "val/seg" in {r[0] for r in con.execute("select distinct tag from images").fetchall()}
+        assert {"dome_pred", "dome_gt"} <= {r[0] for r in con.execute("select distinct kind from overlays").fetchall()}
+    finally:
+        con.close()
+    # `opndet eval` routes a seg ckpt to the seg eval path
+    from opndet.eval import run_eval
+    r = run_eval(ckpt_path=str(ckpts[0]), config_path=None, split="test", out_dir=str(tmp_path / "evalout"))
+    assert "seg" in r and {"dice", "fg_iou", "count_mae", "area_mape", "n_val"} <= set(r["seg"])
+    assert (tmp_path / "evalout" / "seg_eval_test.md").exists()

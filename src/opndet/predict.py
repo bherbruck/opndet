@@ -139,9 +139,11 @@ def predict_video(
 
     m = load_model(model_config, ckpt, device=device)
     in_ch, h, w = m.input_shape
+    is_seg = "dome" in getattr(m, "aliases", {})
+    seg_thr = threshold if (threshold and threshold > 0) else 0.5
 
     acc = None
-    if in_ch == 4:
+    if in_ch == 4 and not is_seg:
         from opndet.temporal import TailAccumulator
         acc = TailAccumulator((h // stride, w // stride),
                               n_frames=temporal_n_frames,
@@ -218,9 +220,6 @@ def predict_video(
                 out = m(t.to(device))
             out_t = out["output"] if isinstance(out, dict) else out
             out_np = out_t.cpu().numpy()
-            dets = decode(out_np[0], h, w, stride, threshold=threshold)
-            if acc is not None:
-                acc.update([((d.x1, d.y1, d.x2, d.y2), d.score) for d in dets])
 
             # render on the letterboxed frame so the output canvas matches model input dims
             canvas = np.full((h, w, 3), 114, dtype=np.uint8)
@@ -229,7 +228,24 @@ def predict_video(
             nw, nh = int(round(sw * s)), int(round(sh * s))
             ox, oy = (w - nw) // 2, (h - nh) // 2
             canvas[oy:oy + nh, ox:ox + nw] = cv2.resize(frame_bgr, (nw, nh))
-            vis = _draw_boxes(canvas, dets)
+
+            if is_seg:
+                from opndet.decode import decode_seg
+                dome = out_np[0, 0]  # [h, w] at canvas coords
+                heat = cv2.applyColorMap((np.clip(dome, 0.0, 1.0) ** 0.5 * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+                vis = cv2.addWeighted(canvas, 0.55, heat, 0.45, 0)
+                cnts, _ = cv2.findContours((dome >= seg_thr).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(vis, cnts, -1, (0, 255, 0), 1)
+                blobs = decode_seg(dome, threshold=seg_thr, min_area=4)
+                for b in blobs:
+                    cv2.circle(vis, (int(b.cx), int(b.cy)), 2, (0, 0, 255), -1)
+                cv2.putText(vis, f"n={len(blobs)}", (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                dets = blobs
+            else:
+                dets = decode(out_np[0], h, w, stride, threshold=threshold)
+                if acc is not None:
+                    acc.update([((d.x1, d.y1, d.x2, d.y2), d.score) for d in dets])
+                vis = _draw_boxes(canvas, dets)
             if used_codec.startswith("imageio"):
                 # imageio expects RGB
                 writer.append_data(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
