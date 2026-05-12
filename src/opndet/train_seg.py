@@ -121,13 +121,21 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: flo
             ne, apes, pairs = _match_count_area(pb, gb, Hd, Wd, edge_margin)
             count_errs.append(ne); area_apes.extend(apes)
             n_gt_total += len(gb); n_pred_total += len(pb)
-            for gi, pj in pairs:
-                gm = gl == (gi + 1); pm = pl == (pj + 1)
-                uni = int((gm | pm).sum())
-                iou = (int((gm & pm).sum()) / uni) if uni else 0.0
-                inst_ious.append(iou)
-                if iou >= 0.5:
-                    n_match_05 += 1
+            # per-instance IoU for the matched pairs: confusion histogram in ONE pass over the
+            # label maps (conf[a,b] = #px with gt-label a & pred-label b) instead of an O(H*W)
+            # boolean intersect per pair.
+            if pairs:
+                G, P = int(gl.max()), int(pl.max())
+                conf = np.bincount((gl.ravel().astype(np.int64) * (P + 1) + pl.ravel().astype(np.int64)),
+                                   minlength=(G + 1) * (P + 1)).reshape(G + 1, P + 1)
+                area_g = conf.sum(axis=1); area_p = conf.sum(axis=0)
+                for gi, pj in pairs:
+                    a, c = gi + 1, pj + 1
+                    inter_ab = int(conf[a, c]); uni = int(area_g[a]) + int(area_p[c]) - inter_ab
+                    iou = (inter_ab / uni) if uni else 0.0
+                    inst_ious.append(iou)
+                    if iou >= 0.5:
+                        n_match_05 += 1
     dice = (2.0 * inter) / max(denom, 1e-9)
     iou = inter_i / max(union_i, 1e-9)
     return {
@@ -169,16 +177,23 @@ def _render_seg_decoded(dome: np.ndarray, thr: float = 0.5, min_area: int = 4,
     canvas = np.zeros((H, W, 4), dtype=np.uint8)   # BGRA
     mx = max(1.0, edge_margin * W) if edge_margin > 0 else 1.0
     my = max(1.0, edge_margin * H) if edge_margin > 0 else 1.0
+    # Operate on each blob's bbox sub-rectangle, not the whole H*W canvas per blob — with
+    # ~hundreds of blobs the full-canvas `lbl == j+1` / np.zeros((H,W,4)) per blob dominated vis.
     for j, blob in enumerate(blobs):
         edge = blob.x1 <= mx or blob.y1 <= my or blob.x2 >= (W - mx) or blob.y2 >= (H - my)
         r, g, b = _SEG_PALETTE[j % len(_SEG_PALETTE)]
-        m = lbl == (j + 1)
-        canvas[m] = (b, g, r, _SEG_BODY_ALPHA)
+        x0, y0 = max(0, int(blob.x1) - 2), max(0, int(blob.y1) - 2)
+        x1, y1 = min(W, int(math.ceil(blob.x2)) + 2), min(H, int(math.ceil(blob.y2)) + 2)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        sub = canvas[y0:y1, x0:x1]
+        m = (lbl[y0:y1, x0:x1] == (j + 1))
+        sub[m] = (b, g, r, _SEG_BODY_ALPHA)
         cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        rim = np.zeros((H, W, 4), dtype=np.uint8)
+        rim = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.uint8)
         cv2.drawContours(rim, cnts, -1, (b, g, r, _SEG_BORDER_ALPHA), 1 if edge else 2)
         rmask = rim[:, :, 3] > 0
-        canvas[rmask] = rim[rmask]
+        sub[rmask] = rim[rmask]
         cx, cy = int(round(blob.cx)), int(round(blob.cy))
         cv2.circle(canvas, (cx, cy), 2, (b, g, r, 255), -1)
         cv2.putText(canvas, f"{int(blob.area_px)}px{'·E' if edge else ''}", (cx + 4, cy - 3),

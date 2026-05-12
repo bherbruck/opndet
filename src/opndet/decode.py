@@ -276,21 +276,41 @@ def _seg_label_map(dome: np.ndarray, threshold: float, mode: str, peak_kernel: i
 
 
 def _blobs_from_labels(dome: np.ndarray, lbl: np.ndarray, min_area: int) -> tuple[list[SegBlob], np.ndarray]:
-    pairs = []  # (SegBlob, bool mask)
-    for i in range(1, int(lbl.max()) + 1):
-        m = lbl == i
-        area = int(m.sum())
-        if area < int(min_area):
+    # Per-label stats in O(H*W) (one argsort + segment reduceat), NOT O(num_labels * H*W) —
+    # with ~hundreds of blobs per image the naive `lbl == i` loop was the seg eval/vis bottleneck.
+    Kmax = int(lbl.max())
+    if Kmax == 0:
+        return [], np.zeros(lbl.shape, np.int32)
+    H, W = lbl.shape
+    flat = lbl.ravel()
+    order = np.argsort(flat, kind="stable")
+    s_lbl = flat[order]
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(s_lbl)) + 1))
+    present = s_lbl[starts]                       # sorted labels actually present (may include 0)
+    ends = np.concatenate((starts[1:], [s_lbl.size]))
+    yy, xx = np.divmod(order, W)                  # pixel coords in label-sorted order
+    s_x = xx.astype(np.float64); s_y = yy.astype(np.float64)
+    s_d = dome.ravel()[order].astype(np.float64)
+    seg_area = (ends - starts).astype(np.int64)
+    seg_sx = np.add.reduceat(s_x, starts); seg_sy = np.add.reduceat(s_y, starts)
+    seg_peak = np.maximum.reduceat(s_d, starts)
+    seg_x1 = np.minimum.reduceat(s_x, starts); seg_x2 = np.maximum.reduceat(s_x, starts)
+    seg_y1 = np.minimum.reduceat(s_y, starts); seg_y2 = np.maximum.reduceat(s_y, starts)
+    blobs: list[SegBlob] = []
+    keep_old: list[int] = []
+    for k, oldlab in enumerate(present):
+        if oldlab == 0 or seg_area[k] < int(min_area):
             continue
-        ys, xs = np.nonzero(m)
-        b = SegBlob(float(xs.mean()), float(ys.mean()), float(area), float(dome[m].max()),
-                    float(xs.min()), float(ys.min()), float(xs.max()) + 1.0, float(ys.max()) + 1.0)
-        pairs.append((b, m))
-    pairs.sort(key=lambda pm: -pm[0].peak)
-    clean = np.zeros(lbl.shape, np.int32)
-    for j, (_, m) in enumerate(pairs):
-        clean[m] = j + 1
-    return [b for b, _ in pairs], clean
+        a = float(seg_area[k])
+        blobs.append(SegBlob(seg_sx[k] / a, seg_sy[k] / a, a, float(seg_peak[k]),
+                             float(seg_x1[k]), float(seg_y1[k]), float(seg_x2[k]) + 1.0, float(seg_y2[k]) + 1.0))
+        keep_old.append(int(oldlab))
+    ordr = sorted(range(len(blobs)), key=lambda j: -blobs[j].peak)
+    blobs = [blobs[j] for j in ordr]
+    remap = np.zeros(Kmax + 1, np.int32)
+    for new_i, j in enumerate(ordr, start=1):
+        remap[keep_old[j]] = new_i
+    return blobs, remap[lbl].astype(np.int32)
 
 
 def decode_seg(dome: np.ndarray, threshold: float = 0.05, min_area: int = 4,
