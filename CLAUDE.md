@@ -191,3 +191,4 @@ All standard presets produce the same `[1, 5, H/4, W/4]` output layout (except h
 - `docs/engineering-decisions.md` — non-obvious choices and gotchas (cls_loss=focal cold-start safety, peak_kernel=7 in bbox-x, curriculum aliases, shape-mAP, trajectory-patience). Read this before changing training defaults.
 - `ROADMAP.md` — plan + SHIPPED tags. Current high-priority: §2.1 OBB output, §1.7 Grad-CAM hard-negative mining.
 - `docs/det-hm-variants.md` — hm2 / flow heatmap variant designs.
+- `docs/models.md` — params + FLOPs + I/O shape + tier for every bundled preset. **Auto-generated** by `scripts/model_table.py` (conv/linear MAC count at each preset's declared input size) — re-run that script after adding or changing a preset; don't hand-edit the table.
