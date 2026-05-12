@@ -90,6 +90,17 @@ class MetricsDB:
         except Exception:
             pass
 
+    def checkpoint(self) -> None:
+        """Force the WAL into the main .duckdb file so a copy of it (e.g. the
+        dashboard's read-only shadow copy) sees all writes so far — including
+        the unbuffered image/overlay/box INSERTs, which only touch the WAL until
+        a CHECKPOINT. flush_scalars() already does this when it has rows; call
+        this directly after a burst of add_image/add_overlay with no scalars."""
+        try:
+            self.con.execute("CHECKPOINT")
+        except Exception:
+            pass
+
     def add_image(self, ep: int, tag: str, sample_idx: int, base_path: str | Path) -> None:
         bp = self._rel(base_path)
         self.con.execute(

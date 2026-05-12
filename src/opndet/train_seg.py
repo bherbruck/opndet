@@ -242,6 +242,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     steps_per_epoch = max(1, len(train_loader))
     total_steps = epochs * steps_per_epoch
     warmup = int(c.get("warmup_steps", min(500, total_steps // 20)))
+    log_every = max(1, steps_per_epoch // 8)   # ~8 train/loss points per epoch in the dashboard
     ema_decay = float(c.get("ema_decay", 0.999))
     ema = EMA(model, decay=ema_decay, tau=int(c.get("ema_tau", 2000))) if ema_decay > 0 else None
     use_amp = bool(c.get("amp", True)) and device.type == "cuda"
@@ -275,7 +276,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
 
     for ep in range(start_epoch + 1, epochs + 1):
         model.train()
-        t0 = time.time(); run_loss = 0.0; nb = 0
+        t0 = time.time(); run_loss = 0.0; nb = 0; lr = base_lr
         for batch in train_loader:
             imgs, _boxes, targets = batch
             imgs = imgs.to(device, non_blocking=True)
@@ -295,6 +296,17 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
             if ema is not None:
                 ema.update(model)
             run_loss += float(loss.detach()); nb += 1; step += 1
+            if db is not None and step % log_every == 0:
+                try:
+                    db.add_scalar(step, "train/loss", float(loss.detach()))
+                    db.add_scalar(step, "lr", lr)
+                    db.flush_scalars()   # MetricsDB buffers scalars to 64 before writing+CHECKPOINTing;
+                                         # the seg loop emits too few per step, so flush eagerly or the
+                                         # dashboard's file-copy never sees them (this is *the* "no
+                                         # scalars logged" bug — train.py just emits >64/step so it never
+                                         # hit it).
+                except Exception:
+                    pass
         eval_model = ema.shadow if ema is not None else model
         m = evaluate_seg(eval_model, val_loader, device)
         dt = time.time() - t0
@@ -303,15 +315,16 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
               f"area_mape={m['area_mape']:.3f}  (n_val={m['n_val']}, {dt:.1f}s)")
         if db is not None:
             try:
-                db.add_scalar(ep, "train/loss", run_loss / max(nb, 1))
-                db.add_scalar(ep, "lr", lr)
                 for k in ("dice", "fg_iou", "count_mae", "area_mape"):
                     db.add_scalar(ep, f"val/{k}", float(m[k]))
+                db.flush_scalars()
             except Exception:
                 pass
         if vis_every > 0 and (ep % vis_every == 0):
             try:
                 _seg_vis(eval_model, val_ds, out_dir, ep, vis_n, device, db=db)
+                if db is not None:
+                    db.flush_scalars(); db.checkpoint()   # push the image/overlay INSERTs out of the WAL
             except Exception as e:
                 print(f"  (vis skipped: {type(e).__name__}: {e})")
         cur = m[metric_for_best]
