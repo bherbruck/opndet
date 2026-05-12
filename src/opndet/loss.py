@@ -668,14 +668,24 @@ class SegDomeLoss(nn.Module):
                weighted up, turns the prediction into a solid blob instead of a CenterNet-style
                peak-with-gradient. Soft-target Dice pulls the same shape l_qfl does (overlap/extent
                emphasis vs l_qfl's per-pixel emphasis), so the two cooperate at any w_dice.
-      loss = w_qfl·l_qfl + w_dice·l_dice   (both ≈ O(0..1), so the weights are real)
+      l_break: REPULSION — `target["break"]` is the ~few-cell band along every inter-instance
+               contact line (from `encode_targets_seg`); `l_break = mean over that band of p²`,
+               so it drives the predicted dome → 0 *between touching objects*, with gradient 2p
+               (bites hardest exactly where the seam is being bridged). The GT carve
+               (`seg_instance_gap_px`) makes the *target* 0 in the corridor; this makes the loss
+               *care* about hitting it — without it a thin corridor is a rounding-error fraction of
+               l_qfl and the model floors the valley at ~0.4, which a low decode threshold then
+               re-merges. Belt-and-braces with the GT carve. (No-op when `w_break==0` or the GT has
+               no `break` mask — e.g. the OBB-ellipse fallback path.)
+      loss = w_qfl·l_qfl + w_dice·l_dice + w_break·l_break   (all ≈ O(0..1), so the weights are real)
     """
 
-    def __init__(self, qfl_beta: float = 2.0, w_qfl: float = 1.0, w_dice: float = 1.0):
+    def __init__(self, qfl_beta: float = 2.0, w_qfl: float = 1.0, w_dice: float = 1.0, w_break: float = 0.0):
         super().__init__()
         self.qfl_beta = float(qfl_beta)
         self.w_qfl = float(w_qfl)
         self.w_dice = float(w_dice)
+        self.w_break = float(w_break)
 
     def forward(self, raw_logit: torch.Tensor, target: dict) -> dict:
         dome = target["dome"]
@@ -691,4 +701,12 @@ class SegDomeLoss(nn.Module):
         denom = (p * p).sum(dim=dims) + (t * t).sum(dim=dims)
         l_dice = (1.0 - (2.0 * inter + 1.0) / (denom + 1.0)).mean()       # ≈ O(0..1)
         loss = self.w_qfl * l_qfl + self.w_dice * l_dice
-        return {"loss": loss, "l_qfl": l_qfl.detach(), "l_dice": l_dice.detach()}
+        l_break = torch.zeros((), device=raw_logit.device)
+        brk = target.get("break")
+        if self.w_break > 0.0 and brk is not None:
+            if brk.dim() == p.dim() - 1:
+                brk = brk.unsqueeze(1)
+            g = brk.to(p.dtype).clamp(0.0, 1.0)
+            l_break = (g * p.pow(2)).sum() / (g.sum() + 1.0)              # mean p² over the inter-instance band → 0
+            loss = loss + self.w_break * l_break
+        return {"loss": loss, "l_qfl": l_qfl.detach(), "l_dice": l_dice.detach(), "l_break": l_break.detach()}

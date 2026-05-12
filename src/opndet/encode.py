@@ -490,7 +490,9 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
       - `obbs`: [N,5] of (cx,cy,w,h,θ) in image px ⇒ the elliptical dome
         (`_draw_rotated_dome`, same two profiles) per box, at seg res. The fallback when
         only OBB sidecars exist (an egg's egg-ellipse is a decent stand-in for its mask).
-    Returns {"dome": Tensor[1, Hd, Wd]} in [0,1].
+    Returns {"dome": Tensor[1, Hd, Wd] in [0,1], "break": Tensor[1, Hd, Wd] in {0,1}} —
+    `break` marks a ~few-cell band along every inter-instance contact line (`SegDomeLoss` uses
+    it for the loss-side repulsion; all-zero when there's ≤1 instance or no masks).
     """
     st = max(1, int(getattr(cfg, "seg_stride", 1)))
     ramp = float(getattr(cfg, "seg_dome_ramp_px", 0.0) or 0.0)
@@ -501,6 +503,7 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
     gap_extra_r = max(0, int(round(gap_d / 2.0)) - 1)
     Hd, Wd = int(cfg.img_h) // st, int(cfg.img_w) // st
     dome = np.zeros((Hd, Wd), dtype=np.float32)
+    break_mask = np.zeros((Hd, Wd), dtype=np.float32)   # 1 on the band between touching instances → loss-side "repulsion"
     if masks is not None and len(masks) > 0:
         import cv2 as _cv2
         bms: list[np.ndarray] = []
@@ -509,10 +512,11 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
             if m.shape != (Hd, Wd):
                 m = _cv2.resize(m.astype(np.uint8), (Wd, Hd), interpolation=_cv2.INTER_NEAREST) > 0
             bms.append(np.ascontiguousarray(m))
-        if gap_d >= 1 and len(bms) > 1:
-            # carve a ~gap_d-cell 0-corridor along inter-instance contact lines ONLY (isolated
-            # edges keep full size). Boundary = a fg cell adjacent to a *different* nonzero label
-            # (already ~2 cells wide); dilate by gap_extra_r to reach the requested total width.
+        if len(bms) > 1:
+            # inter-instance contact band: a fg cell adjacent to a *different* nonzero label
+            # (already ~2 cells wide). Used (a) optionally carved out of the GT dome (the
+            # `seg_instance_gap_px` corridor), and (b) always emitted as `break` so the loss can
+            # weight "predict ~0 here" — the loss-side repulsion that keeps touching objects apart.
             lab = np.zeros((Hd, Wd), np.int32)
             for i, m in enumerate(bms):
                 lab[m] = i + 1
@@ -522,9 +526,15 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
             vd = (lab[:-1, :] != lab[1:, :]) & (lab[:-1, :] > 0) & (lab[1:, :] > 0)
             bnd[:-1, :] |= vd; bnd[1:, :] |= vd
             if bnd.any():
-                corridor = (bnd if gap_extra_r == 0
-                            else _cv2.dilate(bnd.astype(np.uint8), np.ones((2 * gap_extra_r + 1,) * 2, np.uint8)) > 0)
-                bms = [m & ~corridor for m in bms]
+                if gap_d >= 1:
+                    # carve a ~gap_d-cell 0-corridor along the contact lines ONLY (isolated edges
+                    # keep full size); dilate the ~2-cell `bnd` by gap_extra_r to reach the width.
+                    corridor = (bnd if gap_extra_r == 0
+                                else _cv2.dilate(bnd.astype(np.uint8), np.ones((2 * gap_extra_r + 1,) * 2, np.uint8)) > 0)
+                    bms = [m & ~corridor for m in bms]
+                # the supervision band the loss penalises non-zero p on: a ~max(gap,4)-cell strip
+                br = max(gap_extra_r, 1)
+                break_mask[_cv2.dilate(bnd.astype(np.uint8), np.ones((2 * br + 1,) * 2, np.uint8)) > 0] = 1.0
         # Pad the canvas before the distance transform with the EDGE replicated, then crop back:
         # a mask that runs to the array border (a frame-clipped object, or one against the
         # letterbox pad) would otherwise see that border as "background" and get a fake ramp on
@@ -550,7 +560,8 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
                 continue
             _draw_rotated_dome(dome, int(round(float(cx) / st)), int(round(float(cy) / st)),
                                (float(w) * 0.5) / st, (float(h) * 0.5) / st, float(theta), ramp_px=ramp_d)
-    return {"dome": torch.from_numpy(dome).unsqueeze(0)}
+    return {"dome": torch.from_numpy(dome).unsqueeze(0),
+            "break": torch.from_numpy(break_mask).unsqueeze(0)}
 
 
 def collate_targets(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:

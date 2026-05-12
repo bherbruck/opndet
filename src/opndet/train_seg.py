@@ -407,7 +407,8 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     lc = c.get("loss", {}) or {}
     loss_fn = SegDomeLoss(qfl_beta=float(lc.get("qfl_beta", 2.0)),
                           w_qfl=float(lc.get("seg_w_qfl", lc.get("w_hm", 1.0))),
-                          w_dice=float(lc.get("seg_w_dice", 1.0)))
+                          w_dice=float(lc.get("seg_w_dice", 1.0)),
+                          w_break=float(lc.get("seg_w_break", lc.get("seg_w_gap", 0.0))))
     base_lr = float(c["lr"]); wd = float(c.get("weight_decay", 1e-4))
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=wd)
     epochs = int(c["epochs"])
@@ -465,18 +466,20 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                  "inst_recall", "inst_precision")
     for ep in range(start_epoch + 1, epochs + 1):
         model.train()
-        t0 = time.time(); run_loss = run_qfl = run_dice = 0.0; nb = 0; lr = base_lr
+        t0 = time.time(); run_loss = run_qfl = run_dice = run_break = 0.0; nb = 0; lr = base_lr
         for batch in tqdm(train_loader, desc=f"ep {ep}/{epochs} train", total=steps_per_epoch, leave=False):
             imgs, _boxes, targets = batch
             imgs = imgs.to(device, non_blocking=True)
-            dome_t = targets["dome"].to(device, non_blocking=True)
+            tgt = {"dome": targets["dome"].to(device, non_blocking=True)}
+            if "break" in targets:
+                tgt["break"] = targets["break"].to(device, non_blocking=True)
             lr = cosine_lr(step, total_steps, base_lr, warmup=warmup)
             for g in opt.param_groups:
                 g["lr"] = lr
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 logit = model.forward_with_alias(imgs, "raw")
-                out = loss_fn(logit, {"dome": dome_t})
+                out = loss_fn(logit, tgt)
                 loss = out["loss"]
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -485,6 +488,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
             if ema is not None:
                 ema.update(model)
             run_loss += float(loss.detach()); run_qfl += float(out["l_qfl"]); run_dice += float(out["l_dice"])
+            run_break += float(out.get("l_break", 0.0))
             nb += 1; step += 1
         t_train = time.time() - t0
         eval_model = ema.shadow if ema is not None else model
@@ -492,7 +496,8 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         m = evaluate_seg(eval_model, val_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin, **seg_dk)
         t_val = time.time() - t1
         nb = max(nb, 1)
-        print(f"epoch {ep:3d}/{epochs}  lr={lr:.2e}  loss={run_loss/nb:.4f} (qfl={run_qfl/nb:.4f} dice={run_dice/nb:.4f})  "
+        _brk = f" brk={run_break/nb:.4f}" if run_break > 0 else ""
+        print(f"epoch {ep:3d}/{epochs}  lr={lr:.2e}  loss={run_loss/nb:.4f} (qfl={run_qfl/nb:.4f} dice={run_dice/nb:.4f}{_brk})  "
               f"val: dice={m['dice']:.3f} iou={m['fg_iou']:.3f} inst_iou={m['inst_iou_mean']:.3f}/p10={m['inst_iou_p10']:.3f} "
               f"count_mae={m['count_mae']:.2f} area_mape={m['area_mape']:.3f}  (n_val={m['n_val']} | train {t_train:.0f}s + val {t_val:.0f}s)")
         if db is not None:
@@ -503,6 +508,8 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                 db.add_scalar(ep, "train/loss", run_loss / nb)
                 db.add_scalar(ep, "train/l_qfl", run_qfl / nb)
                 db.add_scalar(ep, "train/l_dice", run_dice / nb)
+                if run_break > 0:
+                    db.add_scalar(ep, "train/l_break", run_break / nb)
                 db.add_scalar(ep, "lr", lr)
                 for k in _val_keys:
                     db.add_scalar(ep, f"val/{k}", float(m[k]))
