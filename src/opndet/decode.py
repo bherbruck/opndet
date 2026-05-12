@@ -232,45 +232,98 @@ class SegBlob:
     y2: float
 
 
-def decode_seg(dome: np.ndarray, threshold: float = 0.05, min_area: int = 4) -> list[SegBlob]:
-    """Decode one dense dome map [H, W] (the bbox-*-seg output channel) into instances.
+def _seg_label_map(dome: np.ndarray, threshold: float, mode: str, peak_kernel: int, peak_thr: float) -> np.ndarray:
+    """[H,W] int32 instance label map (0 = background, 1..K = instances), from a dense dome.
 
-    Unlike the detector heads (which bake peak-suppression into the graph so NO
-    postprocessing runs), a dense seg dome IS a segmentation map — extracting the
-    per-object area/center is inherently postprocessing: threshold → connected
-    components → per-blob centroid + pixel count. The dome hits exactly 0 between
-    touching objects, so plain 4-connectivity components already separate them; no
-    NMS, no watershed needed for convex blobs.
-
-    threshold: foreground cut. The dome ramps 1.0 (object center) → 0.0 (object
-               EDGE) *linearly*, so `threshold` is "how deep into the object":
-               ~0.05 ≈ the full footprint (the object's true extent → `area_px`
-               ≈ the real area); 0.5 ≈ only the inner half (~1/4 the area).
-               Default is low (0.05) so areas come out right; raise it only if
-               you want just the cores.
-    min_area : drop blobs smaller than this many px (denoise).
-    Returns blobs sorted by descending peak.
+    mode='cc'        : threshold + 4-connectivity. Fast; merges two touching objects whose
+                       dome doesn't reach 0 between them.
+    mode='watershed' : "march out from each peak" — find the dome's local-maximum peaks
+                       (NMS'd over `peak_kernel`, must be ≥ `peak_thr`), then split the
+                       foreground (`dome ≥ threshold`) by assigning every pixel to its
+                       NEAREST peak (a distance-transform Voronoi over the peak components).
+                       So a region with NO peak ≥ `peak_thr` is dropped entirely ("no peak,
+                       no seg" — that's noise/a fragment, not a detection — also kills the
+                       early-training "background near the init prior → swarm of phantom
+                       blobs"), and two touching objects come apart at the bisector between
+                       their peaks even when the dome only dips, never reaching 0. (≡ 'cc'
+                       when the gap IS 0 and there's one peak per blob.)
     """
     import cv2
     H, W = dome.shape
     fg = (dome >= float(threshold)).astype(np.uint8)
-    n, labels, stats, cents = cv2.connectedComponentsWithStats(fg, connectivity=4)
-    out: list[SegBlob] = []
-    for i in range(1, n):  # 0 is background
-        area = int(stats[i, cv2.CC_STAT_AREA])
+    if mode != "watershed":
+        n, lbl = cv2.connectedComponents(fg, connectivity=4)
+        return lbl.astype(np.int32)
+    k = max(3, int(peak_kernel) | 1)
+    dil = cv2.dilate(dome.astype(np.float32), np.ones((k, k), np.float32))
+    peak_mask = ((dome >= dil - 1e-6) & (dome >= float(peak_thr))).astype(np.uint8)
+    if int(peak_mask.sum()) == 0:                # no peak ≥ peak_thr → no instances
+        return np.zeros((H, W), np.int32)
+    # Voronoi by peak component: distanceTransform measures distance to the nearest ZERO pixel,
+    # so feed (1 - peak_mask) → each pixel gets the label of the nearest peak component.
+    src = (1 - peak_mask).astype(np.uint8)
+    _dist, labels = cv2.distanceTransformWithLabels(src, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_CCOMP)
+    out = np.where(fg > 0, labels, 0).astype(np.int32)
+    # compact the labels to 1..K (drop any that ended up unused after the fg restriction)
+    used = np.unique(out)
+    used = used[used > 0]
+    if len(used) == 0:
+        return np.zeros((H, W), np.int32)
+    remap = np.zeros(int(out.max()) + 1, np.int32)
+    for new_i, old_i in enumerate(used, start=1):
+        remap[int(old_i)] = new_i
+    return remap[out]
+
+
+def _blobs_from_labels(dome: np.ndarray, lbl: np.ndarray, min_area: int) -> tuple[list[SegBlob], np.ndarray]:
+    pairs = []  # (SegBlob, bool mask)
+    for i in range(1, int(lbl.max()) + 1):
+        m = lbl == i
+        area = int(m.sum())
         if area < int(min_area):
             continue
-        x, y, w, h = (int(stats[i, k]) for k in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP,
-                                                 cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
-        peak = float(dome[y:y + h, x:x + w][labels[y:y + h, x:x + w] == i].max())
-        cx, cy = float(cents[i, 0]), float(cents[i, 1])
-        out.append(SegBlob(cx, cy, float(area), peak, float(x), float(y), float(x + w), float(y + h)))
-    out.sort(key=lambda b: -b.peak)
-    return out
+        ys, xs = np.nonzero(m)
+        b = SegBlob(float(xs.mean()), float(ys.mean()), float(area), float(dome[m].max()),
+                    float(xs.min()), float(ys.min()), float(xs.max()) + 1.0, float(ys.max()) + 1.0)
+        pairs.append((b, m))
+    pairs.sort(key=lambda pm: -pm[0].peak)
+    clean = np.zeros(lbl.shape, np.int32)
+    for j, (_, m) in enumerate(pairs):
+        clean[m] = j + 1
+    return [b for b, _ in pairs], clean
 
 
-def decode_seg_batch(out: np.ndarray, threshold: float = 0.05, min_area: int = 4) -> list[list[SegBlob]]:
+def decode_seg(dome: np.ndarray, threshold: float = 0.05, min_area: int = 4,
+               mode: str = "watershed", peak_kernel: int = 9, peak_thr: float = 0.4,
+               return_labels: bool = False):
+    """Decode one dense dome map [H, W] (the bbox-*-seg output channel) into instances.
+
+    A dense seg dome IS a segmentation map → extracting per-object center/extent is
+    inherently postprocessing. `mode='watershed'` (default) marches a marker watershed
+    out from the dome's local-maximum peaks (see `_seg_label_map`) so touching objects
+    split at the ridge; `mode='cc'` is plain threshold + connected-components.
+
+    threshold : foreground cut. The dome ramps 1.0 (object center) → 0.0 (edge) ~linearly,
+                so `threshold` = "how deep into the object": low (~0.05) ≈ the full footprint
+                (`area_px` ≈ the real area); high (~0.3) ≈ just the cores. NOTE an under-
+                trained model's whole background sits near the init prior (≈0.10) — keep
+                `threshold` above that until it's learned to suppress background, or you'll
+                decode noise into a swarm of phantom blobs.
+    peak_kernel/peak_thr : NMS window (px) and minimum height for a watershed seed.
+    min_area  : drop blobs smaller than this many px (denoise).
+    return_labels : if True, return (blobs, label_map[H,W] int32) where label_map==j+1 is
+                    blob j's pixels (0=bg) — needed for per-instance IoU / mask rendering.
+    Returns blobs sorted by descending peak (and the label map, if requested).
+    """
+    lbl = _seg_label_map(dome, threshold, mode, peak_kernel, peak_thr)
+    blobs, clean = _blobs_from_labels(dome, lbl, min_area)
+    return (blobs, clean) if return_labels else blobs
+
+
+def decode_seg_batch(out: np.ndarray, threshold: float = 0.05, min_area: int = 4,
+                     mode: str = "watershed", peak_kernel: int = 9, peak_thr: float = 0.4) -> list[list[SegBlob]]:
     """out: [B, 1, H, W] dome maps → per-image instance lists (see decode_seg)."""
     if out.ndim == 4:
         out = out[:, 0]
-    return [decode_seg(out[b], threshold=threshold, min_area=min_area) for b in range(out.shape[0])]
+    return [decode_seg(out[b], threshold=threshold, min_area=min_area, mode=mode,
+                       peak_kernel=peak_kernel, peak_thr=peak_thr) for b in range(out.shape[0])]

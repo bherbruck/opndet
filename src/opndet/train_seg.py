@@ -49,19 +49,20 @@ def _touches_edge(blob, H: int, W: int, margin: float) -> bool:
 
 
 def _match_count_area(pred_blobs, gt_blobs, H: int, W: int, edge_margin: float = 0.0):
-    """Greedy nearest-centroid match → (count_abs_err, list of |a_pred-a_gt|/a_gt).
+    """Greedy nearest-centroid (one-to-one) match GT↔pred → (count_abs_err, area-MAPE list,
+    matched_pairs). `matched_pairs` = [(gi, pj), ...] indices into gt_blobs / pred_blobs.
 
-    Edge leniency: a GT object whose bbox touches within `edge_margin·dim` of the frame is
-    a clipped partial — its visible area isn't a meaningful measurement — so it (and its
-    matched pred) is skipped for the area-MAPE list. It still counts toward count_abs_err
-    (you still want to know if the model missed/hallucinated an edge object).
+    Edge leniency: a GT object whose bbox touches within `edge_margin·dim` of the frame is a
+    clipped partial — its visible extent isn't a meaningful measurement — so it's skipped for
+    the area-MAPE list (still counted toward count_abs_err; still in matched_pairs so its
+    per-instance IoU is still tracked — IoU of a clipped object is fine to measure).
     """
     n_err = abs(len(pred_blobs) - len(gt_blobs))
     if not gt_blobs or not pred_blobs:
-        return n_err, []
+        return n_err, [], []
     used = set()
-    apes = []
-    for g in gt_blobs:
+    apes, pairs = [], []
+    for gi, g in enumerate(gt_blobs):
         best, bd = -1, 1e18
         for i, p in enumerate(pred_blobs):
             if i in used:
@@ -71,19 +72,33 @@ def _match_count_area(pred_blobs, gt_blobs, H: int, W: int, edge_margin: float =
                 bd, best = d, i
         if best >= 0 and bd <= (max(8.0, math.sqrt(max(g.area_px, 1.0)))) ** 2:
             used.add(best)
-            if _touches_edge(g, H, W, edge_margin) or _touches_edge(pred_blobs[best], H, W, edge_margin):
-                continue   # clipped object → area is unmeasurable; don't ding the model on it
-            apes.append(abs(pred_blobs[best].area_px - g.area_px) / max(g.area_px, 1.0))
-    return n_err, apes
+            pairs.append((gi, best))
+            if not (_touches_edge(g, H, W, edge_margin) or _touches_edge(pred_blobs[best], H, W, edge_margin)):
+                apes.append(abs(pred_blobs[best].area_px - g.area_px) / max(g.area_px, 1.0))
+    return n_err, apes, pairs
 
 
 @torch.no_grad()
-def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: float = 0.0) -> dict:
+def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: float = 0.0,
+                 peak_kernel: int = 9, peak_thr: float = 0.4) -> dict:
+    """Returns:
+      dice / fg_iou         : GLOBAL pixel overlap of (pred dome > fg_thresh) vs (GT dome > fg_thresh)
+      count_mae / area_mape : per-image #blob error / per-matched-object |Δarea|/area (clipped objects
+                              excluded from area; see _match_count_area)
+      inst_iou_mean         : mean per-INSTANCE IoU over GT↔pred matches (the "per-detection" quality —
+                              a single missed/bad object barely dents global dice but tanks this)
+      inst_iou_p10          : the 10th-percentile per-instance IoU — "are the WORST objects in a frame
+                              good?", which is what a tracker actually suffers from. Higher-better.
+      inst_recall / inst_precision : fraction of GT / pred objects matched at IoU ≥ 0.5.
+    Pred & GT are decoded with the watershed ("march out from each peak") instance split so two
+    touching objects whose dome only dips (never reaching 0) still come apart."""
     model.eval()
     inter = denom = inter_i = union_i = 0.0
     n_imgs = 0
     count_errs: list[int] = []
     area_apes: list[float] = []
+    inst_ious: list[float] = []
+    n_gt_total = n_pred_total = n_match_05 = 0
     for batch in loader:
         imgs, _boxes, targets = batch
         imgs = imgs.to(device)
@@ -96,21 +111,33 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: flo
         inter_i += float((pf * tf).sum()); union_i += float(((pf + tf) > 0).float().sum())
         pn = p.cpu().numpy(); tn = dome_t.cpu().numpy()
         Hd, Wd = pn.shape[2], pn.shape[3]
+        dk = dict(threshold=fg_thresh, min_area=4, mode="watershed", peak_kernel=peak_kernel,
+                  peak_thr=peak_thr, return_labels=True)
         for b in range(pn.shape[0]):
             n_imgs += 1
-            pb = decode_seg(pn[b, 0], threshold=fg_thresh, min_area=4)
-            gb = decode_seg(tn[b, 0], threshold=fg_thresh, min_area=4)
-            ne, apes = _match_count_area(pb, gb, Hd, Wd, edge_margin)
+            pb, pl = decode_seg(pn[b, 0], **dk)
+            gb, gl = decode_seg(tn[b, 0], **dk)
+            ne, apes, pairs = _match_count_area(pb, gb, Hd, Wd, edge_margin)
             count_errs.append(ne); area_apes.extend(apes)
+            n_gt_total += len(gb); n_pred_total += len(pb)
+            for gi, pj in pairs:
+                gm = gl == (gi + 1); pm = pl == (pj + 1)
+                uni = int((gm | pm).sum())
+                iou = (int((gm & pm).sum()) / uni) if uni else 0.0
+                inst_ious.append(iou)
+                if iou >= 0.5:
+                    n_match_05 += 1
     dice = (2.0 * inter) / max(denom, 1e-9)
     iou = inter_i / max(union_i, 1e-9)
     return {
         "dice": dice,
         "fg_iou": iou,
         "count_mae": float(np.mean(count_errs)) if count_errs else 0.0,
-        # NaN (not 0.0) when nothing matched — "no measurable blobs" isn't "perfect areas",
-        # and 0.0 would be an unbeatable spurious best for `metric_for_best: area_mape`.
         "area_mape": float(np.mean(area_apes)) if area_apes else float("nan"),
+        "inst_iou_mean": float(np.mean(inst_ious)) if inst_ious else float("nan"),
+        "inst_iou_p10": float(np.percentile(inst_ious, 10)) if inst_ious else float("nan"),
+        "inst_recall": (n_match_05 / n_gt_total) if n_gt_total else float("nan"),
+        "inst_precision": (n_match_05 / n_pred_total) if n_pred_total else float("nan"),
         "n_val": n_imgs,
     }
 
@@ -124,45 +151,43 @@ _SEG_BORDER_ALPHA = 255   # crisp same-hue rim. Flip these two if you want a fai
 
 
 def _render_seg_decoded(dome: np.ndarray, thr: float = 0.5, min_area: int = 4,
-                        edge_margin: float = 0.0) -> np.ndarray:
-    """Decode a [H,W] dome → an RGBA (BGRA, for cv2.imwrite) overlay: each connected
-    component filled with a distinct colour at `body_alpha`, its contour drawn in the
-    SAME hue at `border_alpha`, a `<N>px` area label + centroid dot. Transparent
-    elsewhere. The "instance segmentation" view (vs the raw `dome` heatmap); the
-    dashboard's overlay-opacity slider scales the whole thing — same machinery as the
-    other overlays. Blobs touching within `edge_margin·dim` of the frame (clipped
-    partials) get a thin border + an `·E` tag (their area isn't a real measurement)."""
+                        edge_margin: float = 0.0, peak_kernel: int = 9, peak_thr: float = 0.4) -> np.ndarray:
+    """Decode a [H,W] dome → an RGBA (BGRA, for cv2.imwrite) overlay: each INSTANCE
+    (from the watershed "march out from each peak" split — NOT one big threshold blob,
+    so two touching objects whose dome only dips still come apart) filled with a distinct
+    colour at `body_alpha`, its contour in the SAME hue at `border_alpha`, a `<N>px` area
+    label + centroid dot. Transparent elsewhere. The "instance segmentation" view (vs the
+    raw `dome` heatmap); the dashboard's overlay-opacity slider scales the whole thing.
+    Frame-edge-touching (clipped) instances get a thin border + an `·E` tag."""
     import cv2
+
+    from opndet.decode import decode_seg
     H, W = dome.shape
-    fg = (dome >= float(thr)).astype(np.uint8)
-    n, labels, stats, cents = cv2.connectedComponentsWithStats(fg, connectivity=4)
+    blobs, lbl = decode_seg(dome, threshold=thr, min_area=min_area, mode="watershed",
+                            peak_kernel=peak_kernel, peak_thr=peak_thr, return_labels=True)
     canvas = np.zeros((H, W, 4), dtype=np.uint8)   # BGRA
     mx = max(1.0, edge_margin * W) if edge_margin > 0 else 1.0
     my = max(1.0, edge_margin * H) if edge_margin > 0 else 1.0
-    for lab in range(1, n):
-        area = int(stats[lab, cv2.CC_STAT_AREA])
-        if area < min_area:
-            continue
-        x, y = int(stats[lab, cv2.CC_STAT_LEFT]), int(stats[lab, cv2.CC_STAT_TOP])
-        w, h = int(stats[lab, cv2.CC_STAT_WIDTH]), int(stats[lab, cv2.CC_STAT_HEIGHT])
-        edge = x <= mx or y <= my or (x + w) >= (W - mx) or (y + h) >= (H - my)
-        r, g, b = _SEG_PALETTE[(lab - 1) % len(_SEG_PALETTE)]
-        m = labels == lab
+    for j, blob in enumerate(blobs):
+        edge = blob.x1 <= mx or blob.y1 <= my or blob.x2 >= (W - mx) or blob.y2 >= (H - my)
+        r, g, b = _SEG_PALETTE[j % len(_SEG_PALETTE)]
+        m = lbl == (j + 1)
         canvas[m] = (b, g, r, _SEG_BODY_ALPHA)
         cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         rim = np.zeros((H, W, 4), dtype=np.uint8)
         cv2.drawContours(rim, cnts, -1, (b, g, r, _SEG_BORDER_ALPHA), 1 if edge else 2)
         rmask = rim[:, :, 3] > 0
         canvas[rmask] = rim[rmask]
-        cx, cy = int(round(cents[lab, 0])), int(round(cents[lab, 1]))
+        cx, cy = int(round(blob.cx)), int(round(blob.cy))
         cv2.circle(canvas, (cx, cy), 2, (b, g, r, 255), -1)
-        cv2.putText(canvas, f"{area}px{'·E' if edge else ''}", (cx + 4, cy - 3),
+        cv2.putText(canvas, f"{int(blob.area_px)}px{'·E' if edge else ''}", (cx + 4, cy - 3),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (b, g, r, 255), 1, cv2.LINE_AA)
     return canvas
 
 
 def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/seg",
-             fg_thresh: float = 0.5, edge_margin: float = 0.0, db=None) -> None:
+             fg_thresh: float = 0.5, edge_margin: float = 0.0, peak_kernel: int = 9,
+             peak_thr: float = 0.4, db=None) -> None:
     """Vis for the seg head, on the samples of `ds`, registered under `tag` (e.g. `val/seg`,
     `test/seg`). Per sample:
       base    : sample_<i>_rgb.png         — the clean letterboxed RGB (written ONCE)
@@ -198,7 +223,8 @@ def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/
             if not gt_heat.exists():
                 save_heatmap_overlay_png(gt, str(gt_heat), colormap=cv2.COLORMAP_TURBO, gamma=0.5)
             if not gt_seg.exists():
-                cv2.imwrite(str(gt_seg), _render_seg_decoded(gt, fg_thresh, edge_margin=edge_margin))
+                cv2.imwrite(str(gt_seg), _render_seg_decoded(gt, fg_thresh, edge_margin=edge_margin,
+                                                             peak_kernel=peak_kernel, peak_thr=peak_thr))
             # --- predicted dome: this epoch ---
             pred = torch.sigmoid(model.forward_with_alias(img_t.unsqueeze(0).to(device), "raw"))[0, 0].cpu().numpy()
             if pred.shape != (ih, iw):
@@ -206,7 +232,8 @@ def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/
             pred_heat = epdir / f"sample_{i}_pred_heat.png"
             pred_seg = epdir / f"sample_{i}_pred_seg.png"
             save_heatmap_overlay_png(pred, str(pred_heat), colormap=cv2.COLORMAP_TURBO, gamma=0.5)
-            cv2.imwrite(str(pred_seg), _render_seg_decoded(pred, fg_thresh, edge_margin=edge_margin))
+            cv2.imwrite(str(pred_seg), _render_seg_decoded(pred, fg_thresh, edge_margin=edge_margin,
+                                                           peak_kernel=peak_kernel, peak_thr=peak_thr))
             if db is None:
                 continue
             try:
@@ -216,7 +243,8 @@ def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/
                 db.add_overlay(ep, tag, i, "dome_gt", gt_heat)
                 db.add_overlay(ep, tag, i, "seg_gt", gt_seg)
                 for kind, arr in (("pred", pred), ("gt", gt)):
-                    blobs = decode_seg(arr, threshold=fg_thresh, min_area=4)
+                    blobs = decode_seg(arr, threshold=fg_thresh, min_area=4, mode="watershed",
+                                       peak_kernel=peak_kernel, peak_thr=peak_thr)
                     if blobs:
                         aabbs = np.array([[b.x1, b.y1, b.x2, b.y2] for b in blobs], np.float32)
                         peaks = np.array([b.peak for b in blobs], np.float32)
@@ -354,6 +382,9 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                                                             # edge, so >0.5 is the INNER HALF of the object;
                                                             # ~0.05 ≈ the full object footprint (= the OBB).
     seg_edge_margin = float(c.get("seg_edge_margin", 0.0)) # >0 → clipped (frame-edge) blobs are lenient
+    seg_peak_kernel = int(c.get("seg_peak_kernel", 9))     # watershed-decode: NMS window (px) for dome peaks
+    seg_peak_thr = float(c.get("seg_peak_thr", 0.4))       #   and the min height a dome max needs to be a seed
+    seg_dk = dict(peak_kernel=seg_peak_kernel, peak_thr=seg_peak_thr)
     viz_on_best = bool(c.get("viz_only_on_improvement", True))
     ema_decay = float(c.get("ema_decay", 0.999))
     ema = EMA(model, decay=ema_decay, tau=int(c.get("ema_tau", 2000))) if ema_decay > 0 else None
@@ -410,12 +441,14 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
             run_loss += float(loss.detach()); run_qfl += float(out["l_qfl"]); run_dice += float(out["l_dice"])
             nb += 1; step += 1
         eval_model = ema.shadow if ema is not None else model
-        m = evaluate_seg(eval_model, val_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin)
+        m = evaluate_seg(eval_model, val_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin, **seg_dk)
         dt = time.time() - t0
         nb = max(nb, 1)
+        _val_keys = ("dice", "fg_iou", "count_mae", "area_mape", "inst_iou_mean", "inst_iou_p10",
+                     "inst_recall", "inst_precision")
         print(f"epoch {ep:3d}/{epochs}  lr={lr:.2e}  loss={run_loss/nb:.4f} (qfl={run_qfl/nb:.4f} dice={run_dice/nb:.4f})  "
-              f"val: dice={m['dice']:.3f}  iou={m['fg_iou']:.3f}  count_mae={m['count_mae']:.2f}  "
-              f"area_mape={m['area_mape']:.3f}  (n_val={m['n_val']}, {dt:.1f}s)")
+              f"val: dice={m['dice']:.3f} iou={m['fg_iou']:.3f} inst_iou={m['inst_iou_mean']:.3f}/p10={m['inst_iou_p10']:.3f} "
+              f"count_mae={m['count_mae']:.2f} area_mape={m['area_mape']:.3f}  (n_val={m['n_val']}, {dt:.1f}s)")
         if db is not None:
             try:
                 # epoch-granular (x = epoch, like the val metrics — so train/loss doesn't run off to
@@ -425,7 +458,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                 db.add_scalar(ep, "train/l_qfl", run_qfl / nb)
                 db.add_scalar(ep, "train/l_dice", run_dice / nb)
                 db.add_scalar(ep, "lr", lr)
-                for k in ("dice", "fg_iou", "count_mae", "area_mape"):
+                for k in _val_keys:
                     db.add_scalar(ep, f"val/{k}", float(m[k]))
                 db.flush_scalars()
             except Exception:
@@ -446,19 +479,19 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         if vis_n > 0 and (not viz_on_best or is_best or boundary):
             try:
                 _seg_vis(eval_model, val_ds, out_dir, ep, vis_n, device, tag="val/seg",
-                         fg_thresh=seg_fg, edge_margin=seg_edge_margin, db=db)
+                         fg_thresh=seg_fg, edge_margin=seg_edge_margin, db=db, **seg_dk)
             except Exception as e:
                 print(f"  (val vis skipped: {type(e).__name__}: {e})")
             if len(test_s) > 0:
                 try:
-                    mt = evaluate_seg(eval_model, test_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin)
-                    print(f"  test:  dice={mt['dice']:.3f}  iou={mt['fg_iou']:.3f}  count_mae={mt['count_mae']:.2f}  area_mape={mt['area_mape']:.3f}")
+                    mt = evaluate_seg(eval_model, test_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin, **seg_dk)
+                    print(f"  test:  dice={mt['dice']:.3f} iou={mt['fg_iou']:.3f} inst_iou={mt['inst_iou_mean']:.3f}/p10={mt['inst_iou_p10']:.3f} count_mae={mt['count_mae']:.2f} area_mape={mt['area_mape']:.3f}")
                     if db is not None:
-                        for k in ("dice", "fg_iou", "count_mae", "area_mape"):
+                        for k in _val_keys:
                             db.add_scalar(ep, f"test/{k}", float(mt[k]))
                         db.flush_scalars()
                     _seg_vis(eval_model, test_ds, out_dir, ep, vis_n, device, tag="test/seg",
-                             fg_thresh=seg_fg, edge_margin=seg_edge_margin, db=db)
+                             fg_thresh=seg_fg, edge_margin=seg_edge_margin, db=db, **seg_dk)
                 except Exception as e:
                     print(f"  (test vis skipped: {type(e).__name__}: {e})")
             if db is not None:

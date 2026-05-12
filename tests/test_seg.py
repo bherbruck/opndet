@@ -136,8 +136,30 @@ def test_predict_image_seg_path(tmp_path):
     res = predict_image(image_path=str(ip), model_config=resolve("bbox-n-seg"), ckpt=None,
                         threshold=0.05, device="cpu", save_path=str(out))
     assert out.exists()
-    v = cv2.imread(str(out)); assert v.shape == img.shape  # vis is at original resolution
-    assert res and {"cx", "cy", "area_px", "peak", "x1", "y1", "x2", "y2"} == set(res[0])
+    v = cv2.imread(str(out)); assert v.shape == img.shape   # vis is at original resolution
+    # untrained model → dome ≈ 0.1 everywhere → no peak ≥ peak_thr → no instances ("no peak, no seg").
+    # so res may be empty; if any blobs decoded, they must have the SegBlob keys.
+    assert isinstance(res, list)
+    assert not res or {"cx", "cy", "area_px", "peak", "x1", "y1", "x2", "y2"} == set(res[0])
+
+
+def test_decode_seg_watershed_splits_touching():
+    from opndet.decode import decode_seg
+    # two cone-domes (1.0 at the apex, linear ramp to 0 at r=40) whose 0.3-contours overlap
+    # (apexes 40px apart) → between them the dome DIPS to ~0.5, never to 0. Connected-components
+    # at thr 0.3 merges them into one blob; the watershed-from-peaks split sees the two distinct
+    # local maxima and splits the merged region at the ridge → two instances.
+    yy, xx = np.mgrid[0:128, 0:256]
+    da = np.clip(1.0 - np.hypot(xx - 90, yy - 64) / 40.0, 0.0, 1.0)
+    db = np.clip(1.0 - np.hypot(xx - 130, yy - 64) / 40.0, 0.0, 1.0)
+    dome = np.maximum(da, db).astype(np.float32)
+    assert len(decode_seg(dome, threshold=0.3, min_area=4, mode="cc")) == 1          # naive: merged
+    ws = decode_seg(dome, threshold=0.3, min_area=4, mode="watershed", peak_kernel=15, peak_thr=0.6)
+    assert len(ws) == 2                                                              # split at the ridge
+    xs = sorted(b.cx for b in ws)
+    assert abs(xs[0] - 90) < 8 and abs(xs[1] - 130) < 8
+    # an UNDER-confident dome (everything < peak_thr) → no peaks → no instances ("no peak, no seg")
+    assert decode_seg(dome * 0.4, threshold=0.1, min_area=4, mode="watershed", peak_thr=0.6) == []
 
 
 def test_decode_seg_blobs():
@@ -237,7 +259,8 @@ def test_train_seg_end_to_end(tmp_path):
     assert ckpts, "train_seg should have saved a best checkpoint"
     d = torch.load(ckpts[0], map_location="cpu", weights_only=False)
     assert d["metric_for_best"] == "dice" and d["ema"] is not None
-    assert {"dice", "fg_iou", "count_mae", "area_mape", "n_val"} <= set(d["metrics"])
+    assert {"dice", "fg_iou", "count_mae", "area_mape", "inst_iou_mean", "inst_iou_p10",
+            "inst_recall", "inst_precision", "n_val"} <= set(d["metrics"])
     assert d["metrics"]["n_val"] == 2, "train_seg must honour data.image_filter (10 imgs × 0.25 = 2 val)"
     # vis only runs on a new-best (or first/last) epoch — here ep1 is first+best+last.
     # stable-once PNGs (deterministic on val): RGB + GT heatmap + GT decoded, one each per sample.

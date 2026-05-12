@@ -431,18 +431,24 @@ def _run_seg_eval(model, c: dict, samples, split: str, img_h: int, img_w: int,
     loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=int(c.get("num_workers", 2)),
                         collate_fn=collate, pin_memory=False)
     m = evaluate_seg(model, loader, device, fg_thresh=float(c.get("seg_fg_thresh", 0.05)),
-                     edge_margin=float(c.get("seg_edge_margin", 0.0)))
+                     edge_margin=float(c.get("seg_edge_margin", 0.0)),
+                     peak_kernel=int(c.get("seg_peak_kernel", 9)), peak_thr=float(c.get("seg_peak_thr", 0.4)))
     print(f"\n=== seg eval ({split}, n={m['n_val']}) ===")
-    print(f"  dice       {m['dice']:.4f}")
-    print(f"  fg_iou     {m['fg_iou']:.4f}")
-    print(f"  count_mae  {m['count_mae']:.3f}   (mean |#pred_blobs - #gt_blobs| per image)")
-    print(f"  area_mape  {m['area_mape']:.3f}   (mean |area_pred - area_gt| / area_gt over matched blobs)")
+    print(f"  dice          {m['dice']:.4f}      (global pixel overlap, pred dome vs GT dome)")
+    print(f"  fg_iou        {m['fg_iou']:.4f}")
+    print(f"  inst_iou_mean {m['inst_iou_mean']:.4f}      (mean per-INSTANCE IoU over GT↔pred matches)")
+    print(f"  inst_iou_p10  {m['inst_iou_p10']:.4f}      (10th-pct per-instance IoU — the worst objects)")
+    print(f"  inst_recall   {m['inst_recall']:.4f}      (GT objects matched at IoU≥0.5)")
+    print(f"  inst_precision{m['inst_precision']:.4f}      (pred objects matched at IoU≥0.5)")
+    print(f"  count_mae     {m['count_mae']:.3f}      (mean |#pred - #gt| objects per image)")
+    print(f"  area_mape     {m['area_mape']:.3f}      (mean |Δarea|/area over matched objects; clipped excl.)")
     if out_dir is not None:
         op = Path(out_dir); op.mkdir(parents=True, exist_ok=True)
+        rows = "".join(f"| {k} | {m[k]:.4f} |\n" for k in
+                       ("dice", "fg_iou", "inst_iou_mean", "inst_iou_p10", "inst_recall",
+                        "inst_precision", "count_mae", "area_mape"))
         (op / f"seg_eval_{split}.md").write_text(
-            f"# seg eval ({split}, n={m['n_val']})\n\n| metric | value |\n|---|---:|\n"
-            f"| dice | {m['dice']:.4f} |\n| fg_iou | {m['fg_iou']:.4f} |\n"
-            f"| count_mae | {m['count_mae']:.3f} |\n| area_mape | {m['area_mape']:.3f} |\n")
+            f"# seg eval ({split}, n={m['n_val']})\n\n| metric | value |\n|---|---:|\n{rows}")
         print(f"report: {op / f'seg_eval_{split}.md'}")
     return {"seg": m}
 
