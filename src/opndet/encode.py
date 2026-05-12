@@ -132,12 +132,17 @@ def _draw_obj_blob(hm: np.ndarray, ix: int, iy: int, bw_px: float, bh_px: float,
         _draw_gaussian(hm, ix, iy, sigma)
 
 
-def _draw_rotated_dome(hm: np.ndarray, cx: int, cy: int, a: float, b: float, theta: float) -> None:
-    """Domed ellipse on a stride-cell grid: 1.0 at (cx,cy), linearly ramping to 0
-    at the ellipse boundary (semi-axes a,b in cells, major along theta), 0 outside
-    the ellipse. Single-peaked (the center cell is the unique max); hits exactly 0
-    at the boundary so touching objects' domes don't bleed into the gap between
-    them. Max-aggregated onto hm."""
+def _draw_rotated_dome(hm: np.ndarray, cx: int, cy: int, a: float, b: float, theta: float,
+                       ramp_px: float = 0.0) -> None:
+    """Domed ellipse on a stride-cell grid (semi-axes a,b in cells, major along theta), 0
+    outside the ellipse, max-aggregated onto hm.
+
+    ramp_px == 0 (default): proportional ramp — 1.0 at (cx,cy), linear to 0 at the boundary
+        (single-peaked: the center cell is the unique max).
+    ramp_px  > 0: FLAT-TOP plateau — 1.0 across the interior, linear falloff to 0 only over
+        the last ~ramp_px cells before the boundary. Whole interior is the max (no single
+        peak); the edge dropoff is the only gradient. Still hits exactly 0 at the boundary →
+        touching objects' domes don't bleed across the contact line."""
     h, w = hm.shape
     a = max(1.0, float(a))
     b = max(1.0, float(b))
@@ -153,7 +158,15 @@ def _draw_rotated_dome(hm: np.ndarray, cx: int, cy: int, a: float, b: float, the
     xp = dx * cos_t + dy * sin_t      # along the box's local x (major / theta dir)
     yp = -dx * sin_t + dy * cos_t
     r = np.sqrt((xp / a) ** 2 + (yp / b) ** 2)   # 0 at center, 1 at the ellipse boundary
-    g = np.clip(1.0 - r, 0.0, 1.0).astype(np.float32)
+    if ramp_px > 0:
+        # radial distance (cells) from this point to the boundary along its ray through center:
+        # boundary is at r=1, so dist = |（xp,yp)|·(1−r)/r  (rotation preserves distance).
+        rho = np.sqrt(xp * xp + yp * yp)
+        dist = np.where(r > 1e-6, rho * (1.0 - r) / np.maximum(r, 1e-6), np.float32(1e9))
+        g = np.clip(dist / float(ramp_px), 0.0, 1.0).astype(np.float32)
+        g[r > 1.0] = 0.0
+    else:
+        g = np.clip(1.0 - r, 0.0, 1.0).astype(np.float32)
     hm[y0:y1, x0:x1] = np.maximum(hm[y0:y1, x0:x1], g)
 
 
@@ -451,18 +464,30 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
     """Dense per-pixel dome target for the segmentation head (`bbox-*-seg`).
 
     Rendered at (cfg.img_h, cfg.img_w) // seg_stride (`cfg.seg_stride`, default 1).
+
+    `cfg.seg_dome_ramp_px` (default 0) picks the dome PROFILE:
+      0  : proportional ramp — 1.0 at the deepest interior point, ~linear to 0 at the
+           boundary, spread over the object's whole inscribed radius. Single-peaked.
+      >0 : FLAT-TOP plateau — 1.0 across the interior, linear falloff to 0 only over the
+           last ~ramp_px cells (at seg res) before the boundary. The interior carries no
+           gradient; the thin edge dropoff is the only ramp. Trivial to learn ("am I inside
+           the egg") and `seg_fg_thresh` becomes ~irrelevant (any cut in (0,1) gives the
+           same footprint). Still hits exactly 0 at the boundary, so touching-but-not-
+           overlapping objects keep a 0 valley between them and separate cleanly.
+
     Sources, in priority order:
       - `masks`: list of HxW binary instance masks (at image res). Each → its L2
-        distance-transform normalized by its own max ⇒ 1.0 at the deepest interior
-        point, ~linear ramp to 0 at the boundary, 0 outside. Handles arbitrary
-        convex shapes; max-aggregated across instances ⇒ exactly 0 between two
-        touching ones (no bleed across the contact line). This is the best target.
+        distance-transform, then `dt/dt.max()` (proportional) or `clip(dt/ramp_px, 0, 1)`
+        (flat-top). Handles arbitrary convex shapes; max-aggregated across instances ⇒
+        exactly 0 between two touching ones (no bleed across the contact line).
       - `obbs`: [N,5] of (cx,cy,w,h,θ) in image px ⇒ the elliptical dome
-        (`_draw_rotated_dome`) per box, at seg res. The fallback when only OBB
-        sidecars exist (an egg's egg-ellipse is a decent stand-in for its mask).
+        (`_draw_rotated_dome`, same two profiles) per box, at seg res. The fallback when
+        only OBB sidecars exist (an egg's egg-ellipse is a decent stand-in for its mask).
     Returns {"dome": Tensor[1, Hd, Wd]} in [0,1].
     """
     st = max(1, int(getattr(cfg, "seg_stride", 1)))
+    ramp = float(getattr(cfg, "seg_dome_ramp_px", 0.0) or 0.0)
+    ramp_d = max(ramp / st, 1e-3) if ramp > 0.0 else 0.0     # ramp width in seg-res cells
     Hd, Wd = int(cfg.img_h) // st, int(cfg.img_w) // st
     dome = np.zeros((Hd, Wd), dtype=np.float32)
     if masks is not None and len(masks) > 0:
@@ -475,15 +500,18 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
             if int(m.sum()) == 0:
                 continue
             dt = _cv2.distanceTransform(m, _cv2.DIST_L2, 5)
-            mx = float(dt.max())
-            if mx > 0.0:
-                np.maximum(dome, (dt / mx).astype(np.float32), out=dome)
+            if ramp_d > 0.0:
+                np.maximum(dome, np.clip(dt / ramp_d, 0.0, 1.0).astype(np.float32), out=dome)
+            else:
+                mx = float(dt.max())
+                if mx > 0.0:
+                    np.maximum(dome, (dt / mx).astype(np.float32), out=dome)
     elif obbs is not None and len(obbs) > 0:
         for cx, cy, w, h, theta in obbs:
             if float(w) < 1.0 or float(h) < 1.0:
                 continue
             _draw_rotated_dome(dome, int(round(float(cx) / st)), int(round(float(cy) / st)),
-                               (float(w) * 0.5) / st, (float(h) * 0.5) / st, float(theta))
+                               (float(w) * 0.5) / st, (float(h) * 0.5) / st, float(theta), ramp_px=ramp_d)
     return {"dome": torch.from_numpy(dome).unsqueeze(0)}
 
 

@@ -107,6 +107,29 @@ def test_encode_seg_dome_from_masks_distance_transform():
     assert d2[64, 90] == 0.0, "the gap column between the two disks is 0"
 
 
+def test_encode_seg_dome_flat_top():
+    import cv2
+    from opndet.encode import encode_targets_seg
+    class S(_Shim):
+        seg_dome_ramp_px = 3
+    # 30px-radius disk → flat-top plateau: 1.0 across the interior, dropoff only in the last ~3px.
+    mask = np.zeros((128, 192), np.uint8); cv2.circle(mask, (96, 64), 30, 1, -1)
+    dome = encode_targets_seg(S(), masks=[mask])["dome"][0].numpy()
+    assert dome[64, 96] > 0.99                       # center: 1.0
+    assert dome[64, 96 + 20] > 0.99                  # still deep inside → still 1.0 (NOT a proportional ramp)
+    assert dome[64, 96 + 31] == 0.0                  # outside → 0
+    assert 0.0 < dome[64, 96 + 28] < 1.0             # the ~3px edge ramp
+    # OBB branch flat-tops too
+    obbs = np.array([[96.0, 64.0, 40.0, 24.0, 0.0]], np.float32)
+    d2 = encode_targets_seg(S(), obbs=obbs)["dome"][0].numpy()
+    assert d2[64, 96] > 0.99 and d2[64, 96 + 14] > 0.99 and d2[64, 96 + 22] == 0.0
+    # two disks with a gap → flat tops, still 0 in the gap (no bleed)
+    da = np.zeros((128, 192), np.uint8); cv2.circle(da, (65, 64), 18, 1, -1)
+    db = np.zeros((128, 192), np.uint8); cv2.circle(db, (115, 64), 18, 1, -1)
+    d3 = encode_targets_seg(S(), masks=[da, db])["dome"][0].numpy()
+    assert d3[64, 65] > 0.99 and d3[64, 115] > 0.99 and d3[64, 90] == 0.0
+
+
 def test_encode_seg_empty():
     from opndet.encode import encode_targets_seg
     t = encode_targets_seg(_Shim(), obbs=np.zeros((0, 5), np.float32))
