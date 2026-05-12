@@ -154,7 +154,7 @@ def test_encode_seg_instance_gap():
     assert np.array_equal(d6[:, :16], d0[:, :16])
 
 
-def test_seg_break_mask_and_repulsion_loss():
+def test_seg_seam_mask_and_separation_loss():
     import cv2
     from opndet.encode import encode_targets_seg
     from opndet.loss import SegDomeLoss
@@ -164,24 +164,24 @@ def test_seg_break_mask_and_repulsion_loss():
     class S(_Shim):
         seg_dome_ramp_px = 2; seg_instance_gap_px = 2
     pair = encode_targets_seg(S(), masks=[da, db])
-    assert "break" in pair and float(pair["break"].sum()) > 0
-    bm = pair["break"][0].numpy(); ys, xs = np.nonzero(bm)
+    assert "seam" in pair and float(pair["seam"].sum()) > 0
+    bm = pair["seam"][0].numpy(); ys, xs = np.nonzero(bm)
     assert 52 < xs.mean() < 72 and 48 < ys.mean() < 80     # the band straddles the contact line at x≈62
     solo = encode_targets_seg(S(), masks=[da])
-    assert float(solo["break"].sum()) == 0.0               # one instance → no contact → empty
+    assert float(solo["seam"].sum()) == 0.0               # one instance → no contact → empty
     empty = encode_targets_seg(_Shim(), obbs=np.zeros((0, 5), np.float32))
-    assert "break" in empty and float(empty["break"].sum()) == 0.0
+    assert "seam" in empty and float(empty["seam"].sum()) == 0.0
     # repulsion: w_break>0 penalises a prediction that bridges the break band; no-op when correct
-    dome = pair["dome"]; brk = pair["break"]
+    dome = pair["dome"]; brk = pair["seam"]
     good = torch.logit(dome.clamp(1e-4, 1 - 1e-4))         # sigmoid(good) == dome (≈0 in the carved seam)
     bridge = good.clone(); bridge[brk > 0] = 0.0           # logit 0 → p=0.5 across the break band (a merge bridge)
-    l0 = SegDomeLoss(w_break=0.0)
-    l4 = SegDomeLoss(w_break=4.0)
-    tgt = {"dome": dome, "break": brk}
+    l0 = SegDomeLoss(w_separation=0.0)
+    l4 = SegDomeLoss(w_separation=4.0)
+    tgt = {"dome": dome, "seam": brk}
     assert float(l4(bridge, tgt)["loss"]) > float(l0(bridge, tgt)["loss"])               # the break term punishes the bridge
-    assert float(l4(bridge, tgt)["l_break"]) > float(l4(good, tgt)["l_break"]) >= 0.0     # bridging → larger l_break than the correct pred
-    # w_break=0 → `break` mask ignored entirely (l_break stays 0)
-    assert float(l0(bridge, tgt)["l_break"]) == 0.0
+    assert float(l4(bridge, tgt)["l_sep"]) > float(l4(good, tgt)["l_sep"]) >= 0.0     # bridging → larger l_break than the correct pred
+    # w_separation=0 → `break` mask ignored entirely (l_break stays 0)
+    assert float(l0(bridge, tgt)["l_sep"]) == 0.0
 
 
 def test_encode_seg_clipped_edge_not_ramped():

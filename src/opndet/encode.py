@@ -475,12 +475,12 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
            same footprint). Still hits exactly 0 at the boundary, so touching-but-not-
            overlapping objects keep a 0 valley between them and separate cleanly.
 
-    `cfg.seg_instance_gap_px` (default 0, masks source only): carve a ~gap-wide 0-corridor
-      ONLY along contact lines between *different* instances (a fg pixel with a 4-neighbour of
-      another instance, dilated by ~gap/2) → the GT has a guaranteed gap between any two touching
-      instances, so the model learns to keep them apart and a plain threshold + connected-
-      components decode (no watershed) separates them. An ISOLATED object keeps its full edge —
-      only the contact sides shrink (~gap/2 px there).
+    `cfg.seg_instance_gap_px` (default 0, masks source only — the OLDER separation mechanism):
+      carve a ~gap-wide 0-corridor in the GT dome along contact lines between *different* instances
+      (a fg pixel with a 4-neighbour of another instance, dilated by ~gap/2). Isolated objects keep
+      their full edge; the contact sides shrink ~gap/2 px. Prefer `SegDomeLoss`'s `seg_w_separation`
+      instead — it pulls the *prediction* to 0 on the same seam band without shrinking the GT, so
+      touching-object area accuracy is preserved. Both produce the `seam` mask either way.
 
     Sources, in priority order:
       - `masks`: list of HxW binary instance masks (at image res). Each → (optional contact
@@ -490,9 +490,11 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
       - `obbs`: [N,5] of (cx,cy,w,h,θ) in image px ⇒ the elliptical dome
         (`_draw_rotated_dome`, same two profiles) per box, at seg res. The fallback when
         only OBB sidecars exist (an egg's egg-ellipse is a decent stand-in for its mask).
-    Returns {"dome": Tensor[1, Hd, Wd] in [0,1], "break": Tensor[1, Hd, Wd] in {0,1}} —
-    `break` marks a ~few-cell band along every inter-instance contact line (`SegDomeLoss` uses
-    it for the loss-side repulsion; all-zero when there's ≤1 instance or no masks).
+    Returns {"dome": Tensor[1, Hd, Wd] in [0,1], "seam": Tensor[1, Hd, Wd] in {0,1}} —
+    `seam` marks a ~few-cell band along every inter-instance contact line; `SegDomeLoss`'s
+    `seg_w_separation` term pulls the predicted dome → 0 on it (separates touching objects in
+    the *prediction*, no GT erosion needed — see `seg_instance_gap_px` for the older GT-carve
+    mechanism). All-zero when there's ≤1 instance or no masks.
     """
     st = max(1, int(getattr(cfg, "seg_stride", 1)))
     ramp = float(getattr(cfg, "seg_dome_ramp_px", 0.0) or 0.0)
@@ -503,7 +505,7 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
     gap_extra_r = max(0, int(round(gap_d / 2.0)) - 1)
     Hd, Wd = int(cfg.img_h) // st, int(cfg.img_w) // st
     dome = np.zeros((Hd, Wd), dtype=np.float32)
-    break_mask = np.zeros((Hd, Wd), dtype=np.float32)   # 1 on the band between touching instances → loss-side "repulsion"
+    seam_mask = np.zeros((Hd, Wd), dtype=np.float32)    # 1 on the band between touching instances → loss-side separation term
     if masks is not None and len(masks) > 0:
         import cv2 as _cv2
         bms: list[np.ndarray] = []
@@ -515,8 +517,9 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
         if len(bms) > 1:
             # inter-instance contact band: a fg cell adjacent to a *different* nonzero label
             # (already ~2 cells wide). Used (a) optionally carved out of the GT dome (the
-            # `seg_instance_gap_px` corridor), and (b) always emitted as `break` so the loss can
-            # weight "predict ~0 here" — the loss-side repulsion that keeps touching objects apart.
+            # `seg_instance_gap_px` corridor — older mechanism, shrinks the GT footprint), and
+            # (b) always emitted as `seam` so the `seg_w_separation` loss term can pull predicted
+            # dome → 0 on it (separates touching objects without touching the GT — preferred).
             lab = np.zeros((Hd, Wd), np.int32)
             for i, m in enumerate(bms):
                 lab[m] = i + 1
@@ -532,9 +535,9 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
                     corridor = (bnd if gap_extra_r == 0
                                 else _cv2.dilate(bnd.astype(np.uint8), np.ones((2 * gap_extra_r + 1,) * 2, np.uint8)) > 0)
                     bms = [m & ~corridor for m in bms]
-                # the supervision band the loss penalises non-zero p on: a ~max(gap,4)-cell strip
+                # the supervision band the separation loss penalises non-zero p on: a ~max(gap,4)-cell strip
                 br = max(gap_extra_r, 1)
-                break_mask[_cv2.dilate(bnd.astype(np.uint8), np.ones((2 * br + 1,) * 2, np.uint8)) > 0] = 1.0
+                seam_mask[_cv2.dilate(bnd.astype(np.uint8), np.ones((2 * br + 1,) * 2, np.uint8)) > 0] = 1.0
         # Pad the canvas before the distance transform with the EDGE replicated, then crop back:
         # a mask that runs to the array border (a frame-clipped object, or one against the
         # letterbox pad) would otherwise see that border as "background" and get a fake ramp on
@@ -561,7 +564,7 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
             _draw_rotated_dome(dome, int(round(float(cx) / st)), int(round(float(cy) / st)),
                                (float(w) * 0.5) / st, (float(h) * 0.5) / st, float(theta), ramp_px=ramp_d)
     return {"dome": torch.from_numpy(dome).unsqueeze(0),
-            "break": torch.from_numpy(break_mask).unsqueeze(0)}
+            "seam": torch.from_numpy(seam_mask).unsqueeze(0)}
 
 
 def collate_targets(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:

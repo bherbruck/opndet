@@ -668,24 +668,24 @@ class SegDomeLoss(nn.Module):
                weighted up, turns the prediction into a solid blob instead of a CenterNet-style
                peak-with-gradient. Soft-target Dice pulls the same shape l_qfl does (overlap/extent
                emphasis vs l_qfl's per-pixel emphasis), so the two cooperate at any w_dice.
-      l_break: REPULSION — `target["break"]` is the ~few-cell band along every inter-instance
-               contact line (from `encode_targets_seg`); `l_break = mean over that band of p²`,
-               so it drives the predicted dome → 0 *between touching objects*, with gradient 2p
-               (bites hardest exactly where the seam is being bridged). The GT carve
-               (`seg_instance_gap_px`) makes the *target* 0 in the corridor; this makes the loss
-               *care* about hitting it — without it a thin corridor is a rounding-error fraction of
-               l_qfl and the model floors the valley at ~0.4, which a low decode threshold then
-               re-merges. Belt-and-braces with the GT carve. (No-op when `w_break==0` or the GT has
-               no `break` mask — e.g. the OBB-ellipse fallback path.)
-      loss = w_qfl·l_qfl + w_dice·l_dice + w_break·l_break   (all ≈ O(0..1), so the weights are real)
+      l_sep  : SEPARATION — `target["seam"]` is the ~few-cell band along every inter-instance
+               contact line (from `encode_targets_seg`); `l_sep = mean over that band of p²`, so it
+               pulls the predicted dome → 0 *between touching objects*, with gradient 2p (bites
+               hardest exactly where a seam is being bridged). This is the preferred way to keep
+               touchers apart: it shapes the *prediction*, not the GT, so touching-object area
+               accuracy is preserved (unlike the older `seg_instance_gap_px` GT carve, which erodes
+               the contact sides). Without any separation pressure a thin seam is a rounding-error
+               fraction of l_qfl → the model floors it at ~0.4 → a low decode threshold re-merges.
+               (No-op when `w_separation==0` or the GT has no `seam` mask — e.g. the OBB-ellipse path.)
+      loss = w_qfl·l_qfl + w_dice·l_dice + w_separation·l_sep   (all ≈ O(0..1), so the weights are real)
     """
 
-    def __init__(self, qfl_beta: float = 2.0, w_qfl: float = 1.0, w_dice: float = 1.0, w_break: float = 0.0):
+    def __init__(self, qfl_beta: float = 2.0, w_qfl: float = 1.0, w_dice: float = 1.0, w_separation: float = 0.0):
         super().__init__()
         self.qfl_beta = float(qfl_beta)
         self.w_qfl = float(w_qfl)
         self.w_dice = float(w_dice)
-        self.w_break = float(w_break)
+        self.w_separation = float(w_separation)
 
     def forward(self, raw_logit: torch.Tensor, target: dict) -> dict:
         dome = target["dome"]
@@ -701,12 +701,12 @@ class SegDomeLoss(nn.Module):
         denom = (p * p).sum(dim=dims) + (t * t).sum(dim=dims)
         l_dice = (1.0 - (2.0 * inter + 1.0) / (denom + 1.0)).mean()       # ≈ O(0..1)
         loss = self.w_qfl * l_qfl + self.w_dice * l_dice
-        l_break = torch.zeros((), device=raw_logit.device)
-        brk = target.get("break")
-        if self.w_break > 0.0 and brk is not None:
-            if brk.dim() == p.dim() - 1:
-                brk = brk.unsqueeze(1)
-            g = brk.to(p.dtype).clamp(0.0, 1.0)
-            l_break = (g * p.pow(2)).sum() / (g.sum() + 1.0)              # mean p² over the inter-instance band → 0
-            loss = loss + self.w_break * l_break
-        return {"loss": loss, "l_qfl": l_qfl.detach(), "l_dice": l_dice.detach(), "l_break": l_break.detach()}
+        l_sep = torch.zeros((), device=raw_logit.device)
+        seam = target.get("seam")
+        if self.w_separation > 0.0 and seam is not None:
+            if seam.dim() == p.dim() - 1:
+                seam = seam.unsqueeze(1)
+            g = seam.to(p.dtype).clamp(0.0, 1.0)
+            l_sep = (g * p.pow(2)).sum() / (g.sum() + 1.0)               # mean p² over the inter-instance seam band → 0
+            loss = loss + self.w_separation * l_sep
+        return {"loss": loss, "l_qfl": l_qfl.detach(), "l_dice": l_dice.detach(), "l_sep": l_sep.detach()}
