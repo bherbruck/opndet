@@ -236,7 +236,7 @@ def test_aug_hflip_transforms_obb():
     img = np.zeros((384, 512, 3), dtype=np.uint8)
     boxes = np.array([[100.0, 50.0, 200.0, 150.0]], dtype=np.float32)
     obbs = np.array([[150.0, 100.0, 80.0, 30.0, math.radians(30)]], dtype=np.float32)
-    _, boxes_aug, obbs_aug = aug(img, boxes, obbs)
+    _, boxes_aug, obbs_aug, _ = aug(img, boxes, obbs)
     assert obbs_aug is not None and obbs_aug.shape == (1, 5)
     # cx mirror: 512 - 150 = 362
     assert abs(obbs_aug[0, 0] - 362.0) < 1e-3
@@ -269,7 +269,7 @@ def test_aug_rotate90_transforms_obb():
         (30 + 90 * 2) % 180,
         (30 + 90 * 3) % 180,
     ]
-    _, _, obbs_aug = aug(img, boxes, obbs)
+    _, _, obbs_aug, _ = aug(img, boxes, obbs)
     obs_theta_deg = math.degrees(obbs_aug[0, 4]) % 180
     assert any(abs(obs_theta_deg - v) < 0.1 for v in valid_thetas_deg), \
         f"θ={obs_theta_deg} not in {valid_thetas_deg}"
@@ -293,7 +293,7 @@ def test_aug_cutout_drops_obbs_in_lockstep():
     img = np.zeros((100, 100, 3), dtype=np.uint8)
     boxes = np.array([[10.0, 10.0, 30.0, 30.0]], dtype=np.float32)
     obbs = np.array([[20.0, 20.0, 20.0, 15.0, 0.0]], dtype=np.float32)
-    _, boxes_aug, obbs_aug = aug(img, boxes, obbs)
+    _, boxes_aug, obbs_aug, _ = aug(img, boxes, obbs)
     # near-full-image cutout should occlude the box → boxes/obbs both empty
     assert boxes_aug.shape[0] == obbs_aug.shape[0]
 

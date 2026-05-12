@@ -130,6 +130,52 @@ def test_encode_seg_dome_flat_top():
     assert d3[64, 65] > 0.99 and d3[64, 115] > 0.99 and d3[64, 90] == 0.0
 
 
+def test_encode_seg_instance_gap():
+    import cv2
+    from opndet.encode import encode_targets_seg
+    # two disks 1px apart (cx 30 / 70, r=20 → rims at x=50 / x=49 → essentially tangent at x≈49.5)
+    da = np.zeros((128, 192), np.uint8); cv2.circle(da, (30, 64), 20, 1, -1)
+    db = np.zeros((128, 192), np.uint8); cv2.circle(db, (70, 64), 20, 1, -1)
+    class S0(_Shim):
+        seg_dome_ramp_px = 0; seg_instance_gap_px = 0
+    class S4(_Shim):
+        seg_dome_ramp_px = 0; seg_instance_gap_px = 4
+    d0 = encode_targets_seg(S0(), masks=[da, db])["dome"][0].numpy()
+    d4 = encode_targets_seg(S4(), masks=[da, db])["dome"][0].numpy()
+    # with the 4px erosion the 0-corridor between the disks is wider than without
+    zero_run = lambda row: int((row == 0).sum())
+    assert zero_run(d4[64, 40:60]) > zero_run(d0[64, 40:60])
+    assert d4[64, 30] > 0.0 and d4[64, 70] > 0.0   # interiors still positive (eroded, not gone)
+
+
+def test_seg_mask_gt_through_dataset(tmp_path):
+    import cv2
+    from opndet.dataset import OpndetDataset, Sample
+    from opndet.encode import encode_targets_seg
+    # a 3-channel image + an instance-id mask PNG (two disks: id 1 and id 2)
+    img = (np.random.default_rng(0).random((80, 100, 3)) * 255).astype(np.uint8)
+    ip = tmp_path / "x.png"; cv2.imwrite(str(ip), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    lbl = np.zeros((80, 100), np.uint16)
+    cv2.circle(lbl, (25, 40), 14, 1, -1); cv2.circle(lbl, (75, 40), 14, 2, -1)
+    mp = tmp_path / "x.png_mask.png"; cv2.imwrite(str(mp), lbl)
+    samp = Sample(image_path=ip, boxes=np.array([[11, 26, 39, 54], [61, 26, 89, 54]], np.float32),
+                  img_w=100, img_h=80, mask_path=mp)
+    class _Cfg:
+        img_h = 64; img_w = 64; seg_stride = 1; seg_dome_ramp_px = 0; seg_instance_gap_px = 0
+    def _enc(boxes, obbs=None, masks=None):
+        return encode_targets_seg(_Cfg(), masks=masks)
+    _enc._takes_masks = True
+    ds = OpndetDataset([samp], 64, 64, augment_fn=None, encode_fn=_enc, mosaic_prob=0.0)
+    img_t, boxes, targets = ds[0]
+    dome = targets["dome"][0].numpy()
+    assert dome.shape == (64, 64)
+    assert dome.max() > 0.99                          # the disk interiors made it through letterbox + encode
+    assert int((dome > 0).sum()) > 50                 # non-trivial footprint
+    # mosaic auto-disabled when masks are present (so GT can't desync from the image)
+    ds_m = OpndetDataset([samp], 64, 64, augment_fn=None, encode_fn=_enc, mosaic_prob=1.0)
+    assert ds_m._has_masks and ds_m[0][2]["dome"][0].numpy().max() > 0.99
+
+
 def test_encode_seg_empty():
     from opndet.encode import encode_targets_seg
     t = encode_targets_seg(_Shim(), obbs=np.zeros((0, 5), np.float32))

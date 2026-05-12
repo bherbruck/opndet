@@ -475,9 +475,15 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
            same footprint). Still hits exactly 0 at the boundary, so touching-but-not-
            overlapping objects keep a 0 valley between them and separate cleanly.
 
+    `cfg.seg_instance_gap_px` (default 0, masks source only): erode each instance mask by
+      ~gap/2 px before the distance transform → the GT has a guaranteed ≥gap-wide 0-corridor
+      between any two touching instances, so the model learns to keep them apart and a plain
+      threshold + connected-components decode (no watershed) separates them. Costs a ~gap/2-px
+      shrink of each object's apparent area (small vs the edge ramp; bias is toward under-).
+
     Sources, in priority order:
-      - `masks`: list of HxW binary instance masks (at image res). Each → its L2
-        distance-transform, then `dt/dt.max()` (proportional) or `clip(dt/ramp_px, 0, 1)`
+      - `masks`: list of HxW binary instance masks (at image res). Each → (optional erode) →
+        its L2 distance-transform, then `dt/dt.max()` (proportional) or `clip(dt/ramp_px,0,1)`
         (flat-top). Handles arbitrary convex shapes; max-aggregated across instances ⇒
         exactly 0 between two touching ones (no bleed across the contact line).
       - `obbs`: [N,5] of (cx,cy,w,h,θ) in image px ⇒ the elliptical dome
@@ -488,15 +494,20 @@ def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
     st = max(1, int(getattr(cfg, "seg_stride", 1)))
     ramp = float(getattr(cfg, "seg_dome_ramp_px", 0.0) or 0.0)
     ramp_d = max(ramp / st, 1e-3) if ramp > 0.0 else 0.0     # ramp width in seg-res cells
+    gap = float(getattr(cfg, "seg_instance_gap_px", 0.0) or 0.0)
+    gap_r = int(round(gap / st / 2.0)) if gap > 0.0 else 0   # erosion radius in seg-res cells
     Hd, Wd = int(cfg.img_h) // st, int(cfg.img_w) // st
     dome = np.zeros((Hd, Wd), dtype=np.float32)
     if masks is not None and len(masks) > 0:
         import cv2 as _cv2
+        gap_kernel = np.ones((2 * gap_r + 1, 2 * gap_r + 1), np.uint8) if gap_r > 0 else None
         for mk in masks:
             m = (np.asarray(mk) > 0).astype(np.uint8)
             if m.shape != (Hd, Wd):
                 m = _cv2.resize(m, (Wd, Hd), interpolation=_cv2.INTER_NEAREST)
             m = np.ascontiguousarray(m)
+            if gap_kernel is not None:
+                m = _cv2.erode(m, gap_kernel)
             if int(m.sum()) == 0:
                 continue
             dt = _cv2.distanceTransform(m, _cv2.DIST_L2, 5)

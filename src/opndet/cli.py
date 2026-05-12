@@ -262,6 +262,28 @@ def _cmd_sam_obb(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sam_seg(args: argparse.Namespace) -> int:
+    from opndet.sam_preprocess import run_seg
+    stats = run_seg(
+        coco_json=args.coco,
+        images_dir=args.images,
+        out_dir=args.out,
+        sam_model=args.sam_model,
+        device=args.device,
+        max_images=args.max_images,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        clip_to_box=not args.no_clip_to_box,
+        image_filter=args.filter,
+    )
+    print(f"processed={stats.n_images_processed} skipped={stats.n_images_skipped} "
+          f"obj={stats.n_objects_processed} empty_masks={stats.n_empty_masks} "
+          f"clip_to_box={stats.clip_to_box} errors={len(stats.errors)} ({stats.duration_seconds}s)")
+    print(f"masks: {args.out}/<stem>.png   manifest: {Path(args.out) / 'manifest_seg.json'}")
+    print(f"  → set data.sources[*].mask_dir: {args.out}  in your seg train.yaml")
+    return 0
+
+
 def _cmd_quantize(args: argparse.Namespace) -> int:
     from opndet.quantize import parity_check, quantize_onnx
     info = quantize_onnx(args.onnx, args.out, args.calib, n_calib=args.n_calib, quant_format=args.format)
@@ -479,6 +501,31 @@ def main(argv: list[str] | None = None) -> int:
                           "images you won't train on. (Idempotency still applies: existing *.txt "
                           "outputs are skipped regardless.)")
     pso.set_defaults(func=_cmd_sam_obb)
+
+    pss = sub.add_parser("sam-seg",
+                         help="Preprocess: SAM2 + COCO AABBs → per-image instance-id mask PNGs "
+                              "(<stem>.png, 0=bg, k=instance k) for the bbox-*-seg head. "
+                              "Same as sam-obb minus the OBB-fitting step — the seg head trains "
+                              "on these masks directly (true distance-transform dome). Idempotent.")
+    pss.add_argument("--coco", required=True, help="Path to COCO _annotations.coco.json")
+    pss.add_argument("--images", required=True, help="Directory of images referenced by the COCO file")
+    pss.add_argument("--out", required=True, help="Output dir for per-image <stem>.png + manifest_seg.json (= data.sources[*].mask_dir)")
+    pss.add_argument("--sam-model", default="sam2_b",
+                     help="SAM2 size: sam2_t|s|b|l or sam2.1_t|s|b|l, or raw HF id (default: sam2_b)")
+    pss.add_argument("--device", default="cuda", help="cuda or cpu")
+    pss.add_argument("--max-images", type=int, default=None, help="Cap number of images (debug)")
+    pss.add_argument("--batch-size", type=int, default=8,
+                     help="Images per SAM2 image-encoder batch (16-32 on A100/H100; 4 if OOM on T4)")
+    pss.add_argument("--num-workers", type=int, default=8,
+                     help="ThreadPoolExecutor workers for parallel disk reads during preload (default: 8)")
+    pss.add_argument("--no-clip-to-box", action="store_true",
+                     help="Don't clip each SAM mask to its prompt AABB. By default mask pixels that "
+                          "escaped the box (SAM grabbing background) are zeroed — the AABB is GT.")
+    pss.add_argument("--filter", default=None,
+                     help="Optional text file of image names (one per line, basename or stem, "
+                          "`#`-comments ok) — same format as data.image_filter in train.yaml. "
+                          "When given, SAM only runs on those images. (Idempotency still applies.)")
+    pss.set_defaults(func=_cmd_sam_seg)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
     pq.add_argument("--onnx", required=True, help="Input fp32 ONNX")

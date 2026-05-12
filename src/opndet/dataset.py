@@ -24,6 +24,7 @@ class Sample:
     img_w: int
     img_h: int
     obbs: np.ndarray | None = None  # [N, 5] (cx, cy, w, h, theta) in px+rad; None = AABB-only
+    mask_path: Path | None = None   # <mask_dir>/<stem>.png instance-id label map (0=bg, k=instance k); None = none
 
 
 def _load_obbs_for_image(obb_dir: Path, image_path: Path, img_w: int, img_h: int) -> np.ndarray | None:
@@ -49,16 +50,22 @@ def _load_obbs_for_image(obb_dir: Path, image_path: Path, img_w: int, img_h: int
 
 
 def load_coco_single_class(coco_path: str | Path, image_root: str | Path,
-                            obb_dir: str | Path | None = None) -> list[Sample]:
+                            obb_dir: str | Path | None = None,
+                            mask_dir: str | Path | None = None) -> list[Sample]:
     """Load one COCO json + image dir; collapses all categories to a single class.
 
     If obb_dir is given, also looks up YOLOv8-OBB sidecar `*.txt` files (one per
     image, basename match) and attaches the parsed OBBs to each Sample. Per-image
     fallback: missing .txt → Sample.obbs=None and downstream uses AABB.
+
+    If mask_dir is given, looks up `<mask_dir>/<stem>.png` instance-id label maps
+    (0 = bg, pixel value k = instance k; what `opndet sam-seg` writes) and attaches
+    the path (lazily loaded in __getitem__). Missing → Sample.mask_path=None.
     """
     coco_path = Path(coco_path)
     image_root = Path(image_root)
     obb_dir_p = Path(obb_dir) if obb_dir is not None else None
+    mask_dir_p = Path(mask_dir) if mask_dir is not None else None
     with open(coco_path) as f:
         coco = json.load(f)
 
@@ -79,9 +86,13 @@ def load_coco_single_class(coco_path: str | Path, image_root: str | Path,
             continue
         boxes = np.array(boxes_by_image[im_id], dtype=np.float32) if boxes_by_image[im_id] else np.zeros((0, 4), dtype=np.float32)
         obbs = _load_obbs_for_image(obb_dir_p, path, int(im["width"]), int(im["height"])) if obb_dir_p is not None else None
+        mask_path = None
+        if mask_dir_p is not None:
+            mp = mask_dir_p / (path.stem + ".png")
+            mask_path = mp if mp.exists() else None
         samples.append(Sample(image_path=path, boxes=boxes,
                               img_w=int(im["width"]), img_h=int(im["height"]),
-                              obbs=obbs))
+                              obbs=obbs, mask_path=mask_path))
     return samples
 
 
@@ -124,12 +135,14 @@ def load_datasets(sources: list[dict] | list[tuple[str, str]],
         if isinstance(src, dict):
             coco, root = src["coco"], src["images"]
             obb_dir = src.get("obb_dir")
+            mask_dir = src.get("mask_dir")
         else:
             coco, root = src
-            obb_dir = None
+            obb_dir = mask_dir = None
         before = len(out)
-        out.extend(load_coco_single_class(coco, root, obb_dir=obb_dir))
-        suffix = f" (+OBB from {obb_dir})" if obb_dir else ""
+        out.extend(load_coco_single_class(coco, root, obb_dir=obb_dir, mask_dir=mask_dir))
+        suffix = "".join([f" (+OBB from {obb_dir})" if obb_dir else "",
+                          f" (+masks from {mask_dir})" if mask_dir else ""])
         print(f"  loaded {len(out) - before} samples from {coco}{suffix}")
 
     if image_filter:
@@ -217,7 +230,14 @@ class OpndetDataset(Dataset):
         # Encoders that accept the optional `obbs=` kwarg (OBB head) opt in via
         # an attr on the callable. Avoids fragile signature inspection.
         self._encode_takes_obbs = bool(getattr(encode_fn, "_takes_obbs", False))
+        self._encode_takes_masks = bool(getattr(encode_fn, "_takes_masks", False))
         self._cur_obbs = None
+        self._cur_masks = None
+        # Per-instance label-map masks (`opndet sam-seg`). Only relevant when the encoder
+        # consumes them (the seg head). If present, mosaic is disabled (the mosaic canvas
+        # builder doesn't composite masks) so the GT can't desync from the image.
+        self._has_masks = bool(self._encode_takes_masks) and any(
+            getattr(s, "mask_path", None) is not None for s in self.samples)
         self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
         self.cache_images = cache_images
@@ -248,6 +268,16 @@ class OpndetDataset(Dataset):
         if self.cache_images:
             self._cache[idx] = img
         return img
+
+    def _load_mask(self, mask_path) -> np.ndarray | None:
+        if mask_path is None:
+            return None
+        m = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+        if m is None:
+            return None
+        if m.ndim == 3:
+            m = m[:, :, 0]
+        return m.astype(np.int32, copy=False)
 
     def warm_cache(self, max_mb: float | None = None, workers: int | None = None) -> float:
         """Pre-decode every sample's RGB into `self._cache` (no-op if cache_images=False).
@@ -356,19 +386,29 @@ class OpndetDataset(Dataset):
         return canvas, out_boxes
 
     def _finish(self, img: np.ndarray, boxes: np.ndarray, do_letterbox: bool = True,
-                obbs: np.ndarray | None = None):
-        # OBBs are threaded through aug + letterbox alongside boxes so the
-        # encoded GT lands in the same coords as the canvas image. Without
-        # this, OBB cx/cy stay in original-image coords → encoder cell index
-        # ends up out-of-bounds for non-square images and the GT is dropped.
+                obbs: np.ndarray | None = None, mask: np.ndarray | None = None):
+        # OBBs (and the seg instance-label-map `mask`) are threaded through aug +
+        # letterbox alongside boxes so the encoded GT lands in the same coords as
+        # the canvas image. Without this, OBB cx/cy / mask pixels stay in original-
+        # image coords → encoder cell index out-of-bounds for non-square images.
         if self.aug is not None:
-            img, boxes, obbs = self.aug(img, boxes, obbs)
+            img, boxes, obbs, mask = self.aug(img, boxes, obbs, mask=mask)
 
         # always letterbox — aug (rotate90 with k=1 or 3) can transpose dims, so the
         # final canvas size must be reasserted regardless of where img came from.
         if do_letterbox or img.shape[:2] != (self.img_h, self.img_w):
+            if mask is not None:
+                # same transform letterbox() applies to the image, with NEAREST + 0-pad
+                mh, mw = mask.shape[:2]
+                sc = min(self.img_w / mw, self.img_h / mh)
+                nw, nh = int(round(mw * sc)), int(round(mh * sc))
+                px, py = (self.img_w - nw) // 2, (self.img_h - nh) // 2
+                mcanvas = np.zeros((self.img_h, self.img_w), dtype=mask.dtype)
+                mcanvas[py:py + nh, px:px + nw] = cv2.resize(mask, (nw, nh), interpolation=cv2.INTER_NEAREST)
+                mask = mcanvas
             img, boxes, obbs = letterbox(img, boxes, self.img_h, self.img_w, obbs=obbs)
         self._cur_obbs = obbs if (obbs is not None and obbs.shape[0] > 0) else None
+        self._cur_masks = mask if (mask is not None and mask.max() > 0) else None
 
         if boxes.shape[0] > 0:
             boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, self.img_w - 1)
@@ -396,6 +436,10 @@ class OpndetDataset(Dataset):
 
         if self.encode is None:
             targets = None
+        elif self._cur_masks is not None and self._encode_takes_masks:
+            lbl = self._cur_masks
+            masks_list = [m for m in (lbl == k for k in range(1, int(lbl.max()) + 1)) if m.any()]
+            targets = self.encode(boxes, masks=masks_list)
         elif self._cur_obbs is not None and self._encode_takes_obbs:
             targets = self.encode(boxes, obbs=self._cur_obbs)
         else:
@@ -405,10 +449,11 @@ class OpndetDataset(Dataset):
         return img_t, boxes, targets
 
     def __getitem__(self, idx: int):
-        # _finish() owns aug + letterbox; both transform obbs through in lockstep
-        # with boxes. We just hand it the raw sample (image-pixel coords).
+        # _finish() owns aug + letterbox; both transform obbs/masks through in
+        # lockstep with boxes. We just hand it the raw sample (image-pixel coords).
         self._cur_obbs = None
-        if self.mosaic_prob > 0 and random.random() < self.mosaic_prob:
+        self._cur_masks = None
+        if self.mosaic_prob > 0 and not self._has_masks and random.random() < self.mosaic_prob:
             img, boxes = self._mosaic(idx)
             return self._finish(img, boxes, do_letterbox=False)
         s = self.samples[idx]
@@ -417,7 +462,8 @@ class OpndetDataset(Dataset):
             img = img.copy()
         boxes = s.boxes.copy()
         sample_obbs = s.obbs.copy() if getattr(s, "obbs", None) is not None else None
-        return self._finish(img, boxes, do_letterbox=True, obbs=sample_obbs)
+        sample_mask = self._load_mask(getattr(s, "mask_path", None)) if self._has_masks else None
+        return self._finish(img, boxes, do_letterbox=True, obbs=sample_obbs, mask=sample_mask)
 
 
 def collate(batch):

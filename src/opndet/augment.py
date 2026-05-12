@@ -130,8 +130,11 @@ def _cutout(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.G
 
 
 def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.random.Generator,
-               obbs: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    """Geometric augmentation. Transforms boxes AND OBBs through hflip/vflip/rotate90.
+               obbs: np.ndarray | None = None,
+               mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Geometric augmentation. Transforms boxes AND OBBs through hflip/vflip/rotate90,
+    and (if given) the seg instance-label-map `mask` in lockstep (NEAREST, so instance
+    ids don't get interpolated together).
 
     OBB θ transforms (rectangle has π-symmetry, so we wrap mod π):
       - hflip: θ → (π - θ) mod π   (mirror reflects major-axis direction)
@@ -144,6 +147,8 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
 
     if rng.random() < cfg.hflip_prob:
         img = img[:, ::-1].copy()
+        if mask is not None:
+            mask = mask[:, ::-1].copy()
         if boxes.shape[0]:
             x1 = w - boxes[:, 2]
             x2 = w - boxes[:, 0]
@@ -155,6 +160,8 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
 
     if rng.random() < cfg.vflip_prob:
         img = img[::-1].copy()
+        if mask is not None:
+            mask = mask[::-1].copy()
         if boxes.shape[0]:
             y1 = h - boxes[:, 3]
             y2 = h - boxes[:, 1]
@@ -167,6 +174,8 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
     if rng.random() < cfg.rotate90_prob:
         k = int(rng.choice([1, 2, 3]))
         img = np.rot90(img, k=k).copy()
+        if mask is not None:
+            mask = np.rot90(mask, k=k).copy()
         cur_w, cur_h = w, h
         if boxes.shape[0]:
             cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
@@ -216,6 +225,10 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
             bval = 114 if img.dtype == np.uint8 else 114.0 / 255.0
             img = cv2.warpAffine(img, M, (cw, ch), flags=cv2.INTER_LINEAR,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=(bval, bval, bval))
+            if mask is not None:
+                # uint16 for warpAffine (CV_32S isn't supported); instance ids fit easily
+                mask = cv2.warpAffine(mask.astype(np.uint16), M, (cw, ch), flags=cv2.INTER_NEAREST,
+                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.int32)
             keep = None
             if boxes.shape[0]:
                 bx = boxes.astype(np.float64).copy()
@@ -244,7 +257,7 @@ def _geometric(img: np.ndarray, boxes: np.ndarray, cfg: AugConfig, rng: np.rando
                     ob = ob[keep]
                 obbs = ob.astype(np.float32)
 
-    return img, boxes, obbs
+    return img, boxes, obbs, mask
 
 
 def _hard_negative_paste(
@@ -299,15 +312,17 @@ def make_augment(cfg: AugConfig, hn_pool: list[np.ndarray] | None = None):
 
     pool = hn_pool or []
 
-    def aug(img: np.ndarray, boxes: np.ndarray,
-            obbs: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    def aug(img: np.ndarray, boxes: np.ndarray, obbs: np.ndarray | None = None,
+            mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
         rng = np.random.default_rng()
         img = _photometric(img, cfg, rng)
-        img, boxes, obbs = _geometric(img, boxes, cfg, rng, obbs=obbs)
+        img, boxes, obbs, mask = _geometric(img, boxes, cfg, rng, obbs=obbs, mask=mask)
         if cfg.cutout_prob > 0 and rng.random() < cfg.cutout_prob:
+            # cutout only blanks the IMAGE (occlusion robustness) — the seg label map keeps
+            # the object there on purpose (teaches "object is here even if locally occluded").
             img, boxes, obbs = _cutout(img, boxes, cfg, rng, obbs=obbs)
         if pool and cfg.hard_negative_prob > 0 and rng.random() < cfg.hard_negative_prob:
             img = _hard_negative_paste(img, boxes, pool, cfg, rng)
-        return img, boxes, obbs
+        return img, boxes, obbs, mask
 
     return aug

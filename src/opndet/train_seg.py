@@ -37,8 +37,11 @@ from opndet.yaml_build import build_model_from_yaml
 
 
 class _SegCfgShim:
-    def __init__(self, img_h: int, img_w: int, seg_stride: int = 1):
+    def __init__(self, img_h: int, img_w: int, seg_stride: int = 1,
+                 seg_dome_ramp_px: float = 0.0, seg_instance_gap_px: float = 0.0):
         self.img_h, self.img_w, self.seg_stride = int(img_h), int(img_w), int(seg_stride)
+        self.seg_dome_ramp_px = float(seg_dome_ramp_px)
+        self.seg_instance_gap_px = float(seg_instance_gap_px)
 
 
 def _touches_edge(blob, H: int, W: int, margin: float) -> bool:
@@ -310,38 +313,60 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         model.load_state_dict(resume_state["model"])
     in_ch, img_h, img_w = model.input_shape
     seg_stride = int(c.get("seg_stride", 1))
-    cfg_shim = _SegCfgShim(img_h, img_w, seg_stride)
+    cfg_shim = _SegCfgShim(img_h, img_w, seg_stride,
+                           seg_dome_ramp_px=float(c.get("seg_dome_ramp_px", 0.0) or 0.0),
+                           seg_instance_gap_px=float(c.get("seg_instance_gap_px", 0.0) or 0.0))
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model: {c['model_config']}  params={n_params/1e6:.2f}M  input={in_ch}x{img_h}x{img_w}  "
           f"seg head: dense dome, output [1,1,{img_h//seg_stride},{img_w//seg_stride}]")
 
-    # --- data (requires OBB sidecars; v1 renders the elliptical dome from them) ---
+    # --- data: prefer per-instance masks (`opndet sam-seg`, true distance-transform dome);
+    #     fall back to OBB sidecars (`opndet sam-obb`, elliptical dome) if no mask_dir. ---
     print("loading data ...")
     data_cfg = c.get("data", {}) or {}
     sources = data_cfg["sources"]
-    if not any((s.get("obb_dir") if isinstance(s, dict) else None) for s in sources):
-        raise RuntimeError("bbox-*-seg needs OBB sidecars: run `opndet sam-obb` and set "
-                           "data.sources[*].obb_dir (v1 derives the dome from the OBBs).")
+    has_mask = any((s.get("mask_dir") if isinstance(s, dict) else None) for s in sources)
+    has_obb = any((s.get("obb_dir") if isinstance(s, dict) else None) for s in sources)
+    if not (has_mask or has_obb):
+        raise RuntimeError("bbox-*-seg needs GT shapes: run `opndet sam-seg` and set "
+                           "data.sources[*].mask_dir (true mask dome), or `opndet sam-obb` + "
+                           "data.sources[*].obb_dir (elliptical-dome fallback).")
     all_s = load_datasets(sources, image_filter=data_cfg.get("image_filter"))
     n_pre = len(all_s)
-    out_kept = []
-    for s in all_s:
-        if getattr(s, "obbs", None) is None or s.obbs.shape[0] == 0:
-            continue
-        s.boxes = np.array([obb_to_aabb(*o) for o in s.obbs], dtype=np.float32)  # for aug clip/min-visible
-        out_kept.append(s)
-    all_s = out_kept
-    if not all_s:
-        raise RuntimeError("no samples have OBB sidecars — run `opndet sam-obb` first.")
-    if n_pre != len(all_s):
-        print(f"  dropped {n_pre - len(all_s)} samples without OBB sidecars")
+    if has_mask:
+        kept = [s for s in all_s if getattr(s, "mask_path", None) is not None]
+        # boxes only used for aug clip / min_visible — keep the COCO AABBs (or OBB AABBs if also present)
+        for s in kept:
+            if getattr(s, "obbs", None) is not None and s.obbs.shape[0]:
+                s.boxes = np.array([obb_to_aabb(*o) for o in s.obbs], dtype=np.float32)
+        all_s = kept
+        if not all_s:
+            raise RuntimeError("mask_dir set but no samples have a `<stem>.png` mask — run `opndet sam-seg` first.")
+        if n_pre != len(all_s):
+            print(f"  dropped {n_pre - len(all_s)} samples without mask sidecars")
+    else:
+        kept = []
+        for s in all_s:
+            if getattr(s, "obbs", None) is None or s.obbs.shape[0] == 0:
+                continue
+            s.boxes = np.array([obb_to_aabb(*o) for o in s.obbs], dtype=np.float32)  # for aug clip/min-visible
+            kept.append(s)
+        all_s = kept
+        if not all_s:
+            raise RuntimeError("no samples have OBB sidecars — run `opndet sam-obb` first.")
+        if n_pre != len(all_s):
+            print(f"  dropped {n_pre - len(all_s)} samples without OBB sidecars")
+    print(f"  GT source: {'per-instance masks (sam-seg)' if has_mask else 'OBB ellipses (sam-obb)'}")
     ratios = tuple(data_cfg.get("split_ratios", (0.8, 0.1, 0.1)))
     train_s, val_s, test_s = split_samples(all_s, ratios=ratios, seed=seed)
     print(f"total samples: {len(all_s)}   split: train={len(train_s)} val={len(val_s)} test={len(test_s)}")
 
-    def _seg_encode(boxes_xyxy, obbs=None):
-        return encode_targets_seg(cfg_shim, obbs=obbs if obbs is not None else np.zeros((0, 5), np.float32))
-    _seg_encode._takes_obbs = True  # type: ignore[attr-defined]
+    def _seg_encode(boxes_xyxy, obbs=None, masks=None):
+        return encode_targets_seg(cfg_shim,
+                                  obbs=obbs if obbs is not None else np.zeros((0, 5), np.float32),
+                                  masks=masks)
+    _seg_encode._takes_obbs = True   # type: ignore[attr-defined]
+    _seg_encode._takes_masks = True  # type: ignore[attr-defined]
 
     aug_dict = dict(c.get("augment", {}) or {})
     aug_dict.pop("temporal_prior", None)

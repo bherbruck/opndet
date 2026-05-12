@@ -640,3 +640,157 @@ def run(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
     manifest = {k: v for k, v in asdict(stats).items()}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return stats
+
+
+@dataclass
+class SegRunStats:
+    n_images_processed: int = 0
+    n_images_skipped: int = 0
+    n_objects_processed: int = 0
+    n_empty_masks: int = 0          # SAM returned an all-zero mask for an object
+    sam_model_used: str = ""
+    clip_to_box: bool = True
+    timestamp: str = ""
+    duration_seconds: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+def _masks_to_instance_map(masks: np.ndarray, boxes_xyxy: np.ndarray, H: int, W: int,
+                           clip_to_box: bool, box_pad: int = 1) -> tuple[np.ndarray, int]:
+    """(n_obj,H,W) bool masks → a [H,W] uint16 instance-id label map (0=bg, k=obj k).
+
+    `clip_to_box`: zero any mask pixel outside its prompt AABB (a few px of pad) — SAM2
+    occasionally lets a mask escape the box and grab background; the AABB is GT, so cut it.
+    Later objects overwrite earlier ones on overlap (fine for non-overlapping objects).
+    """
+    lbl = np.zeros((H, W), dtype=np.uint16)
+    n_empty = 0
+    for i, m in enumerate(masks):
+        mm = (np.asarray(m) > 0)
+        if mm.shape != (H, W):
+            mm = cv2.resize(mm.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+        if clip_to_box and i < len(boxes_xyxy):
+            x1, y1, x2, y2 = boxes_xyxy[i]
+            keep = np.zeros((H, W), dtype=bool)
+            xa, ya = max(0, int(np.floor(x1)) - box_pad), max(0, int(np.floor(y1)) - box_pad)
+            xb, yb = min(W, int(np.ceil(x2)) + box_pad), min(H, int(np.ceil(y2)) + box_pad)
+            keep[ya:yb, xa:xb] = True
+            mm = mm & keep
+        if not mm.any():
+            n_empty += 1
+            continue
+        lbl[mm] = i + 1
+    return lbl, n_empty
+
+
+def run_seg(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
+            sam_model: str = "sam2_b", device: str = "cuda",
+            max_images: int | None = None,
+            batch_size: int = 8, num_workers: int = 8,
+            clip_to_box: bool = True,
+            image_filter: str | Path | None = None) -> SegRunStats:
+    """Box-prompt SAM2 with the COCO GT AABBs and dump each image's per-instance masks as a
+    16-bit `<stem>.png` instance-id label map (0=bg, k=instance k) to `out_dir`. Idempotent
+    (skips existing non-empty outputs). This is `sam-obb` minus the OBB-fitting step — the
+    seg head trains on these masks directly (true distance-transform dome). `clip_to_box`
+    cuts any mask pixels that escaped the prompt AABB.
+    """
+    coco_json, images_dir, out_dir = Path(coco_json), Path(images_dir), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(coco_json) as f:
+        coco = json.load(f)
+    images_by_id = {im["id"]: im for im in coco["images"]}
+    anns_by_image: dict[int, list[dict]] = {im_id: [] for im_id in images_by_id}
+    for ann in coco["annotations"]:
+        if ann.get("iscrowd", 0):
+            continue
+        x, y, w, h = (float(v) for v in ann["bbox"])
+        if w <= 0 or h <= 0:
+            continue
+        anns_by_image[ann["image_id"]].append(ann)
+
+    stats = SegRunStats(sam_model_used=sam_model, clip_to_box=clip_to_box,
+                        timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    t0 = time.time()
+
+    items = list(images_by_id.items())
+    if image_filter is not None:
+        from opndet.dataset import _read_image_filter
+        match, n_entries = _read_image_filter(image_filter)
+        if not match:
+            print(f"  image_filter {image_filter}: empty — processing all {len(items)} images")
+        else:
+            kept = [(iid, im) for (iid, im) in items
+                    if Path(im["file_name"]).name in match or Path(im["file_name"]).stem in match]
+            print(f"  image_filter {image_filter}: {n_entries} entries → SAM will run on {len(kept)}/{len(items)} images")
+            if not kept:
+                raise ValueError(f"image_filter {image_filter} matched 0 of this COCO's images — check the names")
+            items = kept
+    if max_images is not None:
+        items = items[:max_images]
+
+    todo: list[tuple[Path, Path, list[dict]]] = []
+    for im_id, im in items:
+        img_path = images_dir / im["file_name"]
+        out_path = out_dir / (Path(im["file_name"]).stem + ".png")
+        if not img_path.exists():
+            stats.errors.append(f"missing image: {img_path}")
+            continue
+        if out_path.exists() and out_path.stat().st_size > 0:
+            stats.n_images_skipped += 1
+            continue
+        anns = anns_by_image.get(im_id, [])
+        if not anns:
+            # no objects → an all-zero label map (so a re-run skips it; the dataset just gets an empty dome)
+            cv2.imwrite(str(out_path), np.zeros((int(im["height"]), int(im["width"])), np.uint16))
+            stats.n_images_processed += 1
+            continue
+        todo.append((img_path, out_path, anns))
+
+    if not todo:
+        stats.duration_seconds = round(time.time() - t0, 2)
+        (out_dir / "manifest_seg.json").write_text(json.dumps(asdict(stats), indent=2))
+        return stats
+
+    predictor = _load_predictor(sam_model, device)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _load_one(item):
+        img = cv2.imread(str(item[0]))
+        return (item, cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        loaded = list(tqdm(pool.map(_load_one, todo), total=len(todo), desc="preload imgs", unit="img", leave=False))
+
+    has_batch_api = hasattr(predictor, "set_image_batch") and hasattr(predictor, "predict_batch")
+    BATCH = batch_size if has_batch_api else 1
+    pbar = tqdm(total=len(todo), desc=f"sam-seg {sam_model}", unit="img", dynamic_ncols=True)
+    for chunk_start in range(0, len(loaded), BATCH):
+        chunk = [(it, im) for (it, im) in loaded[chunk_start:chunk_start + BATCH] if im is not None]
+        if not chunk:
+            continue
+        items_v = [c[0] for c in chunk]; imgs_v = [c[1] for c in chunk]
+        boxes_per = [np.array([coco_bbox_to_xyxy(a["bbox"]) for a in anns if a.get("bbox") is not None],
+                              dtype=np.float32) for (_, _, anns) in items_v]
+        try:
+            masks_per = _sam_batch_predict(predictor, imgs_v, boxes_per, has_batch_api)
+        except Exception as e:  # noqa: BLE001
+            for (img_path, _, _) in items_v:
+                stats.errors.append(f"{img_path.name}: batch failed: {e}")
+            continue
+        for (img_path, out_path, anns), masks, boxes_xyxy, img_rgb in zip(items_v, masks_per, boxes_per, imgs_v):
+            H, W = img_rgb.shape[:2]
+            lbl, n_empty = _masks_to_instance_map(masks, boxes_xyxy, H, W, clip_to_box=clip_to_box)
+            cv2.imwrite(str(out_path), lbl)   # 16-bit single-channel PNG
+            stats.n_images_processed += 1
+            stats.n_objects_processed += len(boxes_xyxy)
+            stats.n_empty_masks += n_empty
+        n_done = len(chunk)
+        pbar.update(n_done)
+        pbar.set_postfix({"objs": stats.n_objects_processed, "empty": stats.n_empty_masks, "B": BATCH})
+    pbar.close()
+
+    stats.duration_seconds = round(time.time() - t0, 2)
+    (out_dir / "manifest_seg.json").write_text(json.dumps(asdict(stats), indent=2))
+    return stats
