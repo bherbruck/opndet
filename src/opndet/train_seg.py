@@ -320,7 +320,16 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     if nw > 0:
         dl_kw["prefetch_factor"] = pf; dl_kw["persistent_workers"] = True
     bs = int(c["batch_size"])
-    common = dict(img_h=img_h, img_w=img_w, encode_fn=_seg_encode, cache_images=bool(c.get("cache_images", False)),
+    cache_imgs = bool(c.get("cache_images", False))
+    if cache_imgs and nw > 0:
+        # Each persistent worker gets its OWN OpndetDataset → its OWN image cache, and with a
+        # reshuffling sampler each worker's cache accumulates toward the FULL dataset over epochs
+        # → effective RAM ≈ num_workers × dataset → the "RAM constantly rising" / OOM. Caching only
+        # makes sense single-process. (TODO: a shared-memory image cache would fix this properly.)
+        print(f"  cache_images=true ignored: num_workers={nw}>0 → it'd be {nw} separate caches growing to "
+              f"~{nw}× the dataset in RAM. Set num_workers: 0 to use caching, or leave it off.")
+        cache_imgs = False
+    common = dict(img_h=img_h, img_w=img_w, encode_fn=_seg_encode, cache_images=cache_imgs,
                   in_ch=in_ch, stride=int(_mc.get("stride", 4)))
     train_ds = OpndetDataset(train_s, augment_fn=make_augment(aug_cfg), mosaic_prob=mosaic_p, min_visible_frac=min_vis, **common)
     val_ds   = OpndetDataset(val_s,   augment_fn=None, mosaic_prob=0.0, min_visible_frac=min_vis, **common)
@@ -340,7 +349,6 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
     steps_per_epoch = max(1, len(train_loader))
     total_steps = epochs * steps_per_epoch
     warmup = int(c.get("warmup_steps", min(500, total_steps // 20)))
-    log_every = max(1, steps_per_epoch // 8)   # ~8 train/loss points per epoch in the dashboard
     seg_fg = float(c.get("seg_fg_thresh", 0.05))           # dome cut for decode/metrics/vis — keep LOW:
                                                             # the dome ramps 1→0 linearly out to the object's
                                                             # edge, so >0.5 is the INNER HALF of the object;
@@ -380,7 +388,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
 
     for ep in range(start_epoch + 1, epochs + 1):
         model.train()
-        t0 = time.time(); run_loss = 0.0; nb = 0; lr = base_lr
+        t0 = time.time(); run_loss = run_qfl = run_dice = 0.0; nb = 0; lr = base_lr
         for batch in train_loader:
             imgs, _boxes, targets = batch
             imgs = imgs.to(device, non_blocking=True)
@@ -399,26 +407,24 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
             scaler.step(opt); scaler.update()
             if ema is not None:
                 ema.update(model)
-            run_loss += float(loss.detach()); nb += 1; step += 1
-            if db is not None and step % log_every == 0:
-                try:
-                    db.add_scalar(step, "train/loss", float(loss.detach()))
-                    db.add_scalar(step, "lr", lr)
-                    db.flush_scalars()   # MetricsDB buffers scalars to 64 before writing+CHECKPOINTing;
-                                         # the seg loop emits too few per step, so flush eagerly or the
-                                         # dashboard's file-copy never sees them (this is *the* "no
-                                         # scalars logged" bug — train.py just emits >64/step so it never
-                                         # hit it).
-                except Exception:
-                    pass
+            run_loss += float(loss.detach()); run_qfl += float(out["l_qfl"]); run_dice += float(out["l_dice"])
+            nb += 1; step += 1
         eval_model = ema.shadow if ema is not None else model
         m = evaluate_seg(eval_model, val_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin)
         dt = time.time() - t0
-        print(f"epoch {ep:3d}/{epochs}  lr={lr:.2e}  loss={run_loss/max(nb,1):.4f}  "
-              f"dice={m['dice']:.3f}  iou={m['fg_iou']:.3f}  count_mae={m['count_mae']:.2f}  "
+        nb = max(nb, 1)
+        print(f"epoch {ep:3d}/{epochs}  lr={lr:.2e}  loss={run_loss/nb:.4f} (qfl={run_qfl/nb:.4f} dice={run_dice/nb:.4f})  "
+              f"val: dice={m['dice']:.3f}  iou={m['fg_iou']:.3f}  count_mae={m['count_mae']:.2f}  "
               f"area_mape={m['area_mape']:.3f}  (n_val={m['n_val']}, {dt:.1f}s)")
         if db is not None:
             try:
+                # epoch-granular (x = epoch, like the val metrics — so train/loss doesn't run off to
+                # "step 800" while everything else stops at the epoch count). Loss-component breakdown
+                # too (train/l_qfl, train/l_dice) like the detector logs its loss terms.
+                db.add_scalar(ep, "train/loss", run_loss / nb)
+                db.add_scalar(ep, "train/l_qfl", run_qfl / nb)
+                db.add_scalar(ep, "train/l_dice", run_dice / nb)
+                db.add_scalar(ep, "lr", lr)
                 for k in ("dice", "fg_iou", "count_mae", "area_mape"):
                     db.add_scalar(ep, f"val/{k}", float(m[k]))
                 db.flush_scalars()

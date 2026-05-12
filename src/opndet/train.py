@@ -800,6 +800,14 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
     else:
         encode_fn = partial(encode_targets, cfg=cfg_shim, dist_head=has_dist)
     cache = bool(c.get("cache_images", False))
+    if cache and int(c.get("num_workers", 2)) > 0:
+        # Persistent workers each get their own dataset → own image cache, and a reshuffling sampler
+        # grows each worker's cache toward the full dataset → ~num_workers× the dataset in RAM ("RAM
+        # constantly rising" / OOM). Caching only helps single-process.
+        _nw = int(c.get("num_workers", 2))
+        print(f"  cache_images=true ignored: num_workers={_nw}>0 → it'd be {_nw} separate caches growing "
+              f"to ~{_nw}× the dataset in RAM. Set num_workers: 0 to use caching, or leave it off.")
+        cache = False
     mosaic_prob = float(aug_cfg.mosaic_prob if hasattr(aug_cfg, "mosaic_prob") else 0.0)
     min_vis = float(aug_cfg.min_visible_frac if hasattr(aug_cfg, "min_visible_frac") else 0.5)
     # 4-ch eval policy: val/test datasets carry the prior synth too — eval
