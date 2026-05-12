@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from opndet.augment import AugConfig, make_augment
 from opndet.dataset import OpndetDataset, collate, load_datasets, split_samples
@@ -99,7 +100,7 @@ def evaluate_seg(model, loader, device, fg_thresh: float = 0.5, edge_margin: flo
     area_apes: list[float] = []
     inst_ious: list[float] = []
     n_gt_total = n_pred_total = n_match_05 = 0
-    for batch in loader:
+    for batch in tqdm(loader, desc="seg eval", leave=False):
         imgs, _boxes, targets = batch
         imgs = imgs.to(device)
         dome_t = targets["dome"].to(device)             # [B,1,H,W]
@@ -208,7 +209,7 @@ def _seg_vis(model, ds, run_dir: Path, ep: int, n: int, device, tag: str = "val/
     epdir.mkdir(parents=True, exist_ok=True)
     model.eval()
     with torch.no_grad():
-        for i in range(min(n, len(ds))):
+        for i in tqdm(range(min(n, len(ds))), desc=f"vis {tag}", leave=False):
             img_t, _boxes, targets = ds[i]
             ih, iw = int(img_t.shape[-2]), int(img_t.shape[-1])
             rgb_path = shared / f"sample_{i}_rgb.png"
@@ -425,10 +426,12 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                     "metric_for_best": metric_for_best, "metrics": metrics, "temperature": 1.0,
                     "config": c}, path)
 
+    _val_keys = ("dice", "fg_iou", "count_mae", "area_mape", "inst_iou_mean", "inst_iou_p10",
+                 "inst_recall", "inst_precision")
     for ep in range(start_epoch + 1, epochs + 1):
         model.train()
         t0 = time.time(); run_loss = run_qfl = run_dice = 0.0; nb = 0; lr = base_lr
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc=f"ep {ep}/{epochs} train", total=steps_per_epoch, leave=False):
             imgs, _boxes, targets = batch
             imgs = imgs.to(device, non_blocking=True)
             dome_t = targets["dome"].to(device, non_blocking=True)
@@ -448,15 +451,15 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                 ema.update(model)
             run_loss += float(loss.detach()); run_qfl += float(out["l_qfl"]); run_dice += float(out["l_dice"])
             nb += 1; step += 1
+        t_train = time.time() - t0
         eval_model = ema.shadow if ema is not None else model
+        t1 = time.time()
         m = evaluate_seg(eval_model, val_loader, device, fg_thresh=seg_fg, edge_margin=seg_edge_margin, **seg_dk)
-        dt = time.time() - t0
+        t_val = time.time() - t1
         nb = max(nb, 1)
-        _val_keys = ("dice", "fg_iou", "count_mae", "area_mape", "inst_iou_mean", "inst_iou_p10",
-                     "inst_recall", "inst_precision")
         print(f"epoch {ep:3d}/{epochs}  lr={lr:.2e}  loss={run_loss/nb:.4f} (qfl={run_qfl/nb:.4f} dice={run_dice/nb:.4f})  "
               f"val: dice={m['dice']:.3f} iou={m['fg_iou']:.3f} inst_iou={m['inst_iou_mean']:.3f}/p10={m['inst_iou_p10']:.3f} "
-              f"count_mae={m['count_mae']:.2f} area_mape={m['area_mape']:.3f}  (n_val={m['n_val']}, {dt:.1f}s)")
+              f"count_mae={m['count_mae']:.2f} area_mape={m['area_mape']:.3f}  (n_val={m['n_val']} | train {t_train:.0f}s + val {t_val:.0f}s)")
         if db is not None:
             try:
                 # epoch-granular (x = epoch, like the val metrics — so train/loss doesn't run off to
@@ -485,6 +488,7 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         # what we already have (matches the detector's viz_only_on_improvement default).
         boundary = (ep == start_epoch + 1) or (ep == epochs)
         if vis_n > 0 and (not viz_on_best or is_best or boundary):
+            t2 = time.time()
             try:
                 _seg_vis(eval_model, val_ds, out_dir, ep, vis_n, device, tag="val/seg",
                          fg_thresh=seg_fg, edge_margin=seg_edge_margin, db=db, **seg_dk)
@@ -502,6 +506,8 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
                              fg_thresh=seg_fg, edge_margin=seg_edge_margin, db=db, **seg_dk)
                 except Exception as e:
                     print(f"  (test vis skipped: {type(e).__name__}: {e})")
+            print(f"  vis: {vis_n} val + {min(vis_n, len(test_s))} test samples in {time.time() - t2:.0f}s "
+                  f"(turn down vis_samples if this dominates)")
             if db is not None:
                 db.flush_scalars(); db.checkpoint()   # push the image/overlay INSERTs out of the WAL
 

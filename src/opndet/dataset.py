@@ -262,7 +262,12 @@ class OpndetDataset(Dataset):
             return 0.0
         budget = float("inf") if max_mb is None else float(max_mb) * 1e6
         used = sum(a.nbytes for a in self._cache.values())
-        for idx, s in enumerate(self.samples):
+        try:
+            from tqdm.auto import tqdm
+            it = tqdm(list(enumerate(self.samples)), desc="cache: decoding images", leave=False)
+        except Exception:
+            it = enumerate(self.samples)
+        for idx, s in it:
             if used >= budget:
                 break
             if idx in self._cache:
