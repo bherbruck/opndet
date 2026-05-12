@@ -499,14 +499,55 @@ def _bundle_run(out_dir: Path, include_tb: bool = False) -> Path | None:
     # cell (`from opndet.train import train; train('cfg.yaml')`) because the
     # IPython kernel context is available. Fails silently for subprocess
     # invocations (`!opndet train ...`) since `files.download` needs the kernel.
+    _colab_download(bundle)
+    return bundle
+
+
+def _colab_download(path: Path) -> None:
+    """Trigger a browser download of `path` if running in a Colab notebook kernel; no-op otherwise."""
     try:
         from google.colab import files  # type: ignore
-        files.download(str(bundle))
+        files.download(str(path))
     except ImportError:
         pass  # not on Colab
     except Exception:
-        pass  # subprocess without kernel; bundle is still on disk at `bundle`
-    return bundle
+        pass  # subprocess without a kernel; the file is still on disk
+
+
+def _download_run(out_dir: Path, c: dict) -> None:
+    """End-of-training Colab download. Controlled by `download:` in the config:
+      "best"   (default) — just `<name>_best.pt` + `metrics.duckdb` (the things you actually
+                 want off the box; the run dir's vis/ PNGs are dashboard artifacts served live,
+                 not worth GB of zip).
+      "bundle"          — zip the whole run dir (minus tb/) and download it (the old behaviour).
+      "none"            — download nothing (the run stays on the box's disk).
+    Back-compat: if `download` is absent but `auto_bundle` is set, true→"bundle", false→"none"."""
+    if "download" in c:
+        mode = str(c["download"]).lower()
+    elif "auto_bundle" in c:
+        mode = "bundle" if c["auto_bundle"] else "none"
+    else:
+        mode = "best"
+    if mode == "none":
+        return
+    if mode == "bundle":
+        _bundle_run(out_dir, include_tb=bool(c.get("bundle_include_tb", False)))
+        return
+    # mode == "best"
+    targets: list[Path] = []
+    best = next(iter(sorted(out_dir.glob("*_best.pt"))), None) or next(iter(sorted(out_dir.glob("*.pt"))), None)
+    if best is not None:
+        targets.append(best)
+    db = out_dir / "metrics.duckdb"
+    if db.exists():
+        targets.append(db)
+    if not targets:
+        print(f"download: nothing to download in {out_dir}")
+        return
+    for p in targets:
+        print(f"download: {p.name} ({p.stat().st_size / 1e6:.1f} MB)")
+    for p in targets:
+        _colab_download(p)
 
 
 def _resolve_out_dir(base: Path, auto_increment: bool = True) -> Path:
@@ -1772,8 +1813,7 @@ def train(cfg_path: str, run_name: str | None = None, runs_dir: str | None = Non
             print(f"  calibration failed: {e}")
     writer.close()
 
-    if c.get("auto_bundle", True):
-        _bundle_run(out_dir, include_tb=bool(c.get("bundle_include_tb", False)))
+    _download_run(out_dir, c)
 
 
 def main() -> None:

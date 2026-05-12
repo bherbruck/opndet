@@ -31,7 +31,7 @@ from opndet.decode import decode_seg
 from opndet.encode import encode_targets_seg, obb_to_aabb
 from opndet.loss import SegDomeLoss
 from opndet.presets import resolve as _resolve_preset
-from opndet.train import EMA, _bundle_run, _resolve_out_dir, cosine_lr
+from opndet.train import EMA, _download_run, _resolve_out_dir, cosine_lr
 from opndet.training_defaults import deep_merge, defaults_for
 from opndet.yaml_build import build_model_from_yaml
 
@@ -563,9 +563,8 @@ def train_seg(cfg_path: str, run_name: str | None = None, runs_dir: str | None =
         import shutil as _sh
         _sh.copy2(out_dir / "last.pt", ckpt_path)
         print(f"  (no {metric_for_best} improvement ever — best = last; {ckpt_path})")
-    if bool(c.get("auto_bundle", True)):
-        try:
-            _bundle_run(out_dir, include_tb=False)
-        except Exception as e:
-            print(f"  (bundle skipped: {type(e).__name__}: {e})")
+    try:
+        _download_run(out_dir, c)
+    except Exception as e:
+        print(f"  (download skipped: {type(e).__name__}: {e})")
     return str(ckpt_path)
