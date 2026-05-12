@@ -249,7 +249,7 @@ class OpndetDataset(Dataset):
             self._cache[idx] = img
         return img
 
-    def warm_cache(self, max_mb: float | None = None) -> float:
+    def warm_cache(self, max_mb: float | None = None, workers: int | None = None) -> float:
         """Pre-decode every sample's RGB into `self._cache` (no-op if cache_images=False).
         Returns the total MB cached. Call this in the MAIN process BEFORE building a
         multi-worker DataLoader: the forked workers then inherit the fully-populated cache
@@ -257,22 +257,49 @@ class OpndetDataset(Dataset):
         filling its OWN `_cache` toward the whole dataset over epochs (≈num_workers× the
         dataset in RAM, growing every epoch: the "RAM rising by gigs/epoch" leak). `max_mb`
         caps it: once the cached arrays would exceed it, stop (the rest decode on the fly).
+        Decode runs on a thread pool (`workers`; cv2.imread releases the GIL) — index order
+        is preserved chunk-wise so the budget still keeps the *first N* images.
         """
         if not self.cache_images:
             return 0.0
+        import os
+        from concurrent.futures import ThreadPoolExecutor
         budget = float("inf") if max_mb is None else float(max_mb) * 1e6
         used = sum(a.nbytes for a in self._cache.values())
+        todo = [(i, s.image_path) for i, s in enumerate(self.samples) if i not in self._cache]
+        if not todo:
+            return used / 1e6
+        nw = workers if workers else min(16, (os.cpu_count() or 4))
+        nw = max(1, min(nw, len(todo)))
         try:
             from tqdm.auto import tqdm
-            it = tqdm(list(enumerate(self.samples)), desc="cache: decoding images", leave=False)
+            pbar = tqdm(total=len(todo), desc="cache: decoding images", leave=False)
         except Exception:
-            it = enumerate(self.samples)
-        for idx, s in it:
-            if used >= budget:
-                break
-            if idx in self._cache:
-                continue
-            used += self._load_rgb(idx, s.image_path).nbytes
+            pbar = None
+
+        def _decode(path):
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if img is None:
+                raise RuntimeError(f"failed to read {path}")
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        step = min(max(nw * 4, 32), 256)
+        stop = False
+        with ThreadPoolExecutor(max_workers=nw) as ex:
+            for c0 in range(0, len(todo), step):
+                if stop:
+                    break
+                chunk = todo[c0:c0 + step]
+                for (idx, _), img in zip(chunk, ex.map(_decode, [p for _, p in chunk])):
+                    self._cache[idx] = img
+                    used += img.nbytes
+                    if pbar is not None:
+                        pbar.update(1)
+                    if used >= budget:
+                        stop = True
+                        break
+        if pbar is not None:
+            pbar.close()
         return used / 1e6
 
     def _mosaic(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
