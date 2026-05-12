@@ -1,0 +1,49 @@
+# opndet-bbox-f-seg: femto dense-dome SEGMENTATION head. Full-resolution output.
+# Output [1, 1, H, W] per-pixel domed map (1 at each convex object's deepest
+# interior point, linear ramp to 0 at its boundary, 0 between touching objects).
+# Smallest seg variant — the sub-1MB-int8 stunt point, but the conv head runs at
+# full res so it's slower than bbox-f-obb. NOT a detector: threshold +
+# connected-components for instances (decode.decode_seg). See opndet-bbox-n-seg
+# for the full rationale. Tier edge (opset-13 + Myriad-safe). img_h/img_w div by 32.
+
+model:
+  tier: edge
+  head: seg
+  in_ch: 3
+  img_h: 384
+  img_w: 512
+  layers:
+    - {name: stem, from: 0,    module: ConvBnAct, args: {in_ch: 3,   out_ch: 4,  k: 3, s: 2}}    # /2
+    - {name: p1,   from: stem, module: CSPBlock,  args: {in_ch: 4,   out_ch: 8,  n: 1, s: 2}}    # /4
+    - {name: p2,   from: p1,   module: CSPBlock,  args: {in_ch: 8,   out_ch: 16, n: 1, s: 2}}    # /8
+    - {name: p3,   from: p2,   module: CSPBlock,  args: {in_ch: 16,  out_ch: 24, n: 1, s: 2}}    # /16
+    - {name: p4,   from: p3,   module: CSPBlock,  args: {in_ch: 24,  out_ch: 32, n: 1, s: 2}}    # /32
+
+    - {name: lat4, from: p4,   module: ConvBnAct, args: {in_ch: 32,  out_ch: 16, k: 1}}   # /32
+    - {name: lat3, from: p3,   module: ConvBnAct, args: {in_ch: 24,  out_ch: 16, k: 1}}   # /16
+    - {name: lat2, from: p2,   module: ConvBnAct, args: {in_ch: 16,  out_ch: 16, k: 1}}   # /8
+    - {name: lat1, from: p1,   module: ConvBnAct, args: {in_ch: 8,   out_ch: 16, k: 1}}   # /4
+    - {name: lat0, from: stem, module: ConvBnAct, args: {in_ch: 4,   out_ch: 16, k: 1}}   # /2
+
+    - {name: up4,   from: lat4,        module: ResizeNearest2x, args: {}}                  # /16
+    - {name: add3,  from: [up4, lat3], module: Add,             args: {}}
+    - {name: fuse3, from: add3,        module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: up3,   from: fuse3,       module: ResizeNearest2x, args: {}}                  # /8
+    - {name: add2,  from: [up3, lat2], module: Add,             args: {}}
+    - {name: fuse2, from: add2,        module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: up2,   from: fuse2,       module: ResizeNearest2x, args: {}}                  # /4
+    - {name: add1,  from: [up2, lat1], module: Add,             args: {}}
+    - {name: fuse1, from: add1,        module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: up1,   from: fuse1,       module: ResizeNearest2x, args: {}}                  # /2
+    - {name: add0,  from: [up1, lat0], module: Add,             args: {}}
+    - {name: fuse0, from: add0,        module: ConvBnAct,       args: {in_ch: 16, out_ch: 16, k: 3}}
+    - {name: up0,   from: fuse0,       module: ResizeNearest2x, args: {}}                  # /1
+
+    - {name: instem, from: 0,            module: ConvBnAct, args: {in_ch: 3, out_ch: 16, k: 3}}   # /1
+    - {name: addf,   from: [up0, instem], module: Add,        args: {}}
+    - {name: trunk,  from: addf,         module: ConvBnAct, args: {in_ch: 16, out_ch: 16, k: 3}}   # /1
+    - {name: raw,    from: trunk,        module: Conv,      args: {in_ch: 16, out_ch: 1, k: 1, bias_init: [-2.19]}}
+    - {name: dome,   from: raw,          module: Sigmoid,   args: {}}
+
+  outputs:
+    - {name: output, from: dome, activation: none}

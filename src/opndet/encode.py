@@ -446,5 +446,46 @@ def encode_targets_obb(
     }
 
 
+def encode_targets_seg(cfg: object, obbs: np.ndarray | None = None,
+                       masks: list | None = None) -> dict[str, torch.Tensor]:
+    """Dense per-pixel dome target for the segmentation head (`bbox-*-seg`).
+
+    Rendered at (cfg.img_h, cfg.img_w) // seg_stride (`cfg.seg_stride`, default 1).
+    Sources, in priority order:
+      - `masks`: list of HxW binary instance masks (at image res). Each → its L2
+        distance-transform normalized by its own max ⇒ 1.0 at the deepest interior
+        point, ~linear ramp to 0 at the boundary, 0 outside. Handles arbitrary
+        convex shapes; max-aggregated across instances ⇒ exactly 0 between two
+        touching ones (no bleed across the contact line). This is the best target.
+      - `obbs`: [N,5] of (cx,cy,w,h,θ) in image px ⇒ the elliptical dome
+        (`_draw_rotated_dome`) per box, at seg res. The fallback when only OBB
+        sidecars exist (an egg's egg-ellipse is a decent stand-in for its mask).
+    Returns {"dome": Tensor[1, Hd, Wd]} in [0,1].
+    """
+    st = max(1, int(getattr(cfg, "seg_stride", 1)))
+    Hd, Wd = int(cfg.img_h) // st, int(cfg.img_w) // st
+    dome = np.zeros((Hd, Wd), dtype=np.float32)
+    if masks is not None and len(masks) > 0:
+        import cv2 as _cv2
+        for mk in masks:
+            m = (np.asarray(mk) > 0).astype(np.uint8)
+            if m.shape != (Hd, Wd):
+                m = _cv2.resize(m, (Wd, Hd), interpolation=_cv2.INTER_NEAREST)
+            m = np.ascontiguousarray(m)
+            if int(m.sum()) == 0:
+                continue
+            dt = _cv2.distanceTransform(m, _cv2.DIST_L2, 5)
+            mx = float(dt.max())
+            if mx > 0.0:
+                np.maximum(dome, (dt / mx).astype(np.float32), out=dome)
+    elif obbs is not None and len(obbs) > 0:
+        for cx, cy, w, h, theta in obbs:
+            if float(w) < 1.0 or float(h) < 1.0:
+                continue
+            _draw_rotated_dome(dome, int(round(float(cx) / st)), int(round(float(cy) / st)),
+                               (float(w) * 0.5) / st, (float(h) * 0.5) / st, float(theta))
+    return {"dome": torch.from_numpy(dome).unsqueeze(0)}
+
+
 def collate_targets(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     return {k: torch.stack([it[k] for it in items], dim=0) for k in items[0]}

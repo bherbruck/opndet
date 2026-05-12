@@ -1,0 +1,63 @@
+# opndet-bbox-n-seg: nano dense-dome SEGMENTATION head. Full-resolution output.
+#
+# Output [1, 1, H, W] = per-pixel domed map: 1.0 at each convex object's deepest
+# interior point, linear ramp to 0 at its boundary, 0 between touching objects
+# (the dome hits a TRUE 0 at edges so adjacent blobs separate). NOT a detector —
+# no boxes, no in-graph peak op. Inference: threshold + connected-components →
+# per-blob centroid + pixel-area (decode.decode_seg), or use the dense 0..1 map
+# directly as a soft mask. Trained against `opndet sam-seg` per-instance masks
+# (true distance-transform dome) or, lacking those, `opndet sam-obb` OBBs (the
+# elliptical dome from encode._draw_rotated_dome at full res). Loss: SegDomeLoss
+# (QFL toward the dome + soft Dice on the foreground).
+#
+# Why full-res: at stride 4 with a 512x384 input the dome is 128x96 — too coarse
+# to read a small object's area off. Stride 1 ("no division") nails it.
+#
+# Tier: edge — every op (Conv/BN/ReLU6/Add/Resize-nearest-asymmetric/Sigmoid) is
+# opset-13 + Myriad-VPU safe. The cost is the conv head running at full resolution,
+# not op support; that's what the femto..medium size ladder is for.
+#
+# img_h/img_w must be divisible by 32 (the deepest backbone stride). Detected as a
+# seg head via the `dome` alias.
+
+model:
+  tier: edge
+  head: seg
+  in_ch: 3
+  img_h: 384
+  img_w: 512
+  layers:
+    - {name: stem, from: 0,    module: ConvBnAct, args: {in_ch: 3,   out_ch: 16,  k: 3, s: 2}}   # /2
+    - {name: p1,   from: stem, module: CSPBlock,  args: {in_ch: 16,  out_ch: 32,  n: 1, s: 2}}   # /4
+    - {name: p2,   from: p1,   module: CSPBlock,  args: {in_ch: 32,  out_ch: 64,  n: 1, s: 2}}   # /8
+    - {name: p3,   from: p2,   module: CSPBlock,  args: {in_ch: 64,  out_ch: 96,  n: 2, s: 2}}   # /16
+    - {name: p4,   from: p3,   module: CSPBlock,  args: {in_ch: 96,  out_ch: 128, n: 1, s: 2}}   # /32
+
+    - {name: lat4, from: p4,   module: ConvBnAct, args: {in_ch: 128, out_ch: 32, k: 1}}   # /32
+    - {name: lat3, from: p3,   module: ConvBnAct, args: {in_ch: 96,  out_ch: 32, k: 1}}   # /16
+    - {name: lat2, from: p2,   module: ConvBnAct, args: {in_ch: 64,  out_ch: 32, k: 1}}   # /8
+    - {name: lat1, from: p1,   module: ConvBnAct, args: {in_ch: 32,  out_ch: 32, k: 1}}   # /4
+    - {name: lat0, from: stem, module: ConvBnAct, args: {in_ch: 16,  out_ch: 32, k: 1}}   # /2
+
+    - {name: up4,   from: lat4,        module: ResizeNearest2x, args: {}}                  # /16
+    - {name: add3,  from: [up4, lat3], module: Add,             args: {}}
+    - {name: fuse3, from: add3,        module: ConvBnAct,       args: {in_ch: 32, out_ch: 32, k: 3}}
+    - {name: up3,   from: fuse3,       module: ResizeNearest2x, args: {}}                  # /8
+    - {name: add2,  from: [up3, lat2], module: Add,             args: {}}
+    - {name: fuse2, from: add2,        module: ConvBnAct,       args: {in_ch: 32, out_ch: 32, k: 3}}
+    - {name: up2,   from: fuse2,       module: ResizeNearest2x, args: {}}                  # /4
+    - {name: add1,  from: [up2, lat1], module: Add,             args: {}}
+    - {name: fuse1, from: add1,        module: ConvBnAct,       args: {in_ch: 32, out_ch: 32, k: 3}}
+    - {name: up1,   from: fuse1,       module: ResizeNearest2x, args: {}}                  # /2
+    - {name: add0,  from: [up1, lat0], module: Add,             args: {}}
+    - {name: fuse0, from: add0,        module: ConvBnAct,       args: {in_ch: 32, out_ch: 32, k: 3}}
+    - {name: up0,   from: fuse0,       module: ResizeNearest2x, args: {}}                  # /1
+
+    - {name: instem, from: 0,            module: ConvBnAct, args: {in_ch: 3, out_ch: 32, k: 3}}   # /1 RGB feature
+    - {name: addf,   from: [up0, instem], module: Add,        args: {}}
+    - {name: trunk,  from: addf,         module: ConvBnAct, args: {in_ch: 32, out_ch: 32, k: 3}}   # /1
+    - {name: raw,    from: trunk,        module: Conv,      args: {in_ch: 32, out_ch: 1, k: 1, bias_init: [-2.19]}}
+    - {name: dome,   from: raw,          module: Sigmoid,   args: {}}
+
+  outputs:
+    - {name: output, from: dome, activation: none}
