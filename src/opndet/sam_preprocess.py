@@ -794,3 +794,135 @@ def run_seg(coco_json: str | Path, images_dir: str | Path, out_dir: str | Path,
     stats.duration_seconds = round(time.time() - t0, 2)
     (out_dir / "manifest_seg.json").write_text(json.dumps(asdict(stats), indent=2))
     return stats
+
+
+# ── coco-segmentation → OBB sidecars (no SAM needed; masks are already the GT) ─────────────
+
+def _seg_to_mask(seg, img_h: int, img_w: int) -> np.ndarray | None:
+    """One COCO annotation's `segmentation` → [img_h, img_w] uint8 binary mask, or None.
+    Handles polygons (cv2.fillPoly + a sanity clamp on wildly-out-of-bounds coords — a known
+    Roboflow-export glitch) and RLE (the native `dataset._decode_coco_rle`, no pycocotools)."""
+    if seg is None:
+        return None
+    if isinstance(seg, dict):
+        from opndet.dataset import _decode_coco_rle
+        m = _decode_coco_rle(seg)
+        if m.shape != (img_h, img_w):
+            m = cv2.resize(m, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+        return m.astype(np.uint8) if m.any() else None
+    if isinstance(seg, list):
+        mask = np.zeros((img_h, img_w), np.uint8)
+        for ring in seg:
+            try:
+                pts = np.asarray(ring, dtype=np.float64).reshape(-1, 2)
+            except (ValueError, TypeError):
+                continue
+            if (pts.shape[0] < 3 or not np.isfinite(pts).all()
+                    or (pts[:, 0] < -2).any() or (pts[:, 0] > img_w + 2).any()
+                    or (pts[:, 1] < -2).any() or (pts[:, 1] > img_h + 2).any()):
+                continue
+            cv2.fillPoly(mask, [np.round(pts).astype(np.int32)], 1)
+        return mask if mask.any() else None
+    return None
+
+
+@dataclass
+class CocoToObbStats:
+    n_images_processed: int = 0
+    n_images_skipped: int = 0
+    n_objects_processed: int = 0
+    n_obb_extracted: int = 0
+    n_aabb_fallback: int = 0
+    n_invalid_dropped: int = 0
+    n_drop_geometry: int = 0
+    n_drop_area: int = 0
+    n_drop_centroid: int = 0
+    n_drop_no_seg: int = 0
+    n_kept_edge: int = 0
+    timestamp: str = ""
+    duration_seconds: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+def run_coco_to_obb(coco_json: str | Path, out_dir: str | Path,
+                    max_images: int | None = None,
+                    image_filter: str | Path | None = None) -> CocoToObbStats:
+    """Fit OBBs to a COCO json's `segmentation` polygons/RLE and dump YOLOv8-OBB `<stem>.txt`
+    sidecars (the same format `opndet sam-obb` writes). No SAM, no image files needed — pure
+    metadata transform. Reuses the OBB-fit gauntlet from `sam-obb` (fitEllipse with minAreaRect
+    fallback for frame-clipped objects + area/centroid validity checks). Idempotent (skips
+    existing non-empty outputs)."""
+    coco_json = Path(coco_json); out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(coco_json) as f:
+        coco = json.load(f)
+    images_by_id = {im["id"]: im for im in coco["images"]}
+    anns_by_image: dict[int, list[dict]] = {im_id: [] for im_id in images_by_id}
+    for ann in coco["annotations"]:
+        if ann.get("iscrowd", 0):
+            continue
+        if ann.get("bbox") is None:
+            continue
+        x, y, w, h = (float(v) for v in ann["bbox"])
+        if w <= 0 or h <= 0:
+            continue
+        anns_by_image[ann["image_id"]].append(ann)
+
+    stats = CocoToObbStats(timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    t0 = time.time()
+
+    items = list(images_by_id.items())
+    if image_filter is not None:
+        from opndet.dataset import _read_image_filter
+        match, n_entries = _read_image_filter(image_filter)
+        if match:
+            items = [(iid, im) for (iid, im) in items
+                     if Path(im["file_name"]).name in match or Path(im["file_name"]).stem in match]
+            print(f"  image_filter {image_filter}: {n_entries} entries → {len(items)} images")
+    if max_images is not None:
+        items = items[:max_images]
+
+    pbar = tqdm(items, desc="coco-to-obb", unit="img", dynamic_ncols=True)
+    for im_id, im in pbar:
+        out_path = out_dir / (Path(im["file_name"]).stem + ".txt")
+        if out_path.exists() and out_path.stat().st_size > 0:
+            stats.n_images_skipped += 1
+            continue
+        H, W = int(im["height"]), int(im["width"])
+        anns = anns_by_image.get(im_id, [])
+        lines: list[str] = []
+        for i, ann in enumerate(anns):
+            stats.n_objects_processed += 1
+            mask = _seg_to_mask(ann.get("segmentation"), H, W)
+            if mask is None:
+                stats.n_drop_no_seg += 1; stats.n_invalid_dropped += 1
+                continue
+            box_xyxy = np.array(coco_bbox_to_xyxy(ann["bbox"]), dtype=np.float32)
+            # truncated → minAreaRect on the visible pixels (no off-frame fitEllipse extrapolation)
+            if _mask_touches_edge(mask):
+                corners = _min_area_rect_corners(mask)
+                if corners is None:
+                    corners = _aabb_corners_from_xyxy(box_xyxy)
+                stats.n_kept_edge += 1
+            else:
+                corners = mask_to_obb_corners(mask, fallback_bbox=box_xyxy)
+                if corners is None:
+                    stats.n_drop_no_seg += 1; stats.n_invalid_dropped += 1; continue
+                if not is_valid_rectangle(corners):
+                    stats.n_drop_geometry += 1; stats.n_invalid_dropped += 1; continue
+                if not is_obb_within_prompt(corners, box_xyxy, max_area_frac=1.5):
+                    stats.n_drop_area += 1; stats.n_invalid_dropped += 1; continue
+                if not is_obb_self_consistent(corners, box_xyxy):
+                    stats.n_drop_centroid += 1; stats.n_invalid_dropped += 1; continue
+            if _is_round_via_corners(corners):
+                stats.n_aabb_fallback += 1
+            stats.n_obb_extracted += 1
+            lines.append(corners_to_yolo_obb_line(corners, W, H, class_id=0))
+        out_path.write_text("\n".join(lines) + ("\n" if lines else ""))
+        stats.n_images_processed += 1
+        pbar.set_postfix({"obb": stats.n_obb_extracted, "edge": stats.n_kept_edge,
+                          "drop": stats.n_invalid_dropped})
+
+    stats.duration_seconds = round(time.time() - t0, 2)
+    (out_dir / "manifest_coco_to_obb.json").write_text(json.dumps(asdict(stats), indent=2))
+    return stats

@@ -286,6 +286,25 @@ def _cmd_sam_seg(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_coco_to_obb(args: argparse.Namespace) -> int:
+    from opndet.sam_preprocess import run_coco_to_obb
+    stats = run_coco_to_obb(
+        coco_json=args.coco,
+        out_dir=args.out,
+        max_images=args.max_images,
+        image_filter=args.filter,
+    )
+    print(f"processed={stats.n_images_processed} skipped={stats.n_images_skipped} "
+          f"obj={stats.n_objects_processed} obb={stats.n_obb_extracted} "
+          f"round={stats.n_aabb_fallback} edge={stats.n_kept_edge} "
+          f"drop={stats.n_invalid_dropped} ({stats.duration_seconds}s)")
+    print(f"  drop breakdown: no_seg={stats.n_drop_no_seg} geometry={stats.n_drop_geometry} "
+          f"area={stats.n_drop_area} centroid={stats.n_drop_centroid}")
+    print(f"obb sidecars: {args.out}/<stem>.txt   manifest: {Path(args.out) / 'manifest_coco_to_obb.json'}")
+    print(f"  → set data.sources[*].obb_dir: {args.out}  in your train.yaml (for -obb / -pro presets)")
+    return 0
+
+
 def _cmd_quantize(args: argparse.Namespace) -> int:
     from opndet.quantize import parity_check, quantize_onnx
     info = quantize_onnx(args.onnx, args.out, args.calib, n_calib=args.n_calib, quant_format=args.format)
@@ -532,6 +551,20 @@ def main(argv: list[str] | None = None) -> int:
                           "`#`-comments ok) — same format as data.image_filter in train.yaml. "
                           "When given, SAM only runs on those images. (Idempotency still applies.)")
     pss.set_defaults(func=_cmd_sam_seg)
+
+    pcb = sub.add_parser("coco-to-obb",
+                         help="Fit OBBs to a COCO json's `segmentation` polygons/RLE → YOLOv8-OBB "
+                              "*.txt sidecars (same format as `sam-obb`). No SAM, no images needed — "
+                              "pure metadata transform. Use this when your dataset already has masks "
+                              "(e.g. a Roboflow COCO-Segmentation export) and you want OBB sidecars "
+                              "for the -obb / -pro presets without re-running SAM. Idempotent.")
+    pcb.add_argument("--coco", required=True, help="Path to COCO _annotations.coco.json")
+    pcb.add_argument("--out", required=True, help="Output dir for per-image *.txt + manifest (= data.sources[*].obb_dir)")
+    pcb.add_argument("--max-images", type=int, default=None, help="Cap number of images (debug)")
+    pcb.add_argument("--filter", default=None,
+                     help="Optional text file of image names (one per line, basename or stem) — "
+                          "same format as data.image_filter in train.yaml.")
+    pcb.set_defaults(func=_cmd_coco_to_obb)
 
     pq = sub.add_parser("quantize", help="Static int8 PTQ on a trained ONNX")
     pq.add_argument("--onnx", required=True, help="Input fp32 ONNX")

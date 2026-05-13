@@ -217,3 +217,50 @@ def test_load_predictor_missing_sam2_raises_clear_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="SAM2 not installed"):
         sp._load_predictor("sam2_b", "cpu")
+
+
+def test_run_coco_to_obb_polygons(tmp_path):
+    """COCO with polygon segmentation → OBB sidecars (no SAM needed)."""
+    import json
+    import cv2
+    from opndet.sam_preprocess import run_coco_to_obb
+    # 200×150 canvas, one rotated ellipse (mask via polygon — sample 24 points around it)
+    cx, cy, a, b, ang = 100.0, 75.0, 36.0, 14.0, 30.0
+    th = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+    cos_t, sin_t = np.cos(np.deg2rad(ang)), np.sin(np.deg2rad(ang))
+    xs = cx + a * np.cos(th) * cos_t - b * np.sin(th) * sin_t
+    ys = cy + a * np.cos(th) * sin_t + b * np.sin(th) * cos_t
+    ring = np.column_stack([xs, ys]).flatten().tolist()
+    coco = {"images": [{"id": 1, "file_name": "a.png", "width": 200, "height": 150}],
+            "annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [60, 60, 80, 30], "iscrowd": 0,
+                             "segmentation": [ring]}],
+            "categories": [{"id": 0, "name": "obj"}]}
+    cp = tmp_path / "ann.json"; cp.write_text(json.dumps(coco))
+    out = tmp_path / "obb"
+    stats = run_coco_to_obb(cp, out)
+    assert stats.n_obb_extracted == 1 and stats.n_invalid_dropped == 0
+    txt = (out / "a.txt").read_text().strip()
+    parts = txt.split()
+    assert len(parts) == 9 and parts[0] == "0"   # class_id + 4 (x,y) corners normalized
+    # idempotent: re-run skips
+    stats2 = run_coco_to_obb(cp, out)
+    assert stats2.n_images_skipped == 1 and stats2.n_obb_extracted == 0
+
+
+def test_run_coco_to_obb_rle(tmp_path):
+    """COCO with RLE segmentation (uncompressed list-counts) → OBB sidecar."""
+    import json
+    from opndet.sam_preprocess import run_coco_to_obb
+    # 12×8 image, RLE marks columns 4..7 (a 4-col strip, column-major counts)
+    rle = {"size": [8, 12], "counts": [32, 32, 32]}   # 32 bg, 32 fg, 32 bg → cols 4..7 fg
+    coco = {"images": [{"id": 1, "file_name": "b.png", "width": 12, "height": 8}],
+            "annotations": [{"id": 1, "image_id": 1, "category_id": 0, "bbox": [4, 0, 4, 8], "iscrowd": 0,
+                             "segmentation": rle}],
+            "categories": [{"id": 0, "name": "obj"}]}
+    cp = tmp_path / "ann.json"; cp.write_text(json.dumps(coco))
+    out = tmp_path / "obb"
+    stats = run_coco_to_obb(cp, out)
+    # frame-clipped (the strip touches top+bottom edges) → minAreaRect path; still emits a line
+    txt = (out / "b.txt").read_text().strip()
+    assert txt and txt.startswith("0 ") and len(txt.split()) == 9
+    assert stats.n_obb_extracted == 1
