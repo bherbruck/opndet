@@ -32,7 +32,7 @@ dashboard = ["duckdb>=1.0", "fastapi>=0.110", "uvicorn[standard]>=0.27", "jinja2
 opndet = "opndet.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
