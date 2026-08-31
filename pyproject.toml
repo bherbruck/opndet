@@ -12,7 +12,7 @@ dependencies = [
     "torch >= 2.0, < 2.12",            # 2.11 current; block 2.12 until validated
     "numpy >= 1.24, < 3",              # lap supports both 1.x and 2.x; no scipy chain
     "lap >= 0.5.13",                   # tiny C-compiled Hungarian; replaces scipy
-    "onnx ~= 1.14",                    # >= 1.14, < 2
+    "onnx~=1.22",                    # >= 1.14, < 2
     "onnxruntime ~= 1.16",             # >= 1.16, < 2
     "onnxscript >= 0.1, < 2",
     "pillow >= 10.0, < 12",            # 12+ broke gradio + others; not worth chasing
