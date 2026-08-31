@@ -15,7 +15,7 @@ dependencies = [
     "onnx ~= 1.14",                    # >= 1.14, < 2
     "onnxruntime ~= 1.16",             # >= 1.16, < 2
     "onnxscript >= 0.1, < 2",
-    "pillow >= 10.0, < 12",            # 12+ broke gradio + others; not worth chasing
+    "pillow>=12.3.0,<13",            # 12+ broke gradio + others; not worth chasing
     "opencv-python-headless ~= 4.8",   # >= 4.8, < 5
     "pyyaml ~= 6.0",                   # >= 6.0, < 7
     "tensorboard >= 2.13",             # train.py falls back to no-op writer if import fails
