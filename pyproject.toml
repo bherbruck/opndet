@@ -9,7 +9,7 @@ dependencies = [
     # analog to Cargo/Poetry's `^`). Explicit `>=X, <Y` used where we need to
     # block a specific bad release below the next-major boundary.
     # See docs/engineering-decisions.md "Dep pinning" for the why.
-    "torch >= 2.0, < 2.12",            # 2.11 current; block 2.12 until validated
+    "torch>=2.13.0,<2.14",            # 2.11 current; block 2.12 until validated
     "numpy >= 1.24, < 3",              # lap supports both 1.x and 2.x; no scipy chain
     "lap >= 0.5.13",                   # tiny C-compiled Hungarian; replaces scipy
     "onnx ~= 1.14",                    # >= 1.14, < 2
